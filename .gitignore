@@ -29,5 +29,12 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+# Goland
+.idea/.gitignore
+.idea/gbl.iml
+.idea/go.imports.xml
+.idea/modules.xml
+.idea/vcs.xml
+
+# vscode
+.vscode/
