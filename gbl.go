@@ -2,8 +2,8 @@
 // Use of this source code is governed by a MIT style
 // license that can be found in the LICENSE file.
 
-package main
+package gbl
 
-func main() {
-	println("Hello G.B.L")
+func Run() {
+
 }
