@@ -24,7 +24,9 @@ func Run() {
 			panic(err)
 		}
 	} else {
-		// Build configuration
+		// Save global parameters
+		iniConfigData = ini
+		// Generate configuration
 		cfg, err = generateConfig(ini)
 		if err != nil {
 			panic(err)
@@ -46,18 +48,21 @@ func Run() {
 		}
 	}(ln)
 
-	handle := &gblHandler{}
-
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           handle,
+		Handler:           &gblHandler{},
 		ReadTimeout:       cfg.ReadTimeout,
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
 		IdleTimeout:       cfg.IdleTimeout,
 	}
 
-	err = server.Serve(ln)
+	// Determine whether to enable TSL
+	if cfg.useTSL {
+		err = server.ServeTLS(ln, cfg.CertFile, cfg.KeyFile)
+	} else {
+		err = server.Serve(ln)
+	}
 
 	if err != nil {
 		panic(err)

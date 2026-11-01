@@ -14,13 +14,19 @@ import (
 
 var durationType = reflect.TypeFor[time.Duration]()
 
+// gblConfig
+// CertFile: Certificate file path
+// KeyFile: SecretKeyFile path
 type gblConfig struct {
 	Name              string
 	Port              string
+	CertFile          string
+	KeyFile           string
 	ReadTimeout       time.Duration
 	ReadHeaderTimeout time.Duration
 	WriteTimeout      time.Duration
 	IdleTimeout       time.Duration
+	useTSL            bool
 }
 
 func defaultConfig() *gblConfig {
@@ -31,6 +37,7 @@ func defaultConfig() *gblConfig {
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       time.Minute,
+		useTSL:            false,
 	}
 }
 
@@ -58,10 +65,14 @@ func generateConfig(ini map[string]map[string]string) (*gblConfig, error) {
 				continue
 			}
 		}
-		println(field.Name, raw)
+
 		if err := setConfigValue(v.Field(i), raw); err != nil {
 			return nil, fmt.Errorf("invalid config %s: %w", field.Name, err)
 		}
+	}
+
+	if cfg.CertFile != "" && cfg.KeyFile != "" {
+		cfg.useTSL = true
 	}
 
 	return cfg, nil
