@@ -28,7 +28,7 @@ func IniBySectionAndKey(section, key string) (string, bool) {
 
 	values, found := iniConfigData[section]
 	if !found {
-		return "", false
+		return null, false
 	}
 
 	value, found := values[key]

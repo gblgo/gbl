@@ -27,7 +27,7 @@ func ReadIni(path string) (map[string]map[string]string, error) {
 
 	ini := make(map[string]map[string]string)
 
-	section := ""
+	section := null
 	scanner := bufio.NewScanner(file)
 
 	for lineNo := 1; scanner.Scan(); lineNo++ {
@@ -36,7 +36,7 @@ func ReadIni(path string) (map[string]map[string]string, error) {
 		line := strings.TrimSpace(scanner.Text())
 
 		// Ignore blank lines and comments
-		if line == "" || strings.HasPrefix(line, "#") {
+		if line == null || strings.HasPrefix(line, "#") {
 			continue
 		}
 
@@ -44,7 +44,7 @@ func ReadIni(path string) (map[string]map[string]string, error) {
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = strings.TrimSpace(line[1 : len(line)-1])
 
-			if section == "" {
+			if section == null {
 				return nil, fmt.Errorf("error parsing section: line %d missing section", lineNo)
 			}
 
@@ -54,7 +54,7 @@ func ReadIni(path string) (map[string]map[string]string, error) {
 			continue
 		}
 
-		if section == "" {
+		if section == null {
 			return nil, fmt.Errorf("error parsing configuration item: line %d missing section", lineNo)
 		}
 
@@ -66,7 +66,7 @@ func ReadIni(path string) (map[string]map[string]string, error) {
 		key := strings.TrimSpace(before)
 		value := strings.TrimSpace(after)
 
-		if key == "" {
+		if key == null {
 			return nil, fmt.Errorf("error parsing configuration item: line %d configuration item key cannot be empty", lineNo)
 		}
 
