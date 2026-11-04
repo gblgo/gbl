@@ -71,7 +71,7 @@ func generateConfig(ini map[string]map[string]string) (*gblConfig, error) {
 		}
 	}
 
-	if cfg.CertFile != "" && cfg.KeyFile != "" {
+	if cfg.CertFile != null && cfg.KeyFile != null {
 		cfg.useTSL = true
 	}
 
@@ -138,8 +138,8 @@ func setConfigValue(field reflect.Value, value string) error {
 // formatName Generate keys in two formats
 // Give an example: Name -> name, name; ReadTimeout -> readTimeout, read-timeout
 func formatName(s string) (lowerFirst, kebabCase string) {
-	if s == "" {
-		return "", ""
+	if s == null {
+		return null, null
 	}
 
 	var result strings.Builder

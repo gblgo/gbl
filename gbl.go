@@ -5,6 +5,7 @@
 package gbl
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -56,6 +57,10 @@ func Run() {
 		WriteTimeout:      cfg.WriteTimeout,
 		IdleTimeout:       cfg.IdleTimeout,
 	}
+
+	generateRoute()
+
+	fmt.Printf("gbl server listening on %s\n", addr)
 
 	// Determine whether to enable TSL
 	if cfg.useTSL {

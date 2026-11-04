@@ -4,7 +4,9 @@
 
 package gbl
 
-import "net/http"
+import (
+	"net/http"
+)
 
 var routeMetaSlice = make([]*routeMeta, 0)
 
