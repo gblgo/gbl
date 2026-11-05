@@ -65,6 +65,7 @@ func dealPath(path string) ([]segmentMeta, string) {
 				panic("when registering a route, the path cannot be '/:' or '/:***:***:' or '/::', etc")
 			}
 			meta.isVar = true
+			meta.paramName = part[1:]
 		}
 
 		if strings.Contains(part, leftCurlyBrace) && (len(part) == 1 || strings.LastIndex(part, leftCurlyBrace) != 0) {
@@ -81,6 +82,7 @@ func dealPath(path string) ([]segmentMeta, string) {
 
 		if strings.Contains(part, leftCurlyBrace) {
 			meta.isVar = true
+			meta.paramName = part[1 : len(part)-1]
 		}
 
 		segmentMetas = append(segmentMetas, meta)

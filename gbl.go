@@ -51,7 +51,7 @@ func Run() {
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           &gblHandler{},
+		Handler:           gh,
 		ReadTimeout:       cfg.ReadTimeout,
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
