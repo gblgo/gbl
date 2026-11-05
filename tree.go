@@ -21,73 +21,78 @@ type segmentMeta struct {
 	isVar   bool
 }
 
+func newNode(segment string) *routeNode {
+	return &routeNode{
+		segment:    segment,
+		exist:      false,
+		handler:    nil,
+		staticNode: make(map[string]*routeNode),
+		varNode:    make([]*routeNode, 0),
+	}
+}
+
 func insertNode(segmentMetas []segmentMeta, path string, method Method, handler *routeHandler) {
 
 	// Get the root node of the corresponding method
 	root := roots[method]
 	// Check if the root node is null
 	if root == nil {
-		root = &routeNode{
-			segment:    "/",
-			exist:      false,
-			handler:    nil,
-			staticNode: make(map[string]*routeNode),
-			varNode:    make([]*routeNode, 0),
-		}
+		root = newNode(slash)
 		roots[method] = root
 	}
+	// Insert route segments
 	for i, meta := range segmentMetas {
+		isLast := i == len(segmentMetas)-1
+
 		if meta.isVar {
-			if len(root.varNode) == 0 {
-				node := &routeNode{
-					segment:    meta.segment,
-					exist:      false,
-					handler:    nil,
-					staticNode: make(map[string]*routeNode),
-					varNode:    make([]*routeNode, 0),
-				}
-				if i+1 == len(segmentMetas) {
-					node.exist = true
-					node.handler = handler
-				}
-				root.varNode = append(root.varNode, node)
-				root = node
-				continue
-			}
+			// Find an existing variable node with the same name
+			var node *routeNode
+
 			for _, vn := range root.varNode {
-				if vn.exist && i+1 == len(segmentMetas) {
-					panic("There exist variable routes with conflicts: " + path)
-				}
 				if vn.segment == meta.segment {
-					if i+1 == len(segmentMetas) {
-						vn.exist = true
-						vn.handler = handler
-					}
-					root = vn
+					node = vn
 					break
 				}
 			}
+
+			// Create a new variable node if not found
+			if node == nil {
+				node = newNode(meta.segment)
+				root.varNode = append(root.varNode, node)
+			}
+
+			// Handle terminal node
+			if isLast {
+				if node.exist {
+					panic("The variable route already exists: " + path)
+				}
+
+				node.exist = true
+				node.handler = handler
+			}
+
+			root = node
 			continue
 		}
+
+		// Find or create a static node
 		node := root.staticNode[meta.segment]
+
 		if node == nil {
-			node = &routeNode{
-				segment:    meta.segment,
-				exist:      false,
-				handler:    nil,
-				staticNode: make(map[string]*routeNode),
-				varNode:    make([]*routeNode, 0),
-			}
+			node = newNode(meta.segment)
 			root.staticNode[meta.segment] = node
 		}
-		if i+1 == len(segmentMetas) {
+
+		// Handle terminal node
+		if isLast {
 			if node.exist {
-				panic("The finally route segment already exists: " + path)
+				panic("The static route already exists: " + path)
 			}
+
 			node.exist = true
 			node.handler = handler
-			break
 		}
+
 		root = node
 	}
 }
@@ -107,33 +112,74 @@ func getLegalSegments(path string) []string {
 	return segments
 }
 
-func matchNode(method Method, path string) *routeHandler {
+func matchNode(method Method, path string) (*routeHandler, map[string]string) {
 
 	segments := getLegalSegments(path)
 
 	root := roots[method]
 	if root == nil {
+		return nil, nil
+	}
+
+	params := make(map[string]string)
+
+	handler := searchNode(root, segments, 0, params)
+
+	if handler == nil {
+		return nil, nil
+	}
+
+	return handler, params
+}
+
+func searchNode(
+	root *routeNode,
+	segments []string,
+	index int,
+	params map[string]string,
+) *routeHandler {
+
+	if root == nil {
 		return nil
 	}
 
-	for i, segment := range segments {
-		// First, find the static route
-		node := root.staticNode[segment]
-		if node != nil {
-			root = node
-			continue
+	// All path segments have matched successfully
+	if index == len(segments) {
+		if root.exist {
+			return root.handler
 		}
-		// If the static route does not exist, then check the variable route
-		if len(root.varNode) == 0 {
-			return nil
-		}
-		for _, vn := range root.varNode {
-			if vn.exist && i+1 == len(segments) {
-				return vn.handler
-			}
+		return nil
+	}
 
+	segment := segments[index]
+
+	// 1. Priority matching for static nodes
+	staticNode := root.staticNode[segment]
+
+	if staticNode != nil {
+		handler := searchNode(staticNode, segments, index+1, params)
+
+		if handler != nil {
+			return handler
 		}
+	}
+
+	// 2. Static node matching failed, attempting dynamic node
+	for _, vn := range root.varNode {
+
+		// Record the current dynamic parameters
+		params[vn.segment] = segment
+
+		handler := searchNode(vn, segments, index+1, params)
+
+		if handler != nil {
+			return handler
+		}
+
+		// The current branch matching failed, delete the parameters just recorded
+		delete(params, vn.segment)
 	}
 
 	return nil
 }
+
