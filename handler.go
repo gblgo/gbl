@@ -8,17 +8,16 @@ import (
 	"net/http"
 )
 
-var gh = &gblHandler{panicProcessor: defaultPanicProcessor}
+type defaultHandler struct{}
 
-type gblHandler struct {
-	panicProcessor PanicProcessor
-	interceptor    Interceptor
-	processor      Processor
+func (dh *defaultHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	serveHTTP(w, r)
 }
 
-func (gbl *gblHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func serveHTTP(w http.ResponseWriter, r *http.Request) {
 
-	defer catchRuntimePanic(gbl, w)
+	// Global panic capture
+	defer catchRuntimePanic(w)
 
 	params := make(map[string]string)
 	rh := matchNode(parseMethod(r.Method), r.URL.Path, params)
@@ -27,9 +26,9 @@ func (gbl *gblHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if gh.interceptor != nil {
-		if ok := gbl.interceptor.PreHandle(r); !ok {
-			http.Error(w, "Forbidden", http.StatusForbidden)
+	if interceptor != nil {
+		if ok := interceptor(r); !ok {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
 	}
