@@ -21,6 +21,7 @@ func RegisterPanicProcessor(p PanicProcessor) {
 	panicProcessor = p
 }
 
+// errorWriteback Exception information is written back according to the reflection type
 func errorWriteback(w http.ResponseWriter, err any) {
 	val := reflect.ValueOf(err)
 	switch val.Kind() {
