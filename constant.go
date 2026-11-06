@@ -24,6 +24,7 @@ const (
 	headerOrigin                  = "Origin"
 	textPlain                     = "text/plain"
 	applicationJson               = "application/json"
+	contentType                   = "Content-Type"
 	accessControlRequestMethod    = "Access-Control-Request-Method"
 	accessControlAllowOrigin      = "Access-Control-Allow-Origin"
 	accessControlAllowCredentials = "Access-Control-Allow-Credentials"
@@ -35,4 +36,5 @@ const (
 	corsOriginNotAllowed          = "CORS origin not allowed"
 	corsMethodNotAllowed          = "CORS method not allowed"
 	corsHeaderNotAllowed          = "CORS header not allowed"
+	typeRecognitionError          = "Reflection Type Identification Exception"
 )
