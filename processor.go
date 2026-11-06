@@ -6,10 +6,10 @@ package gbl
 
 import "net/http"
 
-type Processor interface {
-	PostHandle(w http.ResponseWriter, r *http.Request)
-}
+var processor Processor = nil
+
+type Processor func(w http.ResponseWriter, r *http.Request)
 
 func RegisterProcessor(p Processor) {
-	gh.processor = p
+	processor = p
 }
