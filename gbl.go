@@ -35,7 +35,7 @@ func Run() {
 	}
 
 	// Concatenate address
-	addr := ":" + cfg.Port
+	addr := colon + cfg.Port
 	ln, err := net.Listen("tcp", addr)
 
 	if err != nil {
@@ -49,9 +49,17 @@ func Run() {
 		}
 	}(ln)
 
+	// CORS
+	var handler http.Handler
+	if globalCorsConfig == nil {
+		handler = &defaultHandler{}
+	} else {
+		handler = &corsHandler{config: globalCorsConfig}
+	}
+
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           gh,
+		Handler:           handler,
 		ReadTimeout:       cfg.ReadTimeout,
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
