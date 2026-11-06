@@ -6,14 +6,18 @@ package gbl
 
 import "net/http"
 
-func catchRuntimePanic(gh *gblHandler, w http.ResponseWriter) {
+type PanicProcessor func(w http.ResponseWriter, err any)
+
+var panicProcessor PanicProcessor = nil
+
+func catchRuntimePanic(w http.ResponseWriter) {
 	err := recover()
 	if err == nil {
 		return
 	}
-	gh.panicProcessor(w, err)
+	if panicProcessor == nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+	panicProcessor(w, err)
 }
-
-type PanicProcessor func(w http.ResponseWriter, err any)
-
-func defaultPanicProcessor(w http.ResponseWriter, err any) {}
