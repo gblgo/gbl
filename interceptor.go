@@ -6,10 +6,10 @@ package gbl
 
 import "net/http"
 
-type Interceptor interface {
-	PreHandle(r *http.Request) bool
-}
+var interceptor Interceptor = nil
+
+type Interceptor func(r *http.Request) bool
 
 func RegisterInterceptor(i Interceptor) {
-	gh.interceptor = i
+	interceptor = i
 }
