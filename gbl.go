@@ -17,7 +17,7 @@ func Run() {
 	var cfg *gblConfig
 
 	// Read the application.ini configuration file in the project's root directory
-	ini, err := ReadIni("application.ini")
+	ini, err := ReadIni(applicationIni)
 	if err != nil {
 		if os.IsNotExist(err) {
 			cfg = defaultConfig()
