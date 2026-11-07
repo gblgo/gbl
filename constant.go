@@ -21,6 +21,7 @@ const (
 	vary                          = "Vary"
 	headerTrue                    = "true"
 	headerComma                   = ", "
+	applicationIni                = "application.ini"
 	headerOrigin                  = "Origin"
 	textPlain                     = "text/plain"
 	applicationJson               = "application/json"
@@ -36,5 +37,4 @@ const (
 	corsOriginNotAllowed          = "CORS origin not allowed"
 	corsMethodNotAllowed          = "CORS method not allowed"
 	corsHeaderNotAllowed          = "CORS header not allowed"
-	typeRecognitionError          = "Reflection Type Identification Exception"
 )
