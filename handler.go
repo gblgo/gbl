@@ -16,19 +16,20 @@ func (dh *defaultHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func serveHTTP(w http.ResponseWriter, r *http.Request) {
 
+	rw := &gblResponseWriter{w: w}
 	// Global panic capture
-	defer catchRuntimePanic(w)
+	defer catchRuntimePanic(rw)
 
 	params := make(map[string]string)
 	rh := matchNode(parseMethod(r.Method), r.URL.Path, params)
 	if rh == nil {
-		http.NotFound(w, r)
-		return
+		rw.WriteHeader(http.StatusNotFound)
+		panic(http.StatusText(http.StatusNotFound))
 	}
 
+	// Interceptor judgment
 	if interceptor != nil {
-		if ok := interceptor(r); !ok {
-			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+		if ok := interceptor(rw, r); !ok {
 			return
 		}
 	}
