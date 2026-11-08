@@ -57,6 +57,22 @@ func errorWriteback(w http.ResponseWriter, err any) []byte {
 	return bytes
 }
 
+func detectContentType(data any) string {
+	if data == nil {
+		return textPlain
+	}
+	t := reflect.TypeOf(data)
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Struct, reflect.Map:
+		return applicationJson
+	default:
+		return textPlain
+	}
+}
+
 func catchRuntimePanic(rw ResponseWriter) {
 	err := recover()
 	if err == nil {
@@ -78,6 +94,7 @@ func catchRuntimePanic(rw ResponseWriter) {
 	err, httpStatus := panicProcessor(err)
 	bytes := errorWriteback(rw, err)
 	rw.WriteHeader(int(httpStatus))
+	rw.Header().Set(contentType, detectContentType(err))
 	rw.writeHeader()
 	_, _ = rw.Write(bytes)
 }
