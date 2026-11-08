@@ -8,8 +8,12 @@ import "net/http"
 
 var processor Processor = nil
 
-type Processor func(w http.ResponseWriter, r *http.Request)
+type Processor func(prw ProcessorResponseWriter, r *http.Request, data any)
 
 func RegisterProcessor(p Processor) {
 	processor = p
+}
+
+type ProcessorResponseWriter interface {
+	Header() http.Header
 }
