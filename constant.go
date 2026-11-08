@@ -24,7 +24,11 @@ const (
 	applicationIni                = "application.ini"
 	headerOrigin                  = "Origin"
 	textPlain                     = "text/plain"
+	multipartFormData             = "multipart/form-data"
+	xWwwFormUrlencoded            = "application/x-www-form-urlencoded"
 	applicationJson               = "application/json"
+	applicationNoJson             = "application/"
+	plusSignJson                  = "+json"
 	contentType                   = "Content-Type"
 	accessControlRequestMethod    = "Access-Control-Request-Method"
 	accessControlAllowOrigin      = "Access-Control-Allow-Origin"
@@ -37,4 +41,5 @@ const (
 	corsOriginNotAllowed          = "CORS origin not allowed"
 	corsMethodNotAllowed          = "CORS method not allowed"
 	corsHeaderNotAllowed          = "CORS header not allowed"
+	responseSerializationFailed   = "response serialization failed"
 )

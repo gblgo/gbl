@@ -112,6 +112,12 @@ func generateRoute() {
 			panic(fmt.Errorf("route handler must have at most one return value: %s", meta.path))
 		}
 
+		// A handler registered as variadic must be invoked with CallSlice. GBL keeps
+		// the public handler contract simple and rejects variadic handlers here.
+		if t.IsVariadic() {
+			panic("variadic handlers are not supported")
+		}
+
 		handler := &routeHandler{
 			hct: textPlain,
 			v:   v,
@@ -163,7 +169,6 @@ func generateRoute() {
 		// Insert routing tree
 		insertNode(segmentMetas, path, method, handler)
 	}
-	println(roots)
 	astFileMap = nil
 	routeMetaSlice = nil
 }
