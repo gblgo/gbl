@@ -6,7 +6,6 @@ package gbl
 
 import (
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -50,10 +49,15 @@ func (ch *corsHandler) matchOrigin(origin string) (string, bool) {
 		if globalCorsConfig.allowCredentials {
 			return null, false
 		}
-		return null, true
+		// The literal "*" must reach the browser: an empty
+		// Access-Control-Allow-Origin value fails the CORS check exactly like a
+		// missing one, so returning "" here silently rejected every cross-origin
+		// response.
+		return asterisk, true
 	}
 
-	if slices.Contains(globalCorsConfig.allowedOrigins, origin) {
+	// Compared case-insensitively, consistent with the wildcard check above.
+	if ch.contains(globalCorsConfig.allowedOrigins, origin) {
 		return origin, true
 	}
 
