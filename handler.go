@@ -67,11 +67,26 @@ func serveHTTP(w http.ResponseWriter, r *http.Request) {
 	rw := &gblResponseWriter{w: w}
 	defer catchRuntimePanic(rw)
 
+	method, known := methodOf(r.Method)
+	if !known {
+		// TRACE, CONNECT and custom verbs are not implemented at all, so this is
+		// not a routing failure and 405 would be the wrong answer.
+		rw.WriteHeader(http.StatusNotImplemented)
+		panic(http.StatusText(http.StatusNotImplemented))
+	}
+
 	pathParams := make(map[string]string)
-	rh := matchNode(parseMethod(r.Method), r.URL.Path, pathParams)
+	rh := matchNode(method, r.URL.Path, pathParams)
+
+	// An unregistered HEAD borrows the GET route: the handler runs normally and
+	// net/http drops the body while keeping Content-Length.
+	if rh == nil && method == methodHead {
+		rh = matchNode(methodGet, r.URL.Path, pathParams)
+	}
+
 	if rh == nil {
-		rw.WriteHeader(http.StatusNotFound)
-		panic(http.StatusText(http.StatusNotFound))
+		abortUnmatched(rw, method, r.URL.Path)
+		return
 	}
 
 	if interceptor != nil {
@@ -80,7 +95,7 @@ func serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	form, files, body, mediaType, err := parseRequestParameters(rw, r)
+	form, files, body, mediaType, err := parseRequestParameters(rw, r, method)
 	if err != nil {
 		writeRequestError(rw, err)
 		return
@@ -104,12 +119,28 @@ func serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out := rv.Call(in)
-	result, err := convertToByteArray(out[0])
-	if err != nil {
-		rw.WriteHeader(http.StatusInternalServerError)
-		panic(responseSerializationFailed)
+
+	// A handler may declare no return value at all, which is how the supported
+	// "write the response myself" style registers itself: reflect.Value.Call then
+	// hands back an empty slice, and there is no value to serialize or to hand to
+	// the processor.
+	var (
+		result []byte
+		data   any
+	)
+
+	if len(out) > 0 {
+		result, err = convertToByteArray(out[0])
+		if err != nil {
+			rw.WriteHeader(http.StatusInternalServerError)
+			panic(responseSerializationFailed)
+		}
+		if out[0].IsValid() {
+			data = out[0].Interface()
+		}
 	}
-	doProcessor(rw, r, out[0].Interface())
+
+	doProcessor(rw, r, data)
 	if rw.written() {
 		return
 	}
@@ -119,11 +150,33 @@ func serveHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(result)
 }
 
+// abortUnmatched Answers a request that matched no route, telling "no such
+// path" apart from "path exists, wrong verb".
+func abortUnmatched(rw *gblResponseWriter, method Method, path string) {
+	allowed := allowFor(path)
+	if len(allowed) == 0 {
+		rw.WriteHeader(http.StatusNotFound)
+		panic(http.StatusText(http.StatusNotFound))
+	}
+
+	rw.Header().Set(allow, strings.Join(allowed, headerComma))
+
+	if method == methodOptions {
+		// OPTIONS succeeded, and a 204 must not carry a body, so the recorded
+		// status is flushed here instead of going through the panic path.
+		rw.WriteHeader(http.StatusNoContent)
+		rw.writeHeader()
+		return
+	}
+
+	rw.WriteHeader(http.StatusMethodNotAllowed)
+	panic(http.StatusText(http.StatusMethodNotAllowed))
+}
+
 func writeRequestError(w http.ResponseWriter, err error) {
 	if errors.Is(err, requestBodyTooLargeError) {
 		w.WriteHeader(http.StatusRequestEntityTooLarge)
 		panic(http.StatusText(http.StatusRequestEntityTooLarge))
-		return
 	}
 	w.WriteHeader(http.StatusBadRequest)
 	panic(err)
@@ -172,7 +225,11 @@ func injectedParameters(
 		}
 	}
 
-	for i, name := range paramNames {
+	// Driven by the signature, never by paramNames: the recovered name list can be
+	// shorter than NumIn when parameters are unnamed, and any length at all when
+	// the source could not be parsed.
+	for i := 0; i < rt.NumIn(); i++ {
+		name := paramNameAt(paramNames, i)
 		t := rt.In(i)
 
 		if isSpecialParameter(t) {
@@ -224,14 +281,28 @@ func injectedParameters(
 	}
 
 	for i, v := range params {
+		name := paramNameAt(paramNames, i)
 		if !v.IsValid() {
-			return nil, fmt.Errorf("parameter %q was not initialized", paramNames[i])
+			return nil, fmt.Errorf("parameter %q was not initialized", name)
 		}
 		if !v.Type().AssignableTo(rt.In(i)) {
-			return nil, fmt.Errorf("parameter %q type mismatch: got %s, want %s", paramNames[i], v.Type(), rt.In(i))
+			return nil, fmt.Errorf("parameter %q type mismatch: got %s, want %s", name, v.Type(), rt.In(i))
 		}
 	}
 	return params, nil
+}
+
+// paramNameAt Bounds-safe lookup of a handler parameter name.
+//
+// generateRoute pads the recovered names to exactly one per parameter, so this
+// normally just reads the slice. The fallback keeps a name list of any length
+// from turning into an index-out-of-range panic, which the recover path would
+// otherwise hand back to the client as a 200 response.
+func paramNameAt(names []string, index int) string {
+	if index < len(names) {
+		return names[index]
+	}
+	return unnamedParamName(index)
 }
 
 func isJSONMediaType(mediaType string) bool {
@@ -517,18 +588,15 @@ func bindTextValue(t reflect.Type, values []string) (reflect.Value, error) {
 	return result, nil
 }
 
-func parseRequestParameters(w http.ResponseWriter, r *http.Request) (url.Values, Files, []byte, string, error) {
+func parseRequestParameters(w http.ResponseWriter, r *http.Request, method Method) (url.Values, Files, []byte, string, error) {
 	// GBL deliberately applies a strict parameter-source policy by HTTP method.
-	// GET and DELETE may read only URL path parameters (matched by the router)
-	// and URL query parameters. Their request bodies are never parsed or read,
-	// regardless of Content-Type.
-	if r.Method == http.MethodGet || r.Method == http.MethodDelete {
-		return r.URL.Query(), nil, nil, null, nil
-	}
-
-	// Only POST and PUT are allowed to read request bodies. For any other
-	// method, expose query parameters only and leave the body untouched.
-	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+	// GET, HEAD, DELETE and OPTIONS may read only URL path parameters (matched by
+	// the router) and URL query parameters. Their request bodies are never parsed
+	// or read, regardless of Content-Type.
+	//
+	// Only POST, PUT and PATCH may carry a body GBL reads; every other method
+	// exposes query parameters and leaves the body untouched.
+	if !method.isBodyMethod() {
 		return r.URL.Query(), nil, nil, null, nil
 	}
 
