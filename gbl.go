@@ -8,30 +8,18 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 )
 
 func Run() {
 
 	// Configuration initialization
-	var cfg *gblConfig
-
-	// Read the application.ini configuration file in the project's root directory
-	ini, err := ReadIni(applicationIni)
+	//
+	// The snapshot is shared with IniBySection and is loaded on first access,
+	// so registration code may already have pinned it. A missing application.ini
+	// yields an empty snapshot, which generateConfig resolves to pure defaults.
+	cfg, err := generateConfig(iniSnapshot())
 	if err != nil {
-		if os.IsNotExist(err) {
-			cfg = defaultConfig()
-		} else {
-			panic(err)
-		}
-	} else {
-		// Save global parameters
-		iniConfigData = ini
-		// Generate configuration
-		cfg, err = generateConfig(ini)
-		if err != nil {
-			panic(err)
-		}
+		panic(err)
 	}
 
 	// Concatenate address
@@ -70,8 +58,8 @@ func Run() {
 
 	fmt.Printf("gbl server listening on %s\n", addr)
 
-	// Determine whether to enable TSL
-	if cfg.useTSL {
+	// Determine whether to enable TLS
+	if cfg.useTLS {
 		err = server.ServeTLS(ln, cfg.CertFile, cfg.KeyFile)
 	} else {
 		err = server.Serve(ln)

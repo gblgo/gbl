@@ -6,9 +6,12 @@ package gbl
 
 const (
 	methodGet Method = iota
+	methodHead
 	methodPost
 	methodPut
+	methodPatch
 	methodDelete
+	methodOptions
 	methodCount
 	null                          = ""
 	slash                         = "/"
@@ -30,6 +33,7 @@ const (
 	applicationNoJson             = "application/"
 	plusSignJson                  = "+json"
 	contentType                   = "Content-Type"
+	allow                         = "Allow"
 	accessControlRequestMethod    = "Access-Control-Request-Method"
 	accessControlAllowOrigin      = "Access-Control-Allow-Origin"
 	accessControlAllowCredentials = "Access-Control-Allow-Credentials"

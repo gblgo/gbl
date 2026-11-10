@@ -5,7 +5,7 @@
 package gbl
 
 import (
-	"encoding/json/v2"
+	"encoding/json"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -27,6 +27,15 @@ var typeRecognitionError = []byte("Reflection Type Identification Exception")
 
 // errorWriteback Exception information is written back according to the reflection type
 func errorWriteback(w http.ResponseWriter, err any) []byte {
+	// A value implementing error is written back as its message. Reflecting it
+	// instead walks the concrete type, and the usual errors.New and fmt.Errorf
+	// values consist entirely of unexported fields, so the client would receive
+	// an empty "{}" with no information at all. Keeping the message plain also
+	// matches the 404, 405 and 501 replies the framework generates itself.
+	if e, ok := err.(error); ok {
+		return []byte(e.Error())
+	}
+
 	val := reflect.ValueOf(err)
 	var bytes []byte
 	switch val.Kind() {
@@ -38,7 +47,13 @@ func errorWriteback(w http.ResponseWriter, err any) []byte {
 	case reflect.String:
 		bytes = []byte(val.String())
 	case reflect.Pointer, reflect.Interface:
-		errorWriteback(w, val.Elem())
+		// A nil pointer/interface has no element to unwrap.
+		if val.IsNil() {
+			return []byte(null)
+		}
+		// Unwrap one layer and return the result, passing the element value
+		// itself rather than the reflect.Value wrapper.
+		return errorWriteback(w, val.Elem().Interface())
 	case reflect.Bool:
 		bytes = strconv.AppendBool(nil, val.Bool())
 	case reflect.Float32, reflect.Float64:
@@ -61,6 +76,13 @@ func detectContentType(data any) string {
 	if data == nil {
 		return textPlain
 	}
+
+	// errorWriteback renders an error as its plain message rather than as JSON,
+	// so the declared content type has to agree with that body.
+	if _, isError := data.(error); isError {
+		return textPlain
+	}
+
 	t := reflect.TypeOf(data)
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()

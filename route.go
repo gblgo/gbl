@@ -9,8 +9,10 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -21,19 +23,44 @@ var (
 
 type Method uint8
 
-func parseMethod(method string) Method {
-	switch strings.ToUpper(method) {
-	case "GET":
-		return methodGet
-	case "POST":
-		return methodPost
-	case "PUT":
-		return methodPut
-	case "DELETE":
-		return methodDelete
-	default:
-		panic("unsupported http method")
+// methodNames holds the wire spelling of every supported method, indexed by Method.
+var methodNames = [methodCount]string{
+	methodGet:     "GET",
+	methodHead:    "HEAD",
+	methodPost:    "POST",
+	methodPut:     "PUT",
+	methodPatch:   "PATCH",
+	methodDelete:  "DELETE",
+	methodOptions: "OPTIONS",
+}
+
+// allMethods lists every supported method, used by Any.
+var allMethods = []Method{
+	methodGet, methodHead, methodPost, methodPut, methodPatch, methodDelete, methodOptions,
+}
+
+// methodOf Resolves an HTTP method name, reporting false when GBL does not
+// implement that verb at all.
+//
+// The upper-casing keeps the lenient behavior GBL has always had, so a
+// lowercase "get" is still treated as "GET".
+func methodOf(name string) (Method, bool) {
+	upper := strings.ToUpper(name)
+	for m, methodName := range methodNames {
+		if methodName == upper {
+			return Method(m), true
+		}
 	}
+	return 0, false
+}
+
+// isBodyMethod Reports whether GBL parses a request body for this method.
+//
+// GET, HEAD, DELETE and OPTIONS never touch the body, whatever Content-Type the
+// client sent. PATCH joins POST and PUT here because partial updates are its
+// whole purpose.
+func (m Method) isBodyMethod() bool {
+	return m == methodPost || m == methodPut || m == methodPatch
 }
 
 type routeHandler struct {
@@ -99,12 +126,13 @@ func dealPath(path string) ([]segmentMeta, string) {
 func generateRoute() {
 	for _, meta := range routeMetaSlice {
 		segmentMetas, path := dealPath(meta.path)
-		method := parseMethod(meta.method)
+		method := meta.method
+		methodName := methodNames[method]
 
 		v := reflect.ValueOf(meta.fn)
 
 		if !v.IsValid() || v.Kind() != reflect.Func || v.IsNil() {
-			panic(fmt.Errorf("invalid route handler: %s %s, the method is illegal", meta.method, meta.path))
+			panic(fmt.Errorf("invalid route handler: %s %s, the method is illegal", methodName, meta.path))
 		}
 
 		t := v.Type()
@@ -140,35 +168,107 @@ func generateRoute() {
 		}
 
 		if t.NumIn() > 0 {
-			pc := handler.v.Pointer()
-			funPc := runtime.FuncForPC(pc)
-			file, _ := funPc.FileLine(pc)
-			var af *ast.File
-			if f, ok := astFileMap[file]; ok {
-				af = f
-			} else {
-				af, _ = parser.ParseFile(fest, file, nil, parser.ParseComments)
-				astFileMap[file] = af
-			}
-			var funcDecl *ast.FuncDecl
-			ast.Inspect(af, func(n ast.Node) bool {
-				if fd, ok := n.(*ast.FuncDecl); ok && funPc.Name() == af.Name.Name+point+fd.Name.Name {
-					funcDecl = fd
-					return false
-				}
-				return true
-			})
-			var paramNames []string
-			for _, param := range funcDecl.Type.Params.List {
-				for _, name := range param.Names {
-					paramNames = append(paramNames, name.Name)
-				}
-			}
-			handler.paramNames = paramNames
+			handler.paramNames = normalizeParamNames(resolveParamNames(handler.v), t.NumIn())
 		}
 		// Insert routing tree
 		insertNode(segmentMetas, path, method, handler)
 	}
 	astFileMap = nil
 	routeMetaSlice = nil
+}
+
+// resolveParamNames Recovers a handler's parameter names from its own source file.
+//
+// reflect reports a function's parameter types but never its parameter names, and
+// GBL binds request values by name, so the source recorded in the binary is parsed
+// once per file at startup. Two ordinary deployments break that assumption, and
+// neither may abort the process: both fall back to positional placeholders.
+//
+//   - the source no longer lives where it was compiled, which is what a multi-stage
+//     image, -trimpath or shipping a bare binary produces, so ParseFile fails
+//   - the handler is not a plain package-level function: a func literal, a bound
+//     method value or a generic instantiation all carry a symbol matching no FuncDecl
+func resolveParamNames(v reflect.Value) []string {
+	pc := v.Pointer()
+	funPc := runtime.FuncForPC(pc)
+	if funPc == nil {
+		return nil
+	}
+
+	symbol := funPc.Name()
+	file, _ := funPc.FileLine(pc)
+
+	af := astFileMap[file]
+	if af == nil {
+		parsed, err := parser.ParseFile(fest, file, nil, parser.ParseComments)
+		if err != nil {
+			// A failed file is deliberately not cached: every handler in it should
+			// still report its own warning, and a failed open costs microseconds.
+			warnUnboundParams(symbol, "source unavailable: "+err.Error())
+			return nil
+		}
+		astFileMap[file] = parsed
+		af = parsed
+	}
+
+	var funcDecl *ast.FuncDecl
+	ast.Inspect(af, func(n ast.Node) bool {
+		fd, ok := n.(*ast.FuncDecl)
+		if !ok {
+			return true
+		}
+		if symbol == af.Name.Name+point+fd.Name.Name {
+			funcDecl = fd
+			return false
+		}
+		return true
+	})
+
+	if funcDecl == nil {
+		warnUnboundParams(symbol, "no matching declaration in "+file)
+		return nil
+	}
+
+	var paramNames []string
+	for _, param := range funcDecl.Type.Params.List {
+		for _, name := range param.Names {
+			paramNames = append(paramNames, name.Name)
+		}
+	}
+
+	return paramNames
+}
+
+// normalizeParamNames Pads names to exactly count entries, one per parameter.
+//
+// Unnamed parameters contribute nothing to the recovered list, so it can arrive
+// short or empty. Every gap gets a placeholder that cannot collide with a real
+// path, query or JSON key, which keeps binding deterministic rather than letting
+// a later index lookup panic and surface to the client.
+func normalizeParamNames(names []string, count int) []string {
+	normalized := make([]string, count)
+
+	for i := range normalized {
+		if i < len(names) {
+			normalized[i] = names[i]
+		}
+		if normalized[i] == null {
+			normalized[i] = unnamedParamName(i)
+		}
+	}
+
+	return normalized
+}
+
+// unnamedParamName Placeholder for a parameter the source did not name.
+func unnamedParamName(index int) string {
+	return "arg" + strconv.Itoa(index)
+}
+
+// warnUnboundParams Reports a handler whose parameter names could not be resolved.
+//
+// GBL has no logger yet, and a route that silently lost its names is far harder
+// to diagnose than one line printed while the process is still starting up.
+func warnUnboundParams(symbol, reason string) {
+	_, _ = fmt.Fprintf(os.Stderr, "gbl: warning: handler %s parameters cannot be bound by name (%s)\n", symbol, reason)
 }
