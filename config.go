@@ -26,7 +26,7 @@ type gblConfig struct {
 	ReadHeaderTimeout time.Duration
 	WriteTimeout      time.Duration
 	IdleTimeout       time.Duration
-	useTSL            bool
+	useTLS            bool
 }
 
 func defaultConfig() *gblConfig {
@@ -37,7 +37,7 @@ func defaultConfig() *gblConfig {
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       time.Minute,
-		useTSL:            false,
+		useTLS:            false,
 	}
 }
 
@@ -72,7 +72,7 @@ func generateConfig(ini map[string]map[string]string) (*gblConfig, error) {
 	}
 
 	if cfg.CertFile != null && cfg.KeyFile != null {
-		cfg.useTSL = true
+		cfg.useTLS = true
 	}
 
 	return cfg, nil
