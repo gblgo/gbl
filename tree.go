@@ -166,6 +166,39 @@ func matchNode(method Method, path string, params map[string]string) *routeHandl
 	return handler
 }
 
+// allowFor Lists the methods that can actually reach path.
+//
+// Every supported method owns a separate tree, so a miss only proves the path is
+// unreachable for that one verb. Probing the rest tells "no such path" apart
+// from "path exists, wrong verb", which is what the 405 Allow header needs.
+// This runs on the 404/405 path only, so the extra tree walks are affordable.
+func allowFor(path string) []string {
+	reachable := make([]bool, methodCount)
+
+	for m := range methodCount {
+		// A fresh map per probe: searchNode cleans up after a failed branch, but
+		// nothing here should depend on that.
+		if matchNode(Method(m), path, make(map[string]string)) != nil {
+			reachable[m] = true
+		}
+	}
+
+	// HEAD is served by the GET route even when it was never registered, so the
+	// advertised method list has to match what serveHTTP really accepts.
+	if reachable[methodGet] {
+		reachable[methodHead] = true
+	}
+
+	var allowed []string
+	for m, ok := range reachable {
+		if ok {
+			allowed = append(allowed, methodNames[m])
+		}
+	}
+
+	return allowed
+}
+
 func searchNode(root *routeNode, segments []string, index int, params map[string]string) *routeHandler {
 
 	if root == nil {
