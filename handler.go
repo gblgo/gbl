@@ -21,9 +21,18 @@ import (
 )
 
 type (
-	Files          map[string][]*multipart.FileHeader
+	// filesMap maps a multipart form field name to the headers of the files
+	// uploaded under that name. It stays unexported on purpose: the binder
+	// recognizes only the four multipart.FileHeader shapes as handler parameter
+	// types, so this map is internal plumbing with no usable public role.
+	filesMap map[string][]*multipart.FileHeader
+
+	// defaultHandler is the root http.Handler that serves every request that
+	// reaches the engine, before any CORS wrapper is layered on top.
 	defaultHandler struct{}
-	byteSize       int
+
+	// byteSize is a human-readable byte count used by the size setters.
+	byteSize int
 )
 
 var (
@@ -40,11 +49,21 @@ var (
 	fileHeaderSlice          = reflect.TypeFor[[]multipart.FileHeader]()
 )
 
+// Default limits applied at startup and re-applied defensively if a stored
+// value has been corrupted into a non-positive number.
+const (
+	defaultMaxBodySize   = 10 << 20 // Maximum total request body size: 10 MiB.
+	defaultMaxFileMemory = 32 << 20 // Multipart in-memory threshold, not total upload limit.
+)
+
 func init() {
-	maxBodySize.Store(10 << 20)   // Maximum total request body size: 10 MiB.
-	maxFileMemory.Store(32 << 20) // Multipart in-memory threshold, not total upload limit.
+	maxBodySize.Store(defaultMaxBodySize)
+	maxFileMemory.Store(defaultMaxFileMemory)
 }
 
+// SetMaxBodySize sets the hard limit on the total request body size, applied
+// to every body method (POST, PUT, PATCH), multipart uploads included. A body
+// over the limit is rejected with 413. Panics on a non-positive size.
 func SetMaxBodySize(size byteSize) {
 	if size <= 0 {
 		panic("gbl: max body size must be greater than zero")
@@ -52,6 +71,10 @@ func SetMaxBodySize(size byteSize) {
 	maxBodySize.Store(int64(size))
 }
 
+// SetMaxFileSize sets the multipart in-memory threshold: file parts smaller
+// than size stay in memory, larger ones spill to temporary files. It does not
+// limit the total upload size; see SetMaxBodySize for that. Panics on a
+// non-positive size.
 func SetMaxFileSize(size byteSize) {
 	if size <= 0 {
 		panic("gbl: multipart memory threshold must be greater than zero")
@@ -59,10 +82,15 @@ func SetMaxFileSize(size byteSize) {
 	maxFileMemory.Store(int64(size))
 }
 
+// ServeHTTP implements http.Handler and delegates to the engine pipeline.
 func (dh *defaultHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	serveHTTP(w, r)
 }
 
+// serveHTTP is the full request pipeline: method check, route match, HEAD
+// fallback to GET, interceptor hook, parameter parsing and injection, handler
+// invocation, processor hook, response write. Any panic raised below is
+// recovered and rendered by the deferred catchRuntimePanic.
 func serveHTTP(w http.ResponseWriter, r *http.Request) {
 	rw := &gblResponseWriter{w: w}
 	defer catchRuntimePanic(rw)
@@ -101,12 +129,11 @@ func serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.MultipartForm != nil {
-		defer func(MultipartForm *multipart.Form) {
-			err = MultipartForm.RemoveAll()
-			if err != nil {
-				rw.WriteHeader(http.StatusBadRequest)
-				panic(err)
-			}
+		// Temp upload files are removed after the handler returns, whatever the
+		// outcome. The error is not actionable at this point: the response is
+		// already decided, so RemoveAll failures are silently dropped.
+		defer func(form *multipart.Form) {
+			_ = form.RemoveAll()
 		}(r.MultipartForm)
 	}
 
@@ -173,6 +200,9 @@ func abortUnmatched(rw *gblResponseWriter, method Method, path string) {
 	panic(http.StatusText(http.StatusMethodNotAllowed))
 }
 
+// writeRequestError Maps a request-parsing failure to its status code and
+// aborts the pipeline by panicking: the recorded status is flushed by
+// catchRuntimePanic, which uses the panic value as the response body.
 func writeRequestError(w http.ResponseWriter, err error) {
 	if errors.Is(err, requestBodyTooLargeError) {
 		w.WriteHeader(http.StatusRequestEntityTooLarge)
@@ -194,6 +224,10 @@ func isSpecialParameter(t reflect.Type) bool {
 	}
 }
 
+// injectedParameters builds the reflect argument list for a handler call.
+// Every parameter is either "special" (request, writer, file headers) and
+// injected directly, or bound by name from path parameters, a JSON body, or
+// form values, in that precedence order.
 func injectedParameters(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -201,7 +235,7 @@ func injectedParameters(
 	rt reflect.Type,
 	paramNames []string,
 	form url.Values,
-	files Files,
+	files filesMap,
 	body []byte,
 	mediaType string,
 ) ([]reflect.Value, error) {
@@ -215,7 +249,7 @@ func injectedParameters(
 	}
 
 	var jsonFields map[string]json.RawMessage
-	isJSON := isJSONMediaType(mediaType) && len(bytes.TrimSpace(body)) > 0
+	isJSON := isJSONMediaType(mediaType) && hasNonWhitespace(body)
 	if isJSON && len(businessIndexes) > 1 {
 		if err := json.Unmarshal(body, &jsonFields); err != nil {
 			return nil, fmt.Errorf("invalid JSON body: %w", err)
@@ -305,11 +339,22 @@ func paramNameAt(names []string, index int) string {
 	return unnamedParamName(index)
 }
 
+// hasNonWhitespace reports whether data holds at least one byte beyond
+// spaces, tabs and newlines. The scan is allocation-free; TrimSpace would
+// copy the whole (up to multi-MiB) body just to test emptiness.
+func hasNonWhitespace(data []byte) bool {
+	return bytes.ContainsFunc(data, func(r rune) bool {
+		return r != ' ' && r != '\t' && r != '\n' && r != '\r'
+	})
+}
+
 func isJSONMediaType(mediaType string) bool {
 	return mediaType == applicationJson ||
 		(strings.HasPrefix(mediaType, applicationNoJson) && strings.HasSuffix(mediaType, plusSignJson))
 }
 
+// lookupRawJSON finds a JSON field by exact name first, then case-insensitively,
+// mirroring encoding/json's own case-insensitive field matching.
 func lookupRawJSON(fields map[string]json.RawMessage, name string) (json.RawMessage, bool) {
 	if raw, ok := fields[name]; ok {
 		return raw, true
@@ -322,6 +367,7 @@ func lookupRawJSON(fields map[string]json.RawMessage, name string) (json.RawMess
 	return nil, false
 }
 
+// lookupString finds a map value by exact key first, then case-insensitively.
 func lookupString(values map[string]string, name string) (string, bool) {
 	if value, ok := values[name]; ok {
 		return value, true
@@ -334,6 +380,7 @@ func lookupString(values map[string]string, name string) (string, bool) {
 	return null, false
 }
 
+// lookupValues finds url.Values entries by exact key first, then case-insensitively.
 func lookupValues(values url.Values, name string) ([]string, bool) {
 	if v, ok := values[name]; ok {
 		return v, true
@@ -346,7 +393,11 @@ func lookupValues(values url.Values, name string) ([]string, bool) {
 	return nil, false
 }
 
-func bindFormParameter(t reflect.Type, name string, form url.Values, pathParams map[string]string, files Files) (reflect.Value, error) {
+// bindFormParameter binds one non-JSON parameter of any kind: pointers stay nil
+// when their source is absent, structs recurse over their fields, file header
+// types pull from the uploaded files, slices/arrays consume repeated values,
+// and scalars take the first value.
+func bindFormParameter(t reflect.Type, name string, form url.Values, pathParams map[string]string, files filesMap) (reflect.Value, error) {
 	if t.Kind() == reflect.Pointer {
 		// Missing pointer values remain nil instead of allocating an empty value.
 		if _, ok := lookupString(pathParams, name); !ok {
@@ -416,7 +467,9 @@ func bindFormParameter(t reflect.Type, name string, form url.Values, pathParams 
 	}
 }
 
-func bindStruct(t reflect.Type, form url.Values, pathParams map[string]string, files Files) (reflect.Value, error) {
+// bindStruct fills an exported-field struct from form and path values, matching
+// field names case-insensitively without requiring any struct tags.
+func bindStruct(t reflect.Type, form url.Values, pathParams map[string]string, files filesMap) (reflect.Value, error) {
 	result := reflect.New(t).Elem()
 
 	for i := 0; i < t.NumField(); i++ {
@@ -448,7 +501,9 @@ func bindStruct(t reflect.Type, form url.Values, pathParams map[string]string, f
 	return result, nil
 }
 
-func lookupFiles(files Files, name string) ([]*multipart.FileHeader, bool) {
+// lookupFiles finds uploaded file headers by field name, exact match first,
+// then case-insensitively.
+func lookupFiles(files filesMap, name string) ([]*multipart.FileHeader, bool) {
 	if v, ok := files[name]; ok {
 		return v, true
 	}
@@ -460,10 +515,15 @@ func lookupFiles(files Files, name string) ([]*multipart.FileHeader, bool) {
 	return nil, false
 }
 
+// isFileHeaderType reports whether t is one of the four accepted file
+// parameter shapes: multipart.FileHeader, *multipart.FileHeader,
+// []*multipart.FileHeader or []multipart.FileHeader.
 func isFileHeaderType(t reflect.Type) bool {
 	return t == fileHeaderType || t == fileHeaderPtr || t == fileHeaderPs || t == fileHeaderSlice
 }
 
+// bindFileHeaders converts the looked-up file headers into the exact shape the
+// handler parameter asks for, taking the first upload for single-value types.
 func bindFileHeaders(t reflect.Type, headers []*multipart.FileHeader) (reflect.Value, error) {
 	switch t {
 	case fileHeaderPtr:
@@ -491,6 +551,8 @@ func bindFileHeaders(t reflect.Type, headers []*multipart.FileHeader) (reflect.V
 	}
 }
 
+// decodeJSON unmarshals data into a fresh value of type t and returns the
+// populated value (not a pointer to it).
 func decodeJSON(t reflect.Type, data []byte) (reflect.Value, error) {
 	if t == nil {
 		return reflect.Value{}, errors.New("nil JSON target type")
@@ -502,11 +564,14 @@ func decodeJSON(t reflect.Type, data []byte) (reflect.Value, error) {
 	return result.Elem(), nil
 }
 
+// injectSpecialParameter supplies the framework-owned arguments a handler can
+// declare: *http.Request, any http.ResponseWriter implementation, and the file
+// header types, which are matched by parameter name against the uploads.
 func injectSpecialParameter(
 	t reflect.Type,
 	w http.ResponseWriter,
 	r *http.Request,
-	files Files,
+	files filesMap,
 	name string,
 ) (reflect.Value, error) {
 	if t == requestType {
@@ -528,6 +593,9 @@ func injectSpecialParameter(
 	return bindFileHeaders(t, headers)
 }
 
+// bindTextValue converts raw request strings into a scalar (or pointer to
+// scalar) of type t. Only the first value is used; repeated values should be
+// bound to a slice or array parameter instead.
 func bindTextValue(t reflect.Type, values []string) (reflect.Value, error) {
 	if t.Kind() == reflect.Pointer {
 		if len(values) == 0 {
@@ -588,7 +656,9 @@ func bindTextValue(t reflect.Type, values []string) (reflect.Value, error) {
 	return result, nil
 }
 
-func parseRequestParameters(w http.ResponseWriter, r *http.Request, method Method) (url.Values, Files, []byte, string, error) {
+// parseRequestParameters collects handler-bindable inputs for the request:
+// form values, uploaded files, the raw JSON body and the parsed media type.
+func parseRequestParameters(w http.ResponseWriter, r *http.Request, method Method) (url.Values, filesMap, []byte, string, error) {
 	// GBL deliberately applies a strict parameter-source policy by HTTP method.
 	// GET, HEAD, DELETE and OPTIONS may read only URL path parameters (matched by
 	// the router) and URL query parameters. Their request bodies are never parsed
@@ -602,15 +672,16 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method Metho
 
 	var (
 		form      url.Values
-		files     Files
+		files     filesMap
 		body      []byte
 		mediaType string
 	)
 
 	// Apply one hard limit to the entire request body, including multipart files.
+	// The fallback re-applies the default if the stored value was corrupted.
 	limit := maxBodySize.Load()
 	if limit <= 0 {
-		limit = 10 << 20
+		limit = defaultMaxBodySize
 	}
 	if r.Body != nil {
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
@@ -641,7 +712,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method Metho
 	case mediaType == multipartFormData:
 		memory := maxFileMemory.Load()
 		if memory <= 0 {
-			memory = 32 << 20
+			memory = defaultMaxFileMemory
 		}
 		if err := r.ParseMultipartForm(memory); err != nil {
 			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
@@ -674,6 +745,9 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method Metho
 	return form, files, body, mediaType, nil
 }
 
+// convertToByteArray renders a handler return value as the response body:
+// strings and byte slices pass through, scalars are formatted, composites are
+// JSON-marshalled, and nil pointers/interfaces become an empty body.
 func convertToByteArray(val reflect.Value) ([]byte, error) {
 	if !val.IsValid() {
 		return nil, nil
@@ -710,6 +784,8 @@ func convertToByteArray(val reflect.Value) ([]byte, error) {
 	}
 }
 
+// doProcessor runs the registered response processor, if any, giving it a
+// chance to write the response itself before the default serialization path.
 func doProcessor(prw ProcessorResponseWriter, r *http.Request, data any) {
 	if processor == nil {
 		return
