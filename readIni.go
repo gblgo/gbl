@@ -11,6 +11,11 @@ import (
 	"strings"
 )
 
+// ReadIni parses a classic INI file at path into a section -> key -> value map.
+// Blank lines and # comments are skipped, a [section] header opens a new group,
+// and each key = value line fills the current section. A key seen before any
+// section, or a line without "=", is a parse error; a missing file is reported
+// as an os error the caller can test with errors.Is(err, os.ErrNotExist).
 func ReadIni(path string) (map[string]map[string]string, error) {
 
 	file, err := os.Open(path)

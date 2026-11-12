@@ -9,18 +9,15 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"os"
 	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
 )
 
-var (
-	astFileMap = make(map[string]*ast.File)
-	fest       = token.NewFileSet()
-)
-
+// Method is the internal enum of supported HTTP verbs, indexed against
+// methodNames and the per-method route trees. Its values are unexported and it
+// never appears in a public signature — callers always speak in plain strings.
 type Method uint8
 
 // methodNames holds the wire spelling of every supported method, indexed by Method.
@@ -63,13 +60,26 @@ func (m Method) isBodyMethod() bool {
 	return m == methodPost || m == methodPut || m == methodPatch
 }
 
+// routeHandler is a compiled route: the reflect handle to the user function,
+// the content type chosen for its return value, the recovered parameter names,
+// the precomputed bind plan and the frozen middleware chain. Built once in
+// generateRoute and reused verbatim by every matching request.
 type routeHandler struct {
 	hct        string
 	v          reflect.Value
 	t          reflect.Type
 	paramNames []string
+	plan       bindPlan
+	// handlers is this route's frozen request chain: the engine's global
+	// middleware, then the route group's, then the terminal routeEndpoint.
+	// It is assembled once at startup and reused verbatim by every request.
+	handlers []HandlerFunc
 }
 
+// dealPath splits path into per-segment metadata and a normalized route path.
+// A leading empty segment is dropped, ":name" and "{name}" both mark a variable
+// segment and supply its binding name, and malformed patterns (bare ":", "{}",
+// repeated or misplaced markers) abort startup with a panic.
 func dealPath(path string) ([]segmentMeta, string) {
 
 	path = strings.TrimSpace(path)
@@ -123,8 +133,14 @@ func dealPath(path string) ([]segmentMeta, string) {
 	return segmentMetas, slash + strings.Join(segments, slash)
 }
 
-func generateRoute() {
-	for _, meta := range routeMetaSlice {
+// generateRoute turns every queued registration into live routing: it validates
+// the handler, chooses a response content type from its return kind, builds the
+// bind plan and recovers parameter names (aborting at startup if name-based
+// binding would be unreliable), freezes the request middleware chain, and
+// inserts the route into the method's tree. It runs once, at startup, then
+// releases the registration queue and AST cache.
+func (e *Engine) generateRoute() {
+	for _, meta := range e.routeMetaSlice {
 		segmentMetas, path := dealPath(meta.path)
 		method := meta.method
 		methodName := methodNames[method]
@@ -147,7 +163,7 @@ func generateRoute() {
 		}
 
 		handler := &routeHandler{
-			hct: textPlain,
+			hct: textPlainCharset,
 			v:   v,
 			t:   t,
 		}
@@ -159,84 +175,137 @@ func generateRoute() {
 				reflect.Float32, reflect.Float64,
 				reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 				reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-				handler.hct = textPlain
+				handler.hct = textPlainCharset
 			case reflect.Struct, reflect.Pointer, reflect.Interface:
-				handler.hct = applicationJson
+				handler.hct = applicationJsonCharset
 			default:
-				handler.hct = textPlain
+				handler.hct = textPlainCharset
 			}
 		}
 
 		if t.NumIn() > 0 {
-			handler.paramNames = normalizeParamNames(resolveParamNames(handler.v), t.NumIn())
+			handler.plan = buildBindPlan(t)
+			names, resolved := e.resolveParamNames(handler.v)
+			handler.paramNames = normalizeParamNames(names, t.NumIn())
+
+			// A name-dependent handler whose names could not be recovered would
+			// otherwise bind path/query/JSON values to nothing and answer with wrong
+			// data at request time. Fail loudly at startup instead, pointing at the
+			// two fixes that keep the process honest: build without -trimpath, or
+			// bind through a struct whose field names come from reflection.
+			if handler.plan.needsNames && !resolved {
+				panic(fmt.Errorf("gbl: handler for %s %s binds parameters by name, but the parameter names are unavailable at runtime (source not readable, e.g. built with -trimpath or shipped as a bare binary). Rebuild without -trimpath, or bind through a struct / *struct parameter whose field names come from reflection",
+					methodName, meta.path))
+			}
 		}
+
+		// Freeze the request chain: engine middleware run outermost, then the
+		// group's, and the terminal endpoint invokes the business handler. This
+		// slice is shared by every request routed here.
+		chain := make([]HandlerFunc, 0, len(e.middlewares)+len(meta.mw)+1)
+		chain = append(chain, e.middlewares...)
+		chain = append(chain, meta.mw...)
+		chain = append(chain, routeEndpoint)
+		handler.handlers = chain
+
 		// Insert routing tree
-		insertNode(segmentMetas, path, method, handler)
+		e.insertNode(segmentMetas, path, method, handler)
 	}
-	astFileMap = nil
-	routeMetaSlice = nil
+	e.astFileMap = nil
+	e.routeMetaSlice = nil
+	e.generated = true
 }
 
 // resolveParamNames Recovers a handler's parameter names from its own source file.
 //
 // reflect reports a function's parameter types but never its parameter names, and
 // GBL binds request values by name, so the source recorded in the binary is parsed
-// once per file at startup. Two ordinary deployments break that assumption, and
-// neither may abort the process: both fall back to positional placeholders.
+// once per file at startup. The handler is located by SOURCE POSITION — the line
+// the runtime reports for its entry point — rather than by symbol name: a runtime
+// symbol is a full module-qualified path ("github.com/you/pkg.Handler") while the
+// AST records only the package clause ("pkg"), so comparing them silently fails
+// for every package except main and never matches a func literal. Position
+// matching fixes both and additionally resolves closures passed as handlers.
 //
-//   - the source no longer lives where it was compiled, which is what a multi-stage
-//     image, -trimpath or shipping a bare binary produces, so ParseFile fails
-//   - the handler is not a plain package-level function: a func literal, a bound
-//     method value or a generic instantiation all carry a symbol matching no FuncDecl
-func resolveParamNames(v reflect.Value) []string {
+// Two deployments still fall back to positional placeholders, and neither may
+// abort the process:
+//   - the source no longer lives where it was compiled (a multi-stage image,
+//     -trimpath or a bare binary), so the file cannot be parsed;
+//   - the entry line belongs to generated code with no enclosing declaration,
+//     such as the wrapper thunk synthesized for a bound method value.
+//
+// The second return reports whether real names were recovered: callers use it to
+// reject registrations whose binding would otherwise silently send wrong data.
+func (e *Engine) resolveParamNames(v reflect.Value) ([]string, bool) {
 	pc := v.Pointer()
 	funPc := runtime.FuncForPC(pc)
 	if funPc == nil {
-		return nil
+		return nil, false
 	}
 
 	symbol := funPc.Name()
-	file, _ := funPc.FileLine(pc)
+	file, line := funPc.FileLine(pc)
 
-	af := astFileMap[file]
+	af := e.astFileMap[file]
 	if af == nil {
-		parsed, err := parser.ParseFile(fest, file, nil, parser.ParseComments)
+		parsed, err := parser.ParseFile(e.fest, file, nil, parser.ParseComments)
 		if err != nil {
 			// A failed file is deliberately not cached: every handler in it should
 			// still report its own warning, and a failed open costs microseconds.
-			warnUnboundParams(symbol, "source unavailable: "+err.Error())
-			return nil
+			e.warnUnboundParams(symbol, "source unavailable: "+err.Error())
+			return nil, false
 		}
-		astFileMap[file] = parsed
+		e.astFileMap[file] = parsed
 		af = parsed
 	}
 
-	var funcDecl *ast.FuncDecl
-	ast.Inspect(af, func(n ast.Node) bool {
-		fd, ok := n.(*ast.FuncDecl)
-		if !ok {
-			return true
-		}
-		if symbol == af.Name.Name+point+fd.Name.Name {
-			funcDecl = fd
-			return false
-		}
-		return true
-	})
-
-	if funcDecl == nil {
-		warnUnboundParams(symbol, "no matching declaration in "+file)
-		return nil
+	funcType := findFuncTypeAt(e.fest, af, line)
+	if funcType == nil || funcType.Params == nil {
+		e.warnUnboundParams(symbol, "no function enclosing line "+strconv.Itoa(line)+" of "+file)
+		return nil, false
 	}
 
 	var paramNames []string
-	for _, param := range funcDecl.Type.Params.List {
+	for _, param := range funcType.Params.List {
 		for _, name := range param.Names {
 			paramNames = append(paramNames, name.Name)
 		}
 	}
 
-	return paramNames
+	return paramNames, true
+}
+
+// findFuncTypeAt returns the signature of the innermost function declaration or
+// literal whose source span encloses the given line, or nil when none does.
+// Preferring the smallest enclosing span makes a closure passed as a handler
+// resolve to its own func literal rather than to the function that created it.
+func findFuncTypeAt(fset *token.FileSet, file *ast.File, line int) *ast.FuncType {
+	var (
+		best     *ast.FuncType
+		bestSpan = -1
+	)
+	ast.Inspect(file, func(n ast.Node) bool {
+		var funcType *ast.FuncType
+		switch fn := n.(type) {
+		case *ast.FuncDecl:
+			funcType = fn.Type
+		case *ast.FuncLit:
+			funcType = fn.Type
+		default:
+			return true
+		}
+
+		start := fset.Position(n.Pos()).Line
+		end := fset.Position(n.End()).Line
+		if line < start || line > end {
+			return true
+		}
+		if span := end - start; bestSpan < 0 || span < bestSpan {
+			best, bestSpan = funcType, span
+		}
+		return true
+	})
+	return best
 }
 
 // normalizeParamNames Pads names to exactly count entries, one per parameter.
@@ -265,10 +334,10 @@ func unnamedParamName(index int) string {
 	return "arg" + strconv.Itoa(index)
 }
 
-// warnUnboundParams Reports a handler whose parameter names could not be resolved.
-//
-// GBL has no logger yet, and a route that silently lost its names is far harder
-// to diagnose than one line printed while the process is still starting up.
-func warnUnboundParams(symbol, reason string) {
-	_, _ = fmt.Fprintf(os.Stderr, "gbl: warning: handler %s parameters cannot be bound by name (%s)\n", symbol, reason)
+// warnUnboundParams reports a handler whose parameter names could not be
+// resolved. It routes through the engine Logger at warn level, so the notice
+// honors SetLogger and lands wherever the application's warnings are sent,
+// a dedicated warn file included.
+func (e *Engine) warnUnboundParams(symbol, reason string) {
+	e.logger.Warn("unbound handler parameters", "handler", symbol, "reason", reason)
 }

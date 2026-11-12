@@ -17,6 +17,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -27,12 +28,49 @@ type (
 	// types, so this map is internal plumbing with no usable public role.
 	filesMap map[string][]*multipart.FileHeader
 
-	// defaultHandler is the root http.Handler that serves every request that
-	// reaches the engine, before any CORS wrapper is layered on top.
-	defaultHandler struct{}
-
 	// byteSize is a human-readable byte count used by the size setters.
 	byteSize int
+
+	// paramClass is the precomputed binding strategy for one handler parameter,
+	// decided once at route-generation time so the request path never re-runs
+	// reflection-based type classification.
+	paramClass uint8
+
+	// structField is one settable (exported) field of a struct parameter,
+	// cached so bindStruct can skip reflect.Type field introspection per request.
+	structField struct {
+		index int
+		name  string
+		typ   reflect.Type
+	}
+
+	// bindPlan is a handler's immutable binding blueprint, built in generateRoute
+	// from the handler signature. It carries the per-parameter type and class, the
+	// business-parameter indexes, cached top-level struct fields, and whether the
+	// request body/query must be parsed at all, so serveHTTP can skip work for
+	// handlers that bind nothing.
+	bindPlan struct {
+		types           []reflect.Type
+		classes         []paramClass
+		structFields    [][]structField // parallel to types; non-nil only for struct business params
+		businessIndexes []int
+		needsParse      bool
+		// needsNames is true when at least one business parameter must be matched
+		// against the request by its handler parameter name — any scalar, or more
+		// than one business argument (whose JSON members are split by name). A
+		// lone struct/pointer-to-struct is self-describing: its fields come from
+		// reflection, so it binds correctly even when source names are unavailable.
+		needsNames bool
+	}
+)
+
+// Parameter binding classes; the zero value classBind is the common case.
+const (
+	classBind    paramClass = iota // resolved from path/query/body by name
+	classRequest                   // *http.Request, injected directly
+	classWriter                    // http.ResponseWriter (or a satisfying interface)
+	classFiles                     // one of the multipart.FileHeader shapes
+	classContext                   // *Context, injected directly
 )
 
 var (
@@ -42,6 +80,7 @@ var (
 	maxBodySize              atomic.Int64
 	maxFileMemory            atomic.Int64
 	requestType              = reflect.TypeFor[*http.Request]()
+	contextType              = reflect.TypeFor[*Context]()
 	writerType               = reflect.TypeFor[http.ResponseWriter]()
 	fileHeaderType           = reflect.TypeFor[multipart.FileHeader]()
 	fileHeaderPtr            = reflect.TypeFor[*multipart.FileHeader]()
@@ -59,6 +98,33 @@ const (
 func init() {
 	maxBodySize.Store(defaultMaxBodySize)
 	maxFileMemory.Store(defaultMaxFileMemory)
+}
+
+// Per-request scratch reused across the whole process. The wrapper holds only
+// plain fields and the map only strings, so both reset cheaply and carry no
+// request state between uses.
+var (
+	responseWriterPool = sync.Pool{
+		New: func() any { return &gblResponseWriter{} },
+	}
+	pathParamsPool = sync.Pool{
+		New: func() any { return make(map[string]string, 4) },
+	}
+)
+
+// recycle clears the wrapped ResponseWriter reference — so the pool never pins
+// a finished request's writer — and returns the wrapper for reuse. A named
+// method deferred directly (defer rw.recycle()) avoids the heap-allocated
+// closure that defer func(){...}() would cost on every request.
+func (rw *gblResponseWriter) recycle() {
+	rw.w = nil
+	responseWriterPool.Put(rw)
+}
+
+// releasePathParams empties and recycles a pooled path-parameter map.
+func releasePathParams(params map[string]string) {
+	clear(params)
+	pathParamsPool.Put(params)
 }
 
 // SetMaxBodySize sets the hard limit on the total request body size, applied
@@ -82,108 +148,90 @@ func SetMaxFileSize(size byteSize) {
 	maxFileMemory.Store(int64(size))
 }
 
-// ServeHTTP implements http.Handler and delegates to the engine pipeline.
-func (dh *defaultHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	serveHTTP(w, r)
-}
-
 // serveHTTP is the full request pipeline: method check, route match, HEAD
-// fallback to GET, interceptor hook, parameter parsing and injection, handler
-// invocation, processor hook, response write. Any panic raised below is
-// recovered and rendered by the deferred catchRuntimePanic.
-func serveHTTP(w http.ResponseWriter, r *http.Request) {
-	rw := &gblResponseWriter{w: w}
-	defer catchRuntimePanic(rw)
+// fallback to GET, then the route's frozen middleware chain, whose terminal
+// endpoint runs the business handler; finally the staged result is written.
+// Any panic raised below is recovered and rendered by the deferred
+// catchRuntimePanic.
+//
+// The response wrapper, the path-parameter map and the Context are drawn from
+// pools and returned on every exit path. The wrapper handed to middleware and
+// handlers therefore must not be retained past the request.
+func (e *Engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	rw := responseWriterPool.Get().(*gblResponseWriter)
+	*rw = gblResponseWriter{w: w}
+
+	// Registered first so it runs last: the recover/deferred render below still
+	// needs rw.w, and only afterwards may the wrapper be cleared and recycled.
+	defer rw.recycle()
+	defer e.catchRuntimePanic(rw)
 
 	method, known := methodOf(r.Method)
 	if !known {
 		// TRACE, CONNECT and custom verbs are not implemented at all, so this is
 		// not a routing failure and 405 would be the wrong answer.
-		rw.WriteHeader(http.StatusNotImplemented)
-		panic(http.StatusText(http.StatusNotImplemented))
+		abort(http.StatusNotImplemented, http.StatusText(http.StatusNotImplemented))
 	}
 
-	pathParams := make(map[string]string)
-	rh := matchNode(method, r.URL.Path, pathParams)
+	pathParams := pathParamsPool.Get().(map[string]string)
+	defer releasePathParams(pathParams)
+
+	rh := e.matchNode(method, r.URL.Path, pathParams)
 
 	// An unregistered HEAD borrows the GET route: the handler runs normally and
 	// net/http drops the body while keeping Content-Length.
 	if rh == nil && method == methodHead {
-		rh = matchNode(methodGet, r.URL.Path, pathParams)
+		rh = e.matchNode(methodGet, r.URL.Path, pathParams)
 	}
 
 	if rh == nil {
-		abortUnmatched(rw, method, r.URL.Path)
+		e.abortUnmatched(rw, method, r.URL.Path)
 		return
 	}
 
-	if interceptor != nil {
-		if !interceptor(rw, r) || rw.written() {
-			return
+	c := newContext(rw, r, pathParams, rh, method, e.logger)
+	defer c.recycle()
+
+	// Multipart temp files, if any were parsed, are removed once the whole chain
+	// has completed, whatever the outcome and including a panic unwinding it.
+	defer cleanupMultipart(r)
+
+	c.Next()
+
+	// The chain has fully unwound. If the handler produced a result and nothing
+	// wrote a response — the handler directly or a post-handler middleware —
+	// render the staged body with the content type chosen at registration.
+	//
+	// Write through rw, not the raw w: middleware (or the framework) may have
+	// already recorded a status via rw.WriteHeader, and that choice must survive.
+	// rw.WriteHeader is a no-op once a status is recorded, so the 200 here only
+	// applies as a default when nothing set one, and rw.Write flushes the recorded
+	// status before the body.
+	if c.handled && !rw.written() {
+		rw.Header().Set(contentType, c.contentType)
+		if !rw.headed() {
+			rw.WriteHeader(http.StatusOK)
 		}
+		_, _ = rw.Write(c.bytes)
 	}
+}
 
-	form, files, body, mediaType, err := parseRequestParameters(rw, r, method)
-	if err != nil {
-		writeRequestError(rw, err)
-		return
-	}
+// cleanupMultipart releases any temporary files a parsed multipart request left
+// behind. It is deferred once per request and is a no-op unless the body was
+// actually parsed as multipart, so removing files is not actionable here: the
+// response is already decided and removal failures are silently dropped.
+func cleanupMultipart(r *http.Request) {
 	if r.MultipartForm != nil {
-		// Temp upload files are removed after the handler returns, whatever the
-		// outcome. The error is not actionable at this point: the response is
-		// already decided, so RemoveAll failures are silently dropped.
-		defer func(form *multipart.Form) {
-			_ = form.RemoveAll()
-		}(r.MultipartForm)
+		_ = r.MultipartForm.RemoveAll()
 	}
-
-	rt, rv, names := rh.t, rh.v, rh.paramNames
-
-	in, err := injectedParameters(rw, r, pathParams, rt, names, form, files, body, mediaType)
-	if err != nil {
-		rw.WriteHeader(http.StatusBadRequest)
-		panic(err)
-	}
-
-	out := rv.Call(in)
-
-	// A handler may declare no return value at all, which is how the supported
-	// "write the response myself" style registers itself: reflect.Value.Call then
-	// hands back an empty slice, and there is no value to serialize or to hand to
-	// the processor.
-	var (
-		result []byte
-		data   any
-	)
-
-	if len(out) > 0 {
-		result, err = convertToByteArray(out[0])
-		if err != nil {
-			rw.WriteHeader(http.StatusInternalServerError)
-			panic(responseSerializationFailed)
-		}
-		if out[0].IsValid() {
-			data = out[0].Interface()
-		}
-	}
-
-	doProcessor(rw, r, data)
-	if rw.written() {
-		return
-	}
-
-	w.Header().Set(contentType, rh.hct)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(result)
 }
 
 // abortUnmatched Answers a request that matched no route, telling "no such
 // path" apart from "path exists, wrong verb".
-func abortUnmatched(rw *gblResponseWriter, method Method, path string) {
-	allowed := allowFor(path)
+func (e *Engine) abortUnmatched(rw *gblResponseWriter, method Method, path string) {
+	allowed := e.allowFor(path)
 	if len(allowed) == 0 {
-		rw.WriteHeader(http.StatusNotFound)
-		panic(http.StatusText(http.StatusNotFound))
+		abort(http.StatusNotFound, http.StatusText(http.StatusNotFound))
 	}
 
 	rw.Header().Set(allow, strings.Join(allowed, headerComma))
@@ -196,61 +244,133 @@ func abortUnmatched(rw *gblResponseWriter, method Method, path string) {
 		return
 	}
 
-	rw.WriteHeader(http.StatusMethodNotAllowed)
-	panic(http.StatusText(http.StatusMethodNotAllowed))
+	abort(http.StatusMethodNotAllowed, http.StatusText(http.StatusMethodNotAllowed))
 }
 
 // writeRequestError Maps a request-parsing failure to its status code and
-// aborts the pipeline by panicking: the recorded status is flushed by
-// catchRuntimePanic, which uses the panic value as the response body.
-func writeRequestError(w http.ResponseWriter, err error) {
+// aborts the pipeline. Every error reaching here describes the client's own
+// malformed request (bad Content-Type, unparseable body, oversize payload), so
+// its message is safe to send back.
+func writeRequestError(err error) {
 	if errors.Is(err, requestBodyTooLargeError) {
-		w.WriteHeader(http.StatusRequestEntityTooLarge)
-		panic(http.StatusText(http.StatusRequestEntityTooLarge))
+		abort(http.StatusRequestEntityTooLarge, http.StatusText(http.StatusRequestEntityTooLarge))
 	}
-	w.WriteHeader(http.StatusBadRequest)
-	panic(err)
+	abort(http.StatusBadRequest, err.Error())
 }
 
-func isSpecialParameter(t reflect.Type) bool {
-	if t == requestType || t == writerType || t.Implements(writerType) {
-		return true
+// selfDescribing reports whether a business parameter can be bound without its
+// handler parameter name. A struct — or any pointer chain leading to one — names
+// its values by field, which reflection supplies even when the source file is
+// unavailable at runtime; every other kind (scalar, slice, map, interface and
+// pointer to those) is matched against the request by the parameter's own name.
+func selfDescribing(t reflect.Type) bool {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	return t.Kind() == reflect.Struct
+}
+
+// classifyParam decides a parameter's binding class once, at route-generation
+// time. It mirrors the old per-request isSpecialParameter checks but runs the
+// costlier interface-satisfaction probe (t.Implements) only during startup.
+func classifyParam(t reflect.Type) paramClass {
+	if t == contextType {
+		return classContext
+	}
+	if t == requestType {
+		return classRequest
+	}
+	if t == writerType || t.Implements(writerType) {
+		return classWriter
 	}
 	switch t {
 	case fileHeaderType, fileHeaderPtr, fileHeaderPs, fileHeaderSlice:
-		return true
+		return classFiles
 	default:
-		return false
+		return classBind
 	}
 }
 
-// injectedParameters builds the reflect argument list for a handler call.
-// Every parameter is either "special" (request, writer, file headers) and
-// injected directly, or bound by name from path parameters, a JSON body, or
-// form values, in that precedence order.
+// buildBindPlan turns a handler signature into its immutable binding blueprint.
+// It records each parameter's type and class, collects the business-parameter
+// indexes, caches the top-level fields of struct parameters, and flags whether
+// any parameter forces the request body/query to be parsed.
+func buildBindPlan(rt reflect.Type) bindPlan {
+	n := rt.NumIn()
+	plan := bindPlan{
+		types:        make([]reflect.Type, n),
+		classes:      make([]paramClass, n),
+		structFields: make([][]structField, n),
+	}
+	for i := 0; i < n; i++ {
+		t := rt.In(i)
+		plan.types[i] = t
+
+		class := classifyParam(t)
+		plan.classes[i] = class
+		switch class {
+		case classBind:
+			plan.businessIndexes = append(plan.businessIndexes, i)
+			plan.needsParse = true
+			if t.Kind() == reflect.Struct {
+				plan.structFields[i] = precomputeStructFields(t)
+			}
+			if !selfDescribing(t) {
+				plan.needsNames = true
+			}
+		case classFiles:
+			// File headers arrive only through a parsed multipart body.
+			plan.needsParse = true
+		default:
+			// classRequest, classWriter and classContext are injected directly and
+			// never force the body/query to be parsed.
+		}
+	}
+	// More than one business argument is name-dependent even when every one is a
+	// struct: a JSON object body is distributed across them by parameter name.
+	if len(plan.businessIndexes) > 1 {
+		plan.needsNames = true
+	}
+	return plan
+}
+
+// precomputeStructFields lists a struct type's exported fields in declaration
+// order. Every exported field of a freshly allocated value is settable, so the
+// per-request CanSet/PkgPath checks in bindStruct collapse to this cached slice.
+func precomputeStructFields(t reflect.Type) []structField {
+	n := t.NumField()
+	fields := make([]structField, 0, n)
+	for i := 0; i < n; i++ {
+		field := t.Field(i)
+		if field.PkgPath != null {
+			continue // unexported
+		}
+		fields = append(fields, structField{index: i, name: field.Name, typ: field.Type})
+	}
+	return fields
+}
+
+// injectedParameters builds the reflect argument list for a handler call,
+// driven by the handler's precomputed bind plan. Each parameter is injected
+// directly (request, writer, file headers) or bound by name from path
+// parameters, a JSON body, or form values, in that precedence order. Type
+// classification already happened in generateRoute, so nothing here re-inspects
+// the signature with reflection.
 func injectedParameters(
-	w http.ResponseWriter,
-	r *http.Request,
-	pathParams map[string]string,
-	rt reflect.Type,
-	paramNames []string,
+	c *Context,
 	form url.Values,
 	files filesMap,
 	body []byte,
 	mediaType string,
 ) ([]reflect.Value, error) {
-	params := make([]reflect.Value, rt.NumIn())
-	businessIndexes := make([]int, 0, rt.NumIn())
-
-	for i := 0; i < rt.NumIn(); i++ {
-		if !isSpecialParameter(rt.In(i)) {
-			businessIndexes = append(businessIndexes, i)
-		}
-	}
+	rh := c.rh
+	plan := &rh.plan
+	names := rh.paramNames
+	params := make([]reflect.Value, len(plan.types))
 
 	var jsonFields map[string]json.RawMessage
 	isJSON := isJSONMediaType(mediaType) && hasNonWhitespace(body)
-	if isJSON && len(businessIndexes) > 1 {
+	if isJSON && len(plan.businessIndexes) > 1 {
 		if err := json.Unmarshal(body, &jsonFields); err != nil {
 			return nil, fmt.Errorf("invalid JSON body: %w", err)
 		}
@@ -259,15 +379,27 @@ func injectedParameters(
 		}
 	}
 
-	// Driven by the signature, never by paramNames: the recovered name list can be
-	// shorter than NumIn when parameters are unnamed, and any length at all when
-	// the source could not be parsed.
-	for i := 0; i < rt.NumIn(); i++ {
-		name := paramNameAt(paramNames, i)
-		t := rt.In(i)
+	for i := range plan.types {
+		t := plan.types[i]
+		name := paramNameAt(names, i)
 
-		if isSpecialParameter(t) {
-			v, err := injectSpecialParameter(t, w, r, files, name)
+		switch plan.classes[i] {
+		case classContext:
+			params[i] = reflect.ValueOf(c)
+			continue
+		case classRequest:
+			params[i] = reflect.ValueOf(c.Request)
+			continue
+		case classWriter:
+			v, err := injectSpecialParameter(t, c.Writer, c.Request, files, name)
+			if err != nil {
+				return nil, fmt.Errorf("inject parameter %q: %w", name, err)
+			}
+			params[i] = v
+			continue
+		case classFiles:
+			headers, _ := lookupFiles(files, name)
+			v, err := bindFileHeaders(t, headers)
 			if err != nil {
 				return nil, fmt.Errorf("inject parameter %q: %w", name, err)
 			}
@@ -275,8 +407,9 @@ func injectedParameters(
 			continue
 		}
 
-		// Path parameters have priority for scalar handler arguments too.
-		if pathValue, ok := lookupString(pathParams, name); ok {
+		// classBind: a business parameter, resolved from request data. Path
+		// parameters take priority over query/body for scalar arguments too.
+		if pathValue, ok := lookupString(c.params, name); ok {
 			v, err := bindTextValue(t, []string{pathValue})
 			if err != nil {
 				return nil, fmt.Errorf("path parameter %q: %w", name, err)
@@ -286,7 +419,7 @@ func injectedParameters(
 		}
 
 		if isJSON {
-			if len(businessIndexes) == 1 {
+			if len(plan.businessIndexes) == 1 {
 				v, err := decodeJSON(t, body)
 				if err != nil {
 					return nil, fmt.Errorf("JSON parameter %q: %w", name, err)
@@ -307,7 +440,15 @@ func injectedParameters(
 			continue
 		}
 
-		v, err := bindFormParameter(t, name, form, pathParams, files)
+		var (
+			v   reflect.Value
+			err error
+		)
+		if fields := plan.structFields[i]; fields != nil {
+			v, err = bindStructFields(t, fields, form, c.params, files)
+		} else {
+			v, err = bindFormParameter(t, name, form, c.params, files)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("parameter %q: %w", name, err)
 		}
@@ -315,12 +456,12 @@ func injectedParameters(
 	}
 
 	for i, v := range params {
-		name := paramNameAt(paramNames, i)
+		name := paramNameAt(names, i)
 		if !v.IsValid() {
 			return nil, fmt.Errorf("parameter %q was not initialized", name)
 		}
-		if !v.Type().AssignableTo(rt.In(i)) {
-			return nil, fmt.Errorf("parameter %q type mismatch: got %s, want %s", name, v.Type(), rt.In(i))
+		if !v.Type().AssignableTo(plan.types[i]) {
+			return nil, fmt.Errorf("parameter %q type mismatch: got %s, want %s", name, v.Type(), plan.types[i])
 		}
 	}
 	return params, nil
@@ -348,6 +489,8 @@ func hasNonWhitespace(data []byte) bool {
 	})
 }
 
+// isJSONMediaType reports whether a parsed media type is JSON — the exact
+// application/json or a structured suffix such as application/vnd.api+json.
 func isJSONMediaType(mediaType string) bool {
 	return mediaType == applicationJson ||
 		(strings.HasPrefix(mediaType, applicationNoJson) && strings.HasSuffix(mediaType, plusSignJson))
@@ -468,33 +611,37 @@ func bindFormParameter(t reflect.Type, name string, form url.Values, pathParams 
 }
 
 // bindStruct fills an exported-field struct from form and path values, matching
-// field names case-insensitively without requiring any struct tags.
+// field names case-insensitively without requiring any struct tags. It is the
+// general entry used for nested and pointer-to-struct values; a handler's direct
+// struct parameter goes through bindStructFields with a cached field list.
 func bindStruct(t reflect.Type, form url.Values, pathParams map[string]string, files filesMap) (reflect.Value, error) {
+	return bindStructFields(t, precomputeStructFields(t), form, pathParams, files)
+}
+
+// bindStructFields populates a fresh struct of type t from a precomputed field
+// list, so the request path skips reflect.Type field introspection entirely. The
+// per-field precedence matches bindStruct: a path value wins over form/query, and
+// everything else falls through to bindFormParameter.
+func bindStructFields(t reflect.Type, fields []structField, form url.Values, pathParams map[string]string, files filesMap) (reflect.Value, error) {
 	result := reflect.New(t).Elem()
 
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		dst := result.Field(i)
-		if !dst.CanSet() || field.PkgPath != null {
-			continue
-		}
+	for _, field := range fields {
+		dst := result.Field(field.index)
 
 		// No tags are required: Go field names are matched case-insensitively.
-		name := field.Name
-
 		// Path wins over query/form values.
-		if pathValue, ok := lookupString(pathParams, name); ok {
-			value, err := bindTextValue(field.Type, []string{pathValue})
+		if pathValue, ok := lookupString(pathParams, field.name); ok {
+			value, err := bindTextValue(field.typ, []string{pathValue})
 			if err != nil {
-				return reflect.Value{}, fmt.Errorf("path field %q: %w", field.Name, err)
+				return reflect.Value{}, fmt.Errorf("path field %q: %w", field.name, err)
 			}
 			dst.Set(value)
 			continue
 		}
 
-		value, err := bindFormParameter(field.Type, name, form, pathParams, files)
+		value, err := bindFormParameter(field.typ, field.name, form, pathParams, files)
 		if err != nil {
-			return reflect.Value{}, fmt.Errorf("field %q: %w", field.Name, err)
+			return reflect.Value{}, fmt.Errorf("field %q: %w", field.name, err)
 		}
 		dst.Set(value)
 	}
@@ -667,6 +814,12 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method Metho
 	// Only POST, PUT and PATCH may carry a body GBL reads; every other method
 	// exposes query parameters and leaves the body untouched.
 	if !method.isBodyMethod() {
+		// No query string means nothing to bind from the URL: returning a nil
+		// form avoids the empty url.Values map r.URL.Query() would allocate, and
+		// every form lookup already treats a nil map as "not found".
+		if r.URL.RawQuery == null {
+			return nil, nil, nil, null, nil
+		}
 		return r.URL.Query(), nil, nil, null, nil
 	}
 
@@ -747,7 +900,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method Metho
 
 // convertToByteArray renders a handler return value as the response body:
 // strings and byte slices pass through, scalars are formatted, composites are
-// JSON-marshalled, and nil pointers/interfaces become an empty body.
+// JSON-marshaled, and nil pointers/interfaces become an empty body.
 func convertToByteArray(val reflect.Value) ([]byte, error) {
 	if !val.IsValid() {
 		return nil, nil
@@ -782,13 +935,4 @@ func convertToByteArray(val reflect.Value) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unsupported response type: %s", val.Type())
 	}
-}
-
-// doProcessor runs the registered response processor, if any, giving it a
-// chance to write the response itself before the default serialization path.
-func doProcessor(prw ProcessorResponseWriter, r *http.Request, data any) {
-	if processor == nil {
-		return
-	}
-	processor(prw, r, data)
 }

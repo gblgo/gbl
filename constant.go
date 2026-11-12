@@ -4,6 +4,11 @@
 
 package gbl
 
+// Package-wide internal constants, kept in one place so these magic values are
+// single-sourced rather than scattered across the code. The first run defines the
+// Method enum (methodGet..methodOptions, with methodCount as its size and never a
+// real verb); the rest are shared string literals — delimiter/empty shortcuts,
+// HTTP header names, media types and fixed error/response texts.
 const (
 	methodGet Method = iota
 	methodHead
@@ -16,7 +21,6 @@ const (
 	null                          = ""
 	slash                         = "/"
 	colon                         = ":"
-	point                         = "."
 	comma                         = ","
 	asterisk                      = "*"
 	leftCurlyBrace                = "{"
@@ -26,10 +30,11 @@ const (
 	headerComma                   = ", "
 	applicationIni                = "application.ini"
 	headerOrigin                  = "Origin"
-	textPlain                     = "text/plain"
+	textPlainCharset              = "text/plain; charset=utf-8"
 	multipartFormData             = "multipart/form-data"
 	xWwwFormUrlencoded            = "application/x-www-form-urlencoded"
 	applicationJson               = "application/json"
+	applicationJsonCharset        = "application/json; charset=utf-8"
 	applicationNoJson             = "application/"
 	plusSignJson                  = "+json"
 	contentType                   = "Content-Type"
