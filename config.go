@@ -12,23 +12,33 @@ import (
 	"time"
 )
 
+// durationType is cached so the time.Duration special case in setConfigValue can
+// compare against it without rebuilding the type on every config field.
 var durationType = reflect.TypeFor[time.Duration]()
 
-// gblConfig
-// CertFile: Certificate file path
-// KeyFile: SecretKeyFile path
+// gblConfig is the resolved runtime configuration: defaults from defaultConfig,
+// then overlaid with values read from the [gbl] section of application.ini. Each
+// field maps to an ini key by its name (see formatName); useTLS is derived, not
+// set directly.
 type gblConfig struct {
-	Name              string
-	Port              string
-	CertFile          string
-	KeyFile           string
-	ReadTimeout       time.Duration
-	ReadHeaderTimeout time.Duration
-	WriteTimeout      time.Duration
-	IdleTimeout       time.Duration
-	useTLS            bool
+	Name              string        // application name
+	Port              string        // listen port, without the leading colon
+	CertFile          string        // TLS certificate file path
+	KeyFile           string        // TLS private key file path
+	LogFile           string        // combined file for every level; the lowest-specificity destination
+	LogDir            string        // directory holding auto-named info.log/warn.log/error.log
+	InfoLog           string        // explicit path for the info level; beats LogDir and LogFile
+	WarnLog           string        // explicit path for the warn level; beats LogDir and LogFile
+	ErrorLog          string        // explicit path for the error level; beats LogDir and LogFile
+	ReadTimeout       time.Duration // max duration to read an entire request
+	ReadHeaderTimeout time.Duration // max duration to read request headers
+	WriteTimeout      time.Duration // max duration to write an entire response
+	IdleTimeout       time.Duration // max idle wait before a keep-alive connection closes
+	useTLS            bool          // derived: true when both CertFile and KeyFile are set
 }
 
+// defaultConfig returns the baseline used when application.ini is absent or omits
+// a key: name "gbl" on port 9801 with the standard server timeouts.
 func defaultConfig() *gblConfig {
 	return &gblConfig{
 		Name:              "gbl",
@@ -56,7 +66,7 @@ func generateConfig(ini map[string]map[string]string) (*gblConfig, error) {
 
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
-		// Get INI Tag
+		// Obtain INI Tag
 		key1, key2 := formatName(field.Name)
 		raw, exists := values[key1]
 		if !exists {

@@ -26,7 +26,7 @@ var (
 // loadIni Reads application.ini at most once and freezes the snapshot.
 //
 // The file is read on first access instead of inside Run, so configuration is
-// already available while routes, interceptors and processors are registered.
+// already available while routes and middleware are registered.
 //
 // A missing application.ini is a normal empty configuration: defaults apply and
 // every getter simply reports "not found". A file that exists but cannot be
