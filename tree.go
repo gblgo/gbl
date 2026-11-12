@@ -7,26 +7,32 @@ package gbl
 import (
 	"fmt"
 	"strings"
+	"sync"
 )
 
-var roots = make([]*routeNode, methodCount)
-
+// routeNode is one segment in a method's routing tree. A path is matched by
+// walking segments from the root; the node where the last segment lands either
+// terminates in a handler (exist) or is only a waypoint on a longer route.
 type routeNode struct {
-	segment    string
-	path       string
-	paramName  string
-	exist      bool
-	handler    *routeHandler
-	staticNode map[string]*routeNode
-	varNode    []*routeNode
+	segment    string                // raw segment text this node was created for
+	path       string                // full route path, set only on a terminal node
+	paramName  string                // binding name when segment is a variable, e.g. "id" for ":id"
+	exist      bool                  // true when a handler is registered at this node
+	handler    *routeHandler         // handler reached at this node, valid when exist
+	staticNode map[string]*routeNode // literal children, keyed by exact segment text
+	varNode    []*routeNode          // wildcard children, matched against any segment
 }
 
+// segmentMeta is one parsed segment of a registration path: its text, whether
+// it is a variable, and the parameter name to bind when it is.
 type segmentMeta struct {
 	segment   string
 	paramName string
 	isVar     bool
 }
 
+// newNode builds an empty, non-terminal node for segment, ready to receive
+// children.
 func newNode(segment string) *routeNode {
 	return &routeNode{
 		segment:    segment,
@@ -37,6 +43,11 @@ func newNode(segment string) *routeNode {
 	}
 }
 
+// hasSameRoute reports whether segments[index:] already terminates on an
+// existing route beneath node, returning that route's full path. It is the
+// conflict probe used before inserting a new variable node: two differently
+// named variables occupying the same position would match identically, and the
+// caller rejects that.
 func hasSameRoute(node *routeNode, segments []segmentMeta, index int) (bool, string) {
 	if node == nil {
 		return false, null
@@ -61,14 +72,18 @@ func hasSameRoute(node *routeNode, segments []segmentMeta, index int) (bool, str
 	return hasSameRoute(next, segments, index+1)
 }
 
-func insertNode(segmentMetas []segmentMeta, path string, method Method, handler *routeHandler) {
+// insertNode walks segmentMetas down the tree for method, creating static and
+// variable nodes as needed and attaching handler at the terminal node. Duplicate
+// concrete routes and structurally equivalent variable routes abort startup with
+// a panic, since both would leave matching ambiguous.
+func (e *Engine) insertNode(segmentMetas []segmentMeta, path string, method Method, handler *routeHandler) {
 
 	// Get the root node of the corresponding method
-	root := roots[method]
+	root := e.roots[method]
 	// Check if the root node is null
 	if root == nil {
 		root = newNode(slash)
-		roots[method] = root
+		e.roots[method] = root
 	}
 	// Insert route segments
 	for i, meta := range segmentMetas {
@@ -133,35 +148,44 @@ func insertNode(segmentMetas []segmentMeta, path string, method Method, handler 
 	}
 }
 
-func getLegalSegments(path string) []string {
-	path = strings.TrimSpace(path)
-	parts := strings.Split(path, slash)
-	segments := make([]string, 0, len(parts))
-
-	for _, part := range parts {
-		if part == null {
-			continue
-		}
-		segments = append(segments, part)
-	}
-
-	return segments
+// segmentPool recycles the per-request slice of path segments so matchNode
+// allocates nothing once warm. A pointer to the slice is stored to keep the
+// Get/Put boxing itself allocation-free.
+var segmentPool = sync.Pool{
+	New: func() any { s := make([]string, 0, 8); return &s },
 }
 
-func matchNode(method Method, path string, params map[string]string) *routeHandler {
+// splitPathInto appends the non-empty "/"-separated segments of path to dst and
+// returns the grown slice, reusing dst's backing array. Segments are substrings
+// sharing path's storage, so unlike strings.Split this copies nothing.
+func splitPathInto(dst []string, path string) []string {
+	for {
+		for len(path) > 0 && path[0] == '/' {
+			path = path[1:]
+		}
+		if len(path) == 0 {
+			return dst
+		}
+		var segment string
+		segment, path, _ = strings.Cut(path, slash)
+		dst = append(dst, segment)
+	}
+}
 
-	segments := getLegalSegments(path)
-
-	root := roots[method]
+// matchNode finds the handler registered for method and path, filling params
+// with any bound path-variable values along the way. It returns nil when the
+// method has no tree yet or nothing under it matches.
+func (e *Engine) matchNode(method Method, path string, params map[string]string) *routeHandler {
+	root := e.roots[method]
 	if root == nil {
 		return nil
 	}
 
+	bufp := segmentPool.Get().(*[]string)
+	segments := splitPathInto((*bufp)[:0], path)
 	handler := searchNode(root, segments, 0, params)
-
-	if handler == nil {
-		return nil
-	}
+	*bufp = segments
+	segmentPool.Put(bufp)
 
 	return handler
 }
@@ -172,13 +196,13 @@ func matchNode(method Method, path string, params map[string]string) *routeHandl
 // unreachable for that one verb. Probing the rest tells "no such path" apart
 // from "path exists, wrong verb", which is what the 405 Allow header needs.
 // This runs on the 404/405 path only, so the extra tree walks are affordable.
-func allowFor(path string) []string {
+func (e *Engine) allowFor(path string) []string {
 	reachable := make([]bool, methodCount)
 
 	for m := range methodCount {
 		// A fresh map per probe: searchNode cleans up after a failed branch, but
 		// nothing here should depend on that.
-		if matchNode(Method(m), path, make(map[string]string)) != nil {
+		if e.matchNode(Method(m), path, make(map[string]string)) != nil {
 			reachable[m] = true
 		}
 	}
@@ -199,6 +223,11 @@ func allowFor(path string) []string {
 	return allowed
 }
 
+// searchNode recursively matches segments[index:] starting at root, preferring
+// a static child over a variable one at every level. When it commits to a
+// variable branch it records the segment under that node's parameter name and,
+// if the branch later proves dead, deletes it again so a failed search leaves
+// no stray params behind.
 func searchNode(root *routeNode, segments []string, index int, params map[string]string) *routeHandler {
 
 	if root == nil {
