@@ -5,32 +5,64 @@
 package gbl
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// CorsConfig describes the cross-origin policy applied by the CORS layer. Its
-// fields are unexported because the public construction path is still being
-// finalized; application code should not yet build one by hand.
+// CorsConfig describes the cross-origin policy applied by the CORS layer.
+// All fields are exported: build one with a struct literal and install it
+// with SetCorsConfig (nil disables CORS).
 type CorsConfig struct {
-	allowedOrigins   []string      // origins accepted via Access-Control-Allow-Origin, or "*"
-	allowedMethods   []string      // methods permitted for cross-origin requests
-	allowedHeaders   []string      // request headers accepted in a preflight
-	exposedHeaders   []string      // response headers readable by the cross-origin client
-	allowCredentials bool          // whether cookies/auth may accompany cross-origin calls
-	maxAge           time.Duration // how long a client may cache the preflight result
+	AllowedOrigins   []string      // origins accepted via Access-Control-Allow-Origin, or "*"
+	AllowedMethods   []string      // methods permitted for cross-origin requests
+	AllowedHeaders   []string      // request headers accepted in a preflight
+	ExposedHeaders   []string      // response headers readable by the cross-origin client
+	AllowCredentials bool          // whether cookies/auth may accompany cross-origin calls
+	MaxAge           time.Duration // how long a client may cache the preflight result
+}
+
+// validate enforces the CORS security policy at wiring time, so an unsafe
+// configuration can never reach Run and silently weaken every response. The
+// CORS spec forbids Access-Control-Allow-Credentials: true together with a
+// wildcard Access-Control-Allow-Origin: "*", because that would let any site
+// make credentialed (cookie/auth-bearing) cross-origin calls. Such a config is
+// a mistake, not a runtime condition, so it is reported as an error that the
+// caller turns into a logged startup abort instead of being quietly downgraded
+// per request.
+func (cc *CorsConfig) validate() error {
+	if cc.AllowCredentials {
+		for _, origin := range cc.AllowedOrigins {
+			if strings.EqualFold(strings.TrimSpace(origin), asterisk) {
+				return errors.New("gbl: invalid CORS config: AllowCredentials cannot be true while AllowedOrigins contains \"*\"; list the explicit origins allowed to send credentials instead")
+			}
+		}
+	}
+	return nil
 }
 
 // SetCorsConfig installs the CORS configuration on the default engine; Run
 // then wraps the handler chain with it. A nil configuration disables CORS.
+// A configuration rejected by this security policy (see validate) aborts
+// startup here, before Run.
 func SetCorsConfig(cc *CorsConfig) {
+	if cc != nil {
+		if err := cc.validate(); err != nil {
+			defaultEngine.failStartup(err)
+		}
+	}
 	defaultEngine.cors = cc
 }
 
 // UseCors installs the CORS configuration on this engine.
-func (e *Engine) UseCors(cc *CorsConfig) *Engine {
+func (e *engine) UseCors(cc *CorsConfig) *engine {
+	if cc != nil {
+		if err := cc.validate(); err != nil {
+			e.failStartup(err)
+		}
+	}
 	e.cors = cc
 	return e
 }
@@ -44,7 +76,7 @@ func isPreflightRequest(r *http.Request) bool {
 // is present; it decides CORS headers and preflight handling, then delegates the
 // actual request to the wrapped engine.
 type corsHandler struct {
-	engine *Engine
+	engine *engine
 	config *CorsConfig
 }
 
@@ -64,8 +96,8 @@ func (ch *corsHandler) contains(values []string, target string) bool {
 // credentials are enabled, which forbids wildcards); an allow-listed origin is
 // echoed back verbatim.
 func (ch *corsHandler) matchOrigin(origin string) (string, bool) {
-	if ch.contains(ch.config.allowedOrigins, asterisk) {
-		if ch.config.allowCredentials {
+	if ch.contains(ch.config.AllowedOrigins, asterisk) {
+		if ch.config.AllowCredentials {
 			return null, false
 		}
 		// The literal "*" must reach the browser: an empty
@@ -76,7 +108,7 @@ func (ch *corsHandler) matchOrigin(origin string) (string, bool) {
 	}
 
 	// Compared case-insensitively, consistent with the wildcard check above.
-	if ch.contains(ch.config.allowedOrigins, origin) {
+	if ch.contains(ch.config.AllowedOrigins, origin) {
 		return origin, true
 	}
 
@@ -90,7 +122,7 @@ func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	// Methods to get browser requests
 	requestMethod := r.Header.Get(accessControlRequestMethod)
 
-	if !ch.contains(ch.config.allowedMethods, requestMethod) {
+	if !ch.contains(ch.config.AllowedMethods, requestMethod) {
 		http.Error(w, corsMethodNotAllowed, http.StatusForbidden)
 		return
 	}
@@ -106,7 +138,7 @@ func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			if !ch.contains(ch.config.allowedHeaders, h) {
+			if !ch.contains(ch.config.AllowedHeaders, h) {
 				http.Error(w, corsHeaderNotAllowed, http.StatusForbidden)
 				return
 			}
@@ -114,12 +146,12 @@ func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set preflight response headers
-	header.Set(accessControlAllowMethods, strings.Join(ch.config.allowedMethods, headerComma))
+	header.Set(accessControlAllowMethods, strings.Join(ch.config.AllowedMethods, headerComma))
 
-	header.Set(accessControlAllowHeaders, strings.Join(ch.config.allowedHeaders, headerComma))
+	header.Set(accessControlAllowHeaders, strings.Join(ch.config.AllowedHeaders, headerComma))
 
-	if ch.config.maxAge > 0 {
-		header.Set(accessControlMaxAge, strconv.FormatInt(int64(ch.config.maxAge.Seconds()), 10))
+	if ch.config.MaxAge > 0 {
+		header.Set(accessControlMaxAge, strconv.FormatInt(int64(ch.config.MaxAge.Seconds()), 10))
 	}
 
 	header.Add(vary, accessControlRequestMethod)
@@ -159,12 +191,12 @@ func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	header.Set(accessControlAllowOrigin, allowOrigin)
 	header.Add(vary, headerOrigin)
 
-	if ch.config.allowCredentials {
+	if ch.config.AllowCredentials {
 		header.Set(accessControlAllowCredentials, headerTrue)
 	}
 
-	if len(ch.config.exposedHeaders) > 0 {
-		header.Set(accessControlExposeHeaders, strings.Join(ch.config.exposedHeaders, headerComma))
+	if len(ch.config.ExposedHeaders) > 0 {
+		header.Set(accessControlExposeHeaders, strings.Join(ch.config.ExposedHeaders, headerComma))
 	}
 
 	// Handle preflight request
