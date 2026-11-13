@@ -31,8 +31,7 @@ type segmentMeta struct {
 	isVar     bool
 }
 
-// newNode builds an empty, non-terminal node for segment, ready to receive
-// children.
+// newNode builds an empty, non-terminal node for segment, ready to receive children.
 func newNode(segment string) *routeNode {
 	return &routeNode{
 		segment:    segment,
@@ -76,7 +75,7 @@ func hasSameRoute(node *routeNode, segments []segmentMeta, index int) (bool, str
 // variable nodes as needed and attaching handler at the terminal node. Duplicate
 // concrete routes and structurally equivalent variable routes abort startup with
 // a panic, since both would leave matching ambiguous.
-func (e *Engine) insertNode(segmentMetas []segmentMeta, path string, method Method, handler *routeHandler) {
+func (e *engine) insertNode(segmentMetas []segmentMeta, path string, method httpMethod, handler *routeHandler) {
 
 	// Get the root node of the corresponding method
 	root := e.roots[method]
@@ -102,7 +101,7 @@ func (e *Engine) insertNode(segmentMetas []segmentMeta, path string, method Meth
 			if node == nil {
 				for _, vn := range root.varNode {
 					if found, existPath := hasSameRoute(vn, segmentMetas, i+1); found {
-						panic(fmt.Errorf("variable route conflicts: [%s %s]", path, existPath))
+						e.failStartup(fmt.Errorf("variable route conflicts: [%s %s]", path, existPath))
 					}
 				}
 
@@ -113,7 +112,7 @@ func (e *Engine) insertNode(segmentMetas []segmentMeta, path string, method Meth
 
 			if isLast {
 				if node.exist {
-					panic(fmt.Errorf("variable route already exists: [%s %s]", path, node.path))
+					e.failStartup(fmt.Errorf("variable route already exists: [%s %s]", path, node.path))
 				}
 
 				node.exist = true
@@ -136,7 +135,7 @@ func (e *Engine) insertNode(segmentMetas []segmentMeta, path string, method Meth
 		// Handle terminal node
 		if isLast {
 			if node.exist {
-				panic(fmt.Errorf("static route already exists: [%s %s]", path, node.path))
+				e.failStartup(fmt.Errorf("static route already exists: [%s %s]", path, node.path))
 			}
 
 			node.exist = true
@@ -175,7 +174,7 @@ func splitPathInto(dst []string, path string) []string {
 // matchNode finds the handler registered for method and path, filling params
 // with any bound path-variable values along the way. It returns nil when the
 // method has no tree yet or nothing under it matches.
-func (e *Engine) matchNode(method Method, path string, params map[string]string) *routeHandler {
+func (e *engine) matchNode(method httpMethod, path string, params map[string]string) *routeHandler {
 	root := e.roots[method]
 	if root == nil {
 		return nil
@@ -196,13 +195,13 @@ func (e *Engine) matchNode(method Method, path string, params map[string]string)
 // unreachable for that one verb. Probing the rest tells "no such path" apart
 // from "path exists, wrong verb", which is what the 405 Allow header needs.
 // This runs on the 404/405 path only, so the extra tree walks are affordable.
-func (e *Engine) allowFor(path string) []string {
+func (e *engine) allowFor(path string) []string {
 	reachable := make([]bool, methodCount)
 
 	for m := range methodCount {
 		// A fresh map per probe: searchNode cleans up after a failed branch, but
 		// nothing here should depend on that.
-		if e.matchNode(Method(m), path, make(map[string]string)) != nil {
+		if e.matchNode(httpMethod(m), path, make(map[string]string)) != nil {
 			reachable[m] = true
 		}
 	}

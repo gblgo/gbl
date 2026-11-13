@@ -25,8 +25,6 @@ type RouteGroup interface {
 	Delete(string, any) RouteGroup
 	// Options registers an OPTIONS handler under the group's prefix.
 	Options(string, any) RouteGroup
-	// Any registers the handler for every supported method under the prefix.
-	Any(string, any) RouteGroup
 	// Match registers the handler for exactly the named methods under the prefix.
 	Match([]string, string, any) RouteGroup
 }
@@ -34,7 +32,7 @@ type RouteGroup interface {
 // routeGroup is the concrete RouteGroup: it remembers the engine it came from,
 // the path prefix to prepend, and the middleware to attach to its routes.
 type routeGroup struct {
-	engine      *Engine
+	engine      *engine
 	group       string
 	middlewares []HandlerFunc // middleware that runs only for this group's routes
 }
@@ -46,7 +44,7 @@ func Group(group string) RouteGroup {
 }
 
 // Group is the instance-level counterpart of package-level Group.
-func (e *Engine) Group(group string) RouteGroup {
+func (e *engine) Group(group string) RouteGroup {
 	return &routeGroup{engine: e, group: group}
 }
 
@@ -92,18 +90,11 @@ func (rg *routeGroup) Options(path string, fn any) RouteGroup {
 	return rg
 }
 
-func (rg *routeGroup) Any(path string, fn any) RouteGroup {
-	for _, method := range allMethods {
-		rg.engine.registerWith(method, rg.group+path, fn, rg.middlewares)
-	}
-	return rg
-}
-
 func (rg *routeGroup) Match(methods []string, path string, fn any) RouteGroup {
 	for _, name := range methods {
 		method, known := methodOf(name)
 		if !known {
-			panic("unknown http method: " + name)
+			rg.engine.failStartup(unknownHTTPMethodPrefix + name)
 		}
 		rg.engine.registerWith(method, rg.group+path, fn, rg.middlewares)
 	}

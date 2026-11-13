@@ -7,7 +7,7 @@ package gbl
 // routeMeta is a single queued route registration, recorded at Get/Post/... call
 // time and turned into a real handler later, when generateRoute runs at startup.
 type routeMeta struct {
-	method Method
+	method httpMethod
 	path   string
 	fn     any
 	mw     []HandlerFunc // middleware contributed by the route's group, if any
@@ -16,14 +16,14 @@ type routeMeta struct {
 // register queues a route on the engine with no group middleware. Nothing is
 // validated here: generateRoute does the whole check once the process is ready
 // to serve.
-func (e *Engine) register(method Method, path string, fn any) {
+func (e *engine) register(method httpMethod, path string, fn any) {
 	e.registerWith(method, path, fn, nil)
 }
 
 // registerWith queues a route together with the middleware of the group it was
 // registered through; the engine's global middleware are merged in later, at
 // route-generation time.
-func (e *Engine) registerWith(method Method, path string, fn any, mw []HandlerFunc) {
+func (e *engine) registerWith(method httpMethod, path string, fn any, mw []HandlerFunc) {
 	e.routeMetaSlice = append(e.routeMetaSlice,
 		&routeMeta{
 			method: method,
@@ -80,11 +80,6 @@ func Options(path string, fn any) {
 	defaultEngine.register(methodOptions, path, fn)
 }
 
-// Any registers fn for every method GBL supports, OPTIONS included.
-func Any(path string, fn any) {
-	defaultEngine.Any(path, fn)
-}
-
 // Match registers fn for exactly the named methods.
 //
 // Names are the standard HTTP verbs, for example
@@ -94,19 +89,12 @@ func Match(methods []string, path string, fn any) {
 	defaultEngine.Match(methods, path, fn)
 }
 
-// Any is the instance-level counterpart of package-level Any.
-func (e *Engine) Any(path string, fn any) {
-	for _, method := range allMethods {
-		e.register(method, path, fn)
-	}
-}
-
 // Match is the instance-level counterpart of package-level Match.
-func (e *Engine) Match(methods []string, path string, fn any) {
+func (e *engine) Match(methods []string, path string, fn any) {
 	for _, name := range methods {
 		method, known := methodOf(name)
 		if !known {
-			panic("unknown http method: " + name)
+			e.failStartup(unknownHTTPMethodPrefix + name)
 		}
 		e.register(method, path, fn)
 	}
