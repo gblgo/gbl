@@ -4,13 +4,13 @@
 
 package gbl
 
-// Package-wide internal constants, kept in one place so these magic values are
-// single-sourced rather than scattered across the code. The first run defines the
-// Method enum (methodGet..methodOptions, with methodCount as its size and never a
-// real verb); the rest are shared string literals — delimiter/empty shortcuts,
-// HTTP header names, media types and fixed error/response texts.
+// httpMethod enumerates the HTTP verbs the router recognizes. methodCount is
+// never a real verb — it is the size of the enum, used to size the per-method
+// tables. It gets its own const block so these iota values stay separate from
+// the plain string constants below (mixing an iota enum with unrelated consts
+// makes exhaustive-switch tooling misread every switch that touches them).
 const (
-	methodGet Method = iota
+	methodGet httpMethod = iota
 	methodHead
 	methodPost
 	methodPut
@@ -18,6 +18,12 @@ const (
 	methodDelete
 	methodOptions
 	methodCount
+)
+
+// Package-wide internal string constants, kept in one place so these magic values
+// are single-sourced rather than scattered across the code: delimiter/empty
+// shortcuts, HTTP header names, media types and fixed error/response texts.
+const (
 	null                          = ""
 	slash                         = "/"
 	colon                         = ":"
@@ -29,6 +35,7 @@ const (
 	headerTrue                    = "true"
 	headerComma                   = ", "
 	applicationIni                = "application.ini"
+	startErrorLogFile             = "gbl-start-error.log"
 	headerOrigin                  = "Origin"
 	textPlainCharset              = "text/plain; charset=utf-8"
 	multipartFormData             = "multipart/form-data"
@@ -51,4 +58,7 @@ const (
 	corsMethodNotAllowed          = "CORS method not allowed"
 	corsHeaderNotAllowed          = "CORS header not allowed"
 	responseSerializationFailed   = "response serialization failed"
+	unknownHTTPMethodPrefix       = "unknown http method: "
+	injectParameterErrFormat      = "inject parameter %q: %w"
+	jsonParameterErrFormat        = "JSON parameter %q: %w"
 )

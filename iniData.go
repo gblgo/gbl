@@ -50,7 +50,7 @@ func loadIni() {
 func iniSnapshot() map[string]map[string]string {
 	loadIni()
 	if iniLoadErr != nil {
-		panic(iniLoadErr)
+		defaultEngine.failStartup(iniLoadErr)
 	}
 	return iniConfigData
 }
