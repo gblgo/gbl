@@ -7,7 +7,6 @@ package gbl
 import (
 	"context"
 	"errors"
-	"fmt"
 	"go/ast"
 	"go/token"
 	"net"
@@ -19,15 +18,16 @@ import (
 	"time"
 )
 
-// Engine holds all mutable framework state: the routing trees, the queued
-// registrations, the middleware chain and the panic renderer. Once it has been
-// created it is fully self-contained, so a process may run several isolated
-// engines (for example one per test) without them observing each other's routes.
+// engine holds all mutable framework state: the routing trees, the queued
+// registrations, the middleware chain and the panic renderer.
 //
-// The package-level functions (Get, Post, Run, Group, Use, ...) are a thin
-// facade over defaultEngine, so existing global-style code keeps working
-// unchanged while New() offers the instance-isolated alternative.
-type Engine struct {
+// GBL exposes exactly one public engine — the package-level API (Get, Post,
+// Group, Use, Run, ...) operates on the single defaultEngine behind the scenes,
+// so registration and startup can never land on two different instances. The
+// type stays unexported: it exists only so the package's own tests can build
+// isolated engines (each with its own routes and logger) without a listening
+// port, by driving generateRoute and ServeHTTP directly.
+type engine struct {
 	roots          []*routeNode         // one routing tree per supported method
 	routeMetaSlice []*routeMeta         // registrations queued before generateRoute
 	middlewares    []HandlerFunc        // global chain, merged with each group's at generation
@@ -44,13 +44,15 @@ type Engine struct {
 	startMu        sync.Mutex           // guards listener/server assignment
 }
 
-// defaultEngine backs the package-level API. It is created lazily through New
-// so the two constructor paths cannot drift apart.
-var defaultEngine = New()
+// defaultEngine is the one and only engine, backing the entire package-level
+// API. It is created through newEngine so the constructor has a single path.
+var defaultEngine = newEngine()
 
-// New builds an empty Engine with no routes and no hooks.
-func New() *Engine {
-	return &Engine{
+// newEngine builds an empty engine with no routes and no hooks. It is internal:
+// callers reach the framework through the package-level functions, while tests
+// use it to stand up an isolated instance.
+func newEngine() *engine {
+	return &engine{
 		roots:      make([]*routeNode, methodCount),
 		astFileMap: make(map[string]*ast.File),
 		fest:       token.NewFileSet(),
@@ -58,7 +60,8 @@ func New() *Engine {
 	}
 }
 
-// Run starts the server on the configured address and blocks until it stops.
+// Run starts the single public engine on the configured address and blocks
+// until it stops.
 //
 // On SIGINT or SIGTERM it performs a graceful shutdown instead of exiting
 // abruptly: the listener closes and in-flight requests get a window to finish.
@@ -72,22 +75,34 @@ func Run() { defaultEngine.Run() }
 func Shutdown(ctx context.Context) error { return defaultEngine.Shutdown(ctx) }
 
 // Run is the instance-level counterpart of the package-level Run.
-func (e *Engine) Run() {
-	// Configuration initialization
-	//
-	// The snapshot is shared with IniBySection and is loaded on first access,
-	// so registration code may already have pinned it. A missing application.ini
-	// yields an empty snapshot, which generateConfig resolves to pure defaults.
-	cfg, err := generateConfig(iniSnapshot())
-	if err != nil {
-		panic(err)
+func (e *engine) Run() {
+	// Read the frozen configuration snapshot once. A missing application.ini
+	// yields an empty snapshot; a file that exists but cannot be parsed panics
+	// here, before logging can be configured — its destinations live in that same
+	// file, so there is nothing to log through yet.
+	snapshot := iniSnapshot()
+
+	// Bring logging up first, before anything that can fail on a bad
+	// configuration. The log destinations are plain strings that cannot fail to
+	// parse, so resolving them ahead of the full config means every later startup
+	// error — an invalid config value, a route conflict, a busy port — is recorded
+	// in the configured log file rather than only on stderr. With no destination
+	// configured this leaves the default stderr logger in place and opens no file.
+	// If the destination itself is broken, failLoggingSetup falls back to the
+	// console plus a last-resort gbl-start-error.log so the operator can see and
+	// fix the misconfiguration, then still fails fast.
+	if err := e.setupLogging(loggingConfig(snapshot)); err != nil {
+		e.failLoggingSetup(err)
 	}
 
-	// Install level-aware file logging before routing so even startup-time route
-	// warnings reach the right file. With nothing configured this leaves the
-	// default stderr logger in place and opens no file.
-	if err := e.setupLogging(cfg); err != nil {
-		panic(fmt.Errorf("gbl: open log file: %w", err))
+	// Resolve the full configuration now that logging is in place, so a bad value
+	// is reported through the logger before it aborts startup.
+	//
+	// The snapshot is shared with IniBySection and is loaded on first access, so
+	// registration code may already have pinned it.
+	cfg, err := generateConfig(snapshot)
+	if err != nil {
+		e.failStartup(err)
 	}
 
 	// Build the routing trees from everything registered so far.
@@ -97,7 +112,7 @@ func (e *Engine) Run() {
 	addr := colon + cfg.Port
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		panic(err)
+		e.failStartup(err)
 	}
 
 	server := &http.Server{
@@ -138,12 +153,12 @@ func (e *Engine) Run() {
 	// ErrServerClosed is the expected result of a graceful shutdown, not a
 	// crash: only genuine failures propagate as a panic.
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-		panic(serveErr)
+		e.failStartup(serveErr)
 	}
 }
 
 // Shutdown is the instance-level counterpart of the package-level Shutdown.
-func (e *Engine) Shutdown(ctx context.Context) error {
+func (e *engine) Shutdown(ctx context.Context) error {
 	e.startMu.Lock()
 	server := e.server
 	e.startMu.Unlock()
@@ -166,16 +181,16 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 
 // buildHandler assembles the http.Handler chain: the CORS layer wraps the
 // engine only when a configuration has been registered.
-func (e *Engine) buildHandler() http.Handler {
+func (e *engine) buildHandler() http.Handler {
 	if e.cors == nil {
 		return e
 	}
 	return &corsHandler{engine: e, config: e.cors}
 }
 
-// ServeHTTP lets an Engine act directly as an http.Handler, delegating to the
+// ServeHTTP lets an engine act directly as an http.Handler, delegating to the
 // full request pipeline.
-func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (e *engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	e.serveHTTP(w, r)
 }
 

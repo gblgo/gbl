@@ -6,12 +6,12 @@ package gbl
 
 import "net/http"
 
-// ResponseWriter is gbl's response sink handed to handlers, middleware and the
-// panic path. It embeds http.ResponseWriter and adds unexported accessors the
-// framework uses to coordinate deferred writeback — whether a status or body has
-// been committed, the effective status and the byte count — without exposing
-// those internals to application code.
-type ResponseWriter interface {
+// responseWriter is gbl's internal response sink handed to handlers, middleware
+// and the panic path. It embeds http.ResponseWriter and adds unexported
+// accessors the framework uses to coordinate deferred writeback — whether a
+// status or body has been committed, the effective status and the byte count.
+// The type stays unexported so none of those internals surface in the public api.
+type responseWriter interface {
 	http.ResponseWriter
 	written() bool // reports whether any body byte has been written
 	headed() bool  // reports whether a status has been recorded

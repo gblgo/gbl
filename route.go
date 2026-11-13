@@ -15,12 +15,12 @@ import (
 	"strings"
 )
 
-// Method is the internal enum of supported HTTP verbs, indexed against
+// httpMethod is the internal enum of supported HTTP verbs, indexed against
 // methodNames and the per-method route trees. Its values are unexported and it
 // never appears in a public signature — callers always speak in plain strings.
-type Method uint8
+type httpMethod uint8
 
-// methodNames holds the wire spelling of every supported method, indexed by Method.
+// methodNames holds the wire spelling of every supported method, indexed by httpMethod.
 var methodNames = [methodCount]string{
 	methodGet:     "GET",
 	methodHead:    "HEAD",
@@ -31,21 +31,16 @@ var methodNames = [methodCount]string{
 	methodOptions: "OPTIONS",
 }
 
-// allMethods lists every supported method, used by Any.
-var allMethods = []Method{
-	methodGet, methodHead, methodPost, methodPut, methodPatch, methodDelete, methodOptions,
-}
-
 // methodOf Resolves an HTTP method name, reporting false when GBL does not
 // implement that verb at all.
 //
 // The upper-casing keeps the lenient behavior GBL has always had, so a
 // lowercase "get" is still treated as "GET".
-func methodOf(name string) (Method, bool) {
+func methodOf(name string) (httpMethod, bool) {
 	upper := strings.ToUpper(name)
 	for m, methodName := range methodNames {
 		if methodName == upper {
-			return Method(m), true
+			return httpMethod(m), true
 		}
 	}
 	return 0, false
@@ -56,7 +51,7 @@ func methodOf(name string) (Method, bool) {
 // GET, HEAD, DELETE and OPTIONS never touch the body, whatever Content-Type the
 // client sent. PATCH joins POST and PUT here because partial updates are its
 // whole purpose.
-func (m Method) isBodyMethod() bool {
+func (m httpMethod) isBodyMethod() bool {
 	return m == methodPost || m == methodPut || m == methodPatch
 }
 
@@ -70,7 +65,7 @@ type routeHandler struct {
 	t          reflect.Type
 	paramNames []string
 	plan       bindPlan
-	// handlers is this route's frozen request chain: the engine's global
+	// handlers are this route's frozen request chain: the engine's global
 	// middleware, then the route group's, then the terminal routeEndpoint.
 	// It is assembled once at startup and reused verbatim by every request.
 	handlers []HandlerFunc
@@ -79,13 +74,14 @@ type routeHandler struct {
 // dealPath splits path into per-segment metadata and a normalized route path.
 // A leading empty segment is dropped, ":name" and "{name}" both mark a variable
 // segment and supply its binding name, and malformed patterns (bare ":", "{}",
-// repeated or misplaced markers) abort startup with a panic.
-func dealPath(path string) ([]segmentMeta, string) {
+// repeated or misplaced markers) abort startup: the reason is logged through the
+// engine before the panic, so a bad registration stays explainable after deploy.
+func (e *engine) dealPath(path string) ([]segmentMeta, string) {
 
 	path = strings.TrimSpace(path)
 
 	if path == null {
-		panic("when registering a route, the path cannot be empty")
+		e.failStartup("when registering a route, the path cannot be empty")
 	}
 
 	parts := strings.Split(path, slash)
@@ -99,22 +95,22 @@ func dealPath(path string) ([]segmentMeta, string) {
 		meta := segmentMeta{segment: part, isVar: false}
 		if strings.Contains(part, colon) {
 			if len(part) == 1 || strings.LastIndex(part, colon) != 0 {
-				panic("when registering a route, the path cannot be '/:' or '/:***:***:' or '/::', etc")
+				e.failStartup("when registering a route, the path cannot be '/:' or '/:***:***:' or '/::', etc")
 			}
 			meta.isVar = true
 			meta.paramName = part[1:]
 		}
 
 		if strings.Contains(part, leftCurlyBrace) && (len(part) == 1 || strings.LastIndex(part, leftCurlyBrace) != 0) {
-			panic("when registering a route, the path cannot be '/{' or '/{***{***{' or '/{{', etc")
+			e.failStartup("when registering a route, the path cannot be '/{' or '/{***{***{' or '/{{', etc")
 		}
 
 		if strings.Contains(part, rightCurlyBrace) && (len(part) == 1 || strings.Index(part, rightCurlyBrace)+1 != len(part)) {
-			panic("when registering a route, the path cannot be '/}' or '/}***}***}' or '/}}', etc")
+			e.failStartup("when registering a route, the path cannot be '/}' or '/}***}***}' or '/}}', etc")
 		}
 
 		if strings.TrimSuffix(strings.TrimPrefix(part, leftCurlyBrace), rightCurlyBrace) == null {
-			panic("when registering a route, the path cannot be '/{}'")
+			e.failStartup("when registering a route, the path cannot be '/{}'")
 		}
 
 		if strings.Contains(part, leftCurlyBrace) {
@@ -127,7 +123,7 @@ func dealPath(path string) ([]segmentMeta, string) {
 	}
 
 	if len(segmentMetas) == 0 {
-		panic("when registering a route, the path cannot be empty or '/'")
+		e.failStartup("when registering a route, the path cannot be empty or '/'")
 	}
 
 	return segmentMetas, slash + strings.Join(segments, slash)
@@ -139,27 +135,27 @@ func dealPath(path string) ([]segmentMeta, string) {
 // binding would be unreliable), freezes the request middleware chain, and
 // inserts the route into the method's tree. It runs once, at startup, then
 // releases the registration queue and AST cache.
-func (e *Engine) generateRoute() {
+func (e *engine) generateRoute() {
 	for _, meta := range e.routeMetaSlice {
-		segmentMetas, path := dealPath(meta.path)
+		segmentMetas, path := e.dealPath(meta.path)
 		method := meta.method
 		methodName := methodNames[method]
 
 		v := reflect.ValueOf(meta.fn)
 
 		if !v.IsValid() || v.Kind() != reflect.Func || v.IsNil() {
-			panic(fmt.Errorf("invalid route handler: %s %s, the method is illegal", methodName, meta.path))
+			e.failStartup(fmt.Errorf("invalid route handler: %s %s, the method is illegal", methodName, meta.path))
 		}
 
 		t := v.Type()
 		if t.NumOut() > 1 {
-			panic(fmt.Errorf("route handler must have at most one return value: %s", meta.path))
+			e.failStartup(fmt.Errorf("route handler must have at most one return value: %s", meta.path))
 		}
 
 		// A handler registered as variadic must be invoked with CallSlice. GBL keeps
 		// the public handler contract simple and rejects variadic handlers here.
 		if t.IsVariadic() {
-			panic("variadic handlers are not supported")
+			e.failStartup("variadic handlers are not supported")
 		}
 
 		handler := &routeHandler{
@@ -194,7 +190,7 @@ func (e *Engine) generateRoute() {
 			// two fixes that keep the process honest: build without -trimpath, or
 			// bind through a struct whose field names come from reflection.
 			if handler.plan.needsNames && !resolved {
-				panic(fmt.Errorf("gbl: handler for %s %s binds parameters by name, but the parameter names are unavailable at runtime (source not readable, e.g. built with -trimpath or shipped as a bare binary). Rebuild without -trimpath, or bind through a struct / *struct parameter whose field names come from reflection",
+				e.failStartup(fmt.Errorf("gbl: handler for %s %s binds parameters by name, but the parameter names are unavailable at runtime (source not readable, e.g. built with -trimpath or shipped as a bare binary). Rebuild without -trimpath, or bind through a struct / *struct parameter whose field names come from reflection",
 					methodName, meta.path))
 			}
 		}
@@ -236,7 +232,7 @@ func (e *Engine) generateRoute() {
 //
 // The second return reports whether real names were recovered: callers use it to
 // reject registrations whose binding would otherwise silently send wrong data.
-func (e *Engine) resolveParamNames(v reflect.Value) ([]string, bool) {
+func (e *engine) resolveParamNames(v reflect.Value) ([]string, bool) {
 	pc := v.Pointer()
 	funPc := runtime.FuncForPC(pc)
 	if funPc == nil {
@@ -338,6 +334,6 @@ func unnamedParamName(index int) string {
 // resolved. It routes through the engine Logger at warn level, so the notice
 // honors SetLogger and lands wherever the application's warnings are sent,
 // a dedicated warn file included.
-func (e *Engine) warnUnboundParams(symbol, reason string) {
+func (e *engine) warnUnboundParams(symbol, reason string) {
 	e.logger.Warn("unbound handler parameters", "handler", symbol, "reason", reason)
 }

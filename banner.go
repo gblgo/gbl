@@ -19,23 +19,33 @@ var bannerArt = `  ┏━╸  ┏┓   ╻
   ┃╺┓  ┣┻┓  ┃      zero-dependency Go web framework
   ┗━┛  ┗━┛  ┗━╸`
 
+// startupSuccessMessage is the one-line confirmation emitted right after the
+// banner block. Unlike the art it is an ordinary Info record, so it carries the
+// Logger's timestamp and level (and console tint) and lands in the log files as
+// an explicit "we are live" event.
+const startupSuccessMessage = "started successfully, ready to accept requests"
+
 // printBanner emits the startup banner through the engine's Logger so a
-// redirected or structured sink captures startup like any other event. When the
-// Logger also implements BannerLogger the block is handed over for verbatim,
-// prefix-free rendering; otherwise it is delivered as a single Info record.
-func (e *Engine) printBanner(cfg *gblConfig, addr net.Addr) {
+// redirected or structured sink captures startup like any other event. The whole
+// block (logo plus status table) goes out verbatim: through BannerLogger when
+// present, otherwise as a single Info record, so no timestamp or level label
+// crowds the art. A one-line startupSuccessMessage Info record follows the block,
+// and that line does carry the Logger's timestamp and level like any event.
+func (e *engine) printBanner(cfg *gblConfig, addr net.Addr) {
 	block := e.renderBanner(cfg, addr)
 	if bl, ok := e.logger.(BannerLogger); ok {
 		bl.Banner(block)
-		return
+	} else {
+		e.logger.Info(block)
 	}
-	e.logger.Info(block)
+	e.logger.Info(startupSuccessMessage)
 }
 
-// renderBanner assembles the display block: the logo, then an
-// aligned status table. It is layout only — the actual sink is chosen by
-// printBanner.
-func (e *Engine) renderBanner(cfg *gblConfig, addr net.Addr) string {
+// renderBanner assembles the display block: the logo, then an aligned status
+// table. It is layout only; the actual sink is chosen by printBanner. The
+// trailing blank line separates the status table from whatever log line follows
+// (the startup success record) so the block does not crowd it.
+func (e *engine) renderBanner(cfg *gblConfig, addr net.Addr) string {
 	scheme := "http"
 	if cfg.useTLS {
 		scheme = "https"
@@ -53,7 +63,7 @@ func (e *Engine) renderBanner(cfg *gblConfig, addr net.Addr) string {
 		lines[i] = fmt.Sprintf("  %-10s %s", row[0], row[1])
 	}
 
-	return strings.TrimRight(bannerArt, "\n") + "\n\n" + strings.Join(lines, "\n")
+	return strings.TrimRight(bannerArt, "\n") + "\n\n" + strings.Join(lines, "\n") + "\n"
 }
 
 // bannerVersion reports the version the binary was built with, read from the
@@ -61,7 +71,7 @@ func (e *Engine) renderBanner(cfg *gblConfig, addr net.Addr) string {
 // untagged or local build yields "(devel)".
 func bannerVersion() string {
 	info, ok := debug.ReadBuildInfo()
-	if !ok || info.Main.Version == "" {
+	if !ok || info.Main.Version == null {
 		return "(devel)"
 	}
 	return info.Main.Version
@@ -69,9 +79,9 @@ func bannerVersion() string {
 
 // countRoutes totals every handler installed across all method trees. It runs
 // after generateRoute, so the number matches exactly what serveHTTP can match,
-// counting per concrete route rather than per registration (an Any expands to
-// one line per verb, each genuinely routable).
-func (e *Engine) countRoutes() int {
+// counting per concrete route rather than per registration (a Match across
+// several verbs installs one line per verb, each genuinely routable).
+func (e *engine) countRoutes() int {
 	var total int
 	for _, root := range e.roots {
 		total += countRouteNodes(root)
@@ -110,7 +120,7 @@ func displayHost(addr net.Addr) string {
 		return addr.String()
 	}
 	switch host {
-	case "", "0.0.0.0", "::", "[::]":
+	case null, "0.0.0.0", "::", "[::]":
 		host = "localhost"
 	}
 	return host + colon + port

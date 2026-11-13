@@ -35,11 +35,12 @@ var routeEndpoint HandlerFunc = func(c *Context) { c.invokeHandler() }
 // middleware use to hand data to later links and to the handler.
 //
 // A Context is pooled. It must not be retained past the request that produced
-// it, exactly like the ResponseWriter it wraps.
+// it, exactly like the response writer it wraps.
 type Context struct {
-	// Writer is the response sink. It is the framework's pooled wrapper, so it
-	// must not be stored beyond the request.
-	Writer ResponseWriter
+	// writer is the framework's pooled response sink. It stays unexported:
+	// handlers own the response by declaring an http.ResponseWriter parameter,
+	// and it must never be stored beyond the request.
+	writer responseWriter
 	// Request is the inbound HTTP request.
 	Request *http.Request
 
@@ -48,7 +49,7 @@ type Context struct {
 	params      map[string]string
 	query       url.Values // lazily parsed from RawQuery and cached per request by Query
 	rh          *routeHandler
-	method      Method
+	method      httpMethod
 	keys        map[string]any
 	bytes       []byte        // serialized handler result
 	contentType string        // result content type chosen at registration
@@ -65,9 +66,9 @@ var contextPool = sync.Pool{
 
 // newContext fetches a Context primed for one request. handlers already holds
 // the merged chain with the endpoint appended, so the caller only runs Next.
-func newContext(w *gblResponseWriter, r *http.Request, params map[string]string, rh *routeHandler, method Method, logger Logger) *Context {
+func newContext(w *gblResponseWriter, r *http.Request, params map[string]string, rh *routeHandler, method httpMethod, logger Logger) *Context {
 	c := contextPool.Get().(*Context)
-	c.Writer = w
+	c.writer = w
 	c.Request = r
 	c.handlers = rh.handlers
 	c.index = -1
@@ -89,7 +90,7 @@ func newContext(w *gblResponseWriter, r *http.Request, params map[string]string,
 // pool, so a pooled Context never pins a finished request's writer, body or
 // middleware-set values.
 func (c *Context) recycle() {
-	c.Writer = nil
+	c.writer = nil
 	c.Request = nil
 	c.handlers = nil
 	c.params = nil
@@ -124,21 +125,21 @@ func (c *Context) Aborted() bool { return c.index >= abortIndex }
 
 // IsWritten reports whether a response body has already been committed, letting
 // a post-handler middleware decide whether to override the default rendering.
-func (c *Context) IsWritten() bool { return c.Writer.written() }
+func (c *Context) IsWritten() bool { return c.writer.written() }
 
 // StatusCode reports the status that will be, or was, sent for this response:
 // the recorded one once anything has set it, otherwise net/http's 200 default.
 // Because the staged body is committed only after the whole chain unwinds, this
 // prediction is what lets an access-log or metrics middleware read the effective
 // status from c.Next()'s return point.
-func (c *Context) StatusCode() int { return c.Writer.status() }
+func (c *Context) StatusCode() int { return c.writer.status() }
 
 // Size reports the effective response body length: the bytes already written,
 // or — while the staged result has not been committed yet — the length of that
 // staged body. It matches what the pipeline will actually send, so a middleware
 // observing the response after c.Next() sees the true size.
 func (c *Context) Size() int {
-	if n := c.Writer.size(); n > 0 {
+	if n := c.writer.size(); n > 0 {
 		return n
 	}
 	if c.handled {
@@ -149,7 +150,7 @@ func (c *Context) Size() int {
 
 // Status records the response status. Like net/http it reaches the wire on the
 // first write, so a status set before c.Next() survives into the rendered result.
-func (c *Context) Status(code int) { c.Writer.WriteHeader(code) }
+func (c *Context) Status(code int) { c.writer.WriteHeader(code) }
 
 // Param returns a matched path parameter by name.
 func (c *Context) Param(name string) string {
@@ -159,7 +160,7 @@ func (c *Context) Param(name string) string {
 
 // Query returns a URL query value by name. The query string is parsed once on
 // the first call and cached on the Context, so repeated lookups within a request
-// do not re-parse RawQuery into a fresh map each time.
+// do not reparse RawQuery into a fresh map each time.
 func (c *Context) Query(name string) string {
 	if c.query == nil {
 		c.query = c.Request.URL.Query()
@@ -194,9 +195,9 @@ func (c *Context) Result() any {
 
 // String writes a plain-text body with the given status.
 func (c *Context) String(status int, body string) {
-	c.Writer.Header().Set(contentType, textPlainCharset)
-	c.Writer.WriteHeader(status)
-	_, _ = c.Writer.Write([]byte(body))
+	c.writer.Header().Set(contentType, textPlainCharset)
+	c.writer.WriteHeader(status)
+	_, _ = c.writer.Write([]byte(body))
 }
 
 // JSON writes a JSON body with the given status. A marshaling failure is a
@@ -206,16 +207,16 @@ func (c *Context) JSON(status int, value any) {
 	if err != nil {
 		abort(http.StatusInternalServerError, responseSerializationFailed)
 	}
-	c.Writer.Header().Set(contentType, applicationJsonCharset)
-	c.Writer.WriteHeader(status)
-	_, _ = c.Writer.Write(data)
+	c.writer.Header().Set(contentType, applicationJsonCharset)
+	c.writer.WriteHeader(status)
+	_, _ = c.writer.Write(data)
 }
 
 // AbortWithStatus denies the request with a status and no body, flushing the
 // status immediately since no further write will follow.
 func (c *Context) AbortWithStatus(status int) {
-	c.Writer.WriteHeader(status)
-	c.Writer.writeHeader()
+	c.writer.WriteHeader(status)
+	c.writer.writeHeader()
 	c.Abort()
 }
 
@@ -254,7 +255,7 @@ func Use(middleware ...HandlerFunc) { defaultEngine.Use(middleware...) }
 // Use appends middleware that run for every route on this engine. They are
 // combined with each route group's middleware at route-generation time, the
 // engine's running outermost. Register all middleware before Run.
-func (e *Engine) Use(middleware ...HandlerFunc) *Engine {
+func (e *engine) Use(middleware ...HandlerFunc) *engine {
 	e.middlewares = append(e.middlewares, middleware...)
 	return e
 }
@@ -274,7 +275,7 @@ func (c *Context) invokeHandler() {
 		err       error
 	)
 	if rh.plan.needsParse {
-		form, files, body, mediaType, err = parseRequestParameters(c.Writer, c.Request, c.method)
+		form, files, body, mediaType, err = parseRequestParameters(c.writer, c.Request, c.method)
 		if err != nil {
 			writeRequestError(err)
 			return
@@ -294,8 +295,8 @@ func (c *Context) invokeHandler() {
 		// handler runs. A validation failure is still the client's fault, but the
 		// message may expose internal rules, so only a generic 400 is returned and
 		// the detail stays in the server log.
-		if verr := validateBusiness(in, rh.plan.businessIndexes); verr != nil {
-			c.logger.Error("request validation failed", "error", verr)
+		if vErr := validateBusiness(in, rh.plan.businessIndexes); vErr != nil {
+			c.logger.Error("request validation failed", "error", vErr)
 			abort(http.StatusBadRequest, http.StatusText(http.StatusBadRequest))
 			return
 		}

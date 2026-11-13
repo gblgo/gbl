@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Logger is gbl's minimal, zero-dependency logging contract. The framework
@@ -44,6 +45,10 @@ type BannerLogger interface {
 // stdLogger is the default Logger. It writes through the standard library's log
 // package, so output keeps the familiar date/time prefix and can be redirected
 // globally with log.SetOutput. A nil l means "use the package-level logger".
+//
+// The package-level output is upgraded to a level-tinting writer at init while it
+// still points at os.Stderr, so the default console is colored on a real terminal
+// without giving up log.SetOutput redirection.
 type stdLogger struct {
 	l *log.Logger
 }
@@ -51,6 +56,17 @@ type stdLogger struct {
 // newStdLogger builds the default logger backed by the log package's global
 // logger.
 func newStdLogger() stdLogger { return stdLogger{} }
+
+// init upgrades the standard library's default log output to a level-tinting
+// writer, but only while it still points at os.Stderr — that is, the program has
+// not redirected logging itself. The wrapper is a pure pass-through unless stderr
+// is a real terminal, so redirected output, pipes and tests are unaffected, and
+// calling log.SetOutput later replaces the wrapper outright.
+func init() {
+	if log.Writer() == os.Stderr {
+		log.SetOutput(consoleWriter(os.Stderr))
+	}
+}
 
 // NewStdLogger adapts any *log.Logger to the gbl Logger interface, so callers
 // who already configure a standard logger (a specific writer, flags, prefix) can
@@ -115,12 +131,88 @@ func SetLogger(l Logger) { defaultEngine.SetLogger(l) }
 // SetLogger installs a Logger on this engine. It is safe to call before or after
 // routes and middleware are registered; passing nil leaves the current logger
 // untouched.
-func (e *Engine) SetLogger(l Logger) *Engine {
+func (e *engine) SetLogger(l Logger) *engine {
 	if l != nil {
 		e.logger = l
 		e.loggerReplaced = true
 	}
 	return e
+}
+
+// failStartup records a startup, configuration or registration failure through
+// the engine Logger and then panics with the very same value. Logging before the
+// process dies means a deployment that never reaches serving still leaves a
+// durable, sink-routed reason instead of only a bare stderr trace; the panic
+// value is unchanged, so any recover-based caller observes exactly what it would
+// have without the logging. It is deliberately not used for the request-time
+// responseAbort control flow, which is a normal answer rather than a failure.
+func (e *engine) failStartup(reason any) {
+	e.logger.Error("startup aborted", "reason", reason)
+	panic(reason)
+}
+
+// failLoggingSetup aborts startup when the user-configured file logging itself
+// cannot be initialized — a bad path, missing write permission, a full disk. The
+// configured destination is exactly what broke, so the reason cannot be recorded
+// there. To keep the failure unmistakable without demanding any log-capture setup
+// from the operator, it is delivered three ways at once: a structured line on the
+// console through the freshly restored default logger, a plain-language copy in a
+// last-resort gbl-start-error.log placed beside the running executable, and the
+// panic value. Startup still fails fast — a broken logging configuration must
+// never silently run. If even the fallback file cannot be created, the console
+// copy still stands.
+func (e *engine) failLoggingSetup(err error) {
+	// The file config is what failed, so restore the default console logger: it
+	// never depends on the destination that just broke.
+	e.logger = newStdLogger()
+
+	// Anchor the fallback file next to the binary, a location the operator always
+	// knows, rather than in whatever working directory the process was launched
+	// from. The resolved path is reported verbatim so the message points at the
+	// real file.
+	fallback := startErrorFilePath()
+
+	e.logger.Error("file logging could not be initialized",
+		"error", err,
+		"hint", "check that the logFile/logDir/infoLog/warnLog/errorLog path in application.ini exists and is writable",
+		"fallbackFile", fallback)
+
+	e.writeStartErrorFile(fallback, err)
+
+	panic(fmt.Errorf("gbl: file logging could not be initialized: %w (details written to %s)", err, fallback))
+}
+
+// startErrorFilePath resolves gbl-start-error.log against the directory holding
+// the running executable, so a deployed binary drops the diagnostic beside
+// itself instead of into an unpredictable working directory. When the executable
+// path cannot be determined it falls back to the bare name, which resolves
+// against the current working directory.
+func startErrorFilePath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return startErrorLogFile
+	}
+	return filepath.Join(filepath.Dir(exe), startErrorLogFile)
+}
+
+// writeStartErrorFile drops a plain-language diagnostic into the last-resort
+// fallback file, so an operator who turned on file logging — and therefore
+// expects to read a file, not a console — still finds out exactly what broke and
+// how to fix it. It is best-effort: failing to create even this file is reported
+// on the console and otherwise swallowed, because startup is already aborting and
+// the reason has been printed there.
+func (e *engine) writeStartErrorFile(path string, err error) {
+	f, fErr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if fErr != nil {
+		e.logger.Warn("could not create the fallback startup-error file",
+			"file", path, "error", fErr)
+		return
+	}
+	defer f.Close()
+
+	_, _ = fmt.Fprintf(f,
+		"%s\ngbl: startup aborted - the configured file logging could not be initialized.\nReason: %v\nFix: check the logFile/logDir/infoLog/warnLog/errorLog value in application.ini; the path must exist and be writable. Then restart.\n\n",
+		time.Now().Format(time.RFC3339), err)
 }
 
 // levelLogger routes the three levels to independent destinations. Each level
@@ -139,6 +231,37 @@ func (l *levelLogger) Warn(msg string, kv ...any)  { l.warn.Warn(msg, kv...) }
 func (l *levelLogger) Error(msg string, kv ...any) { l.err.Error(msg, kv...) }
 func (l *levelLogger) Banner(block string)         { l.info.Banner(block) }
 
+// loggingConfig resolves only the log-destination keys straight from the raw ini
+// snapshot. Those values are plain strings and can never fail to parse, so
+// logging can be brought up before the rest of the configuration is validated:
+// an invalid config value elsewhere then still lands in the configured log file
+// instead of only on stderr. The result is a partial gblConfig carrying just the
+// destinations setupLogging needs; Run resolves the full configuration after.
+func loggingConfig(ini map[string]map[string]string) *gblConfig {
+	cfg := &gblConfig{}
+	values := ini["gbl"]
+	if values == nil {
+		return cfg
+	}
+	cfg.LogFile = iniValue(values, "LogFile")
+	cfg.LogDir = iniValue(values, "LogDir")
+	cfg.InfoLog = iniValue(values, "InfoLog")
+	cfg.WarnLog = iniValue(values, "WarnLog")
+	cfg.ErrorLog = iniValue(values, "ErrorLog")
+	return cfg
+}
+
+// iniValue returns the raw value stored under a config field's name, accepting
+// both spellings formatName produces (lowerCamel and kebab-case); empty when the
+// key is absent.
+func iniValue(values map[string]string, field string) string {
+	lowerFirst, kebabCase := formatName(field)
+	if v, ok := values[lowerFirst]; ok {
+		return v
+	}
+	return values[kebabCase]
+}
+
 // setupLogging configures level-aware file logging from the resolved
 // configuration. Each level's destination is chosen by precedence: an explicit
 // per-level path (infoLog/warnLog/errorLog), then a file auto-named inside
@@ -151,7 +274,7 @@ func (l *levelLogger) Banner(block string)         { l.info.Banner(block) }
 // remembered so Shutdown closes them. A custom Logger installed via SetLogger
 // takes precedence over all of this: when one is present the file keys are
 // ignored with a one-time startup warning rather than silently replacing it.
-func (e *Engine) setupLogging(cfg *gblConfig) error {
+func (e *engine) setupLogging(cfg *gblConfig) error {
 	paths := map[string]string{
 		"info":  firstNonEmpty(cfg.InfoLog, inDir(cfg.LogDir, "info.log"), cfg.LogFile),
 		"warn":  firstNonEmpty(cfg.WarnLog, inDir(cfg.LogDir, "warn.log"), cfg.LogFile),
@@ -190,7 +313,7 @@ func (e *Engine) setupLogging(cfg *gblConfig) error {
 	}
 
 	// A level with no file still prints to stdout so console output stays whole.
-	stdout := stdLogger{l: log.New(os.Stdout, null, log.LstdFlags)}
+	stdout := stdLogger{l: log.New(consoleWriter(os.Stdout), null, log.LstdFlags)}
 	sink := func(path string) stdLogger {
 		if path == null {
 			return stdout
@@ -209,7 +332,7 @@ func (e *Engine) setupLogging(cfg *gblConfig) error {
 // fileStdLogger creates the parent directory, opens path for appending, records
 // the handle for Shutdown, and returns a stdLogger that mirrors to stdout plus
 // the file.
-func (e *Engine) fileStdLogger(path string) (stdLogger, error) {
+func (e *engine) fileStdLogger(path string) (stdLogger, error) {
 	if dir := filepath.Dir(path); dir != null && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return stdLogger{}, err
@@ -222,7 +345,7 @@ func (e *Engine) fileStdLogger(path string) (stdLogger, error) {
 	}
 	e.logFiles = append(e.logFiles, f)
 
-	return stdLogger{l: log.New(io.MultiWriter(os.Stdout, f), null, log.LstdFlags)}, nil
+	return stdLogger{l: log.New(io.MultiWriter(consoleWriter(os.Stdout), f), null, log.LstdFlags)}, nil
 }
 
 // inDir joins dir and name when dir is set; an empty dir yields an empty path.

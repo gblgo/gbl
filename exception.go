@@ -16,15 +16,12 @@ import (
 // A distinct named type, it documents intent at the hook boundary.
 type HttpStatus int
 
-// ErrorHandlingReturnInfo is the payload a PanicProcessor may return; it accepts
-// any value the response writer can render (string, error, struct, map, ...).
-type ErrorHandlingReturnInfo any
-
 // PanicProcessor is the user-installed hook that renders every recovered panic
-// value into a response body and status. Once registered it owns rendering for
-// all recovered values, genuine crashes included, so it must avoid leaking
-// internal error details to the client.
-type PanicProcessor func(err any) (ErrorHandlingReturnInfo, HttpStatus)
+// value into a response body and status. The body is any value the response
+// writer can render (string, error, struct, map, ...); once registered it owns
+// rendering for all recovered values, genuine crashes included, so it must avoid
+// leaking internal error details to the client.
+type PanicProcessor func(err any) (any, HttpStatus)
 
 // RegisterPanicProcessor installs the panic renderer on the default engine. As
 // soon as one is registered it owns the rendering of every recovered value,
@@ -35,7 +32,7 @@ func RegisterPanicProcessor(p PanicProcessor) {
 }
 
 // SetPanicProcessor installs the panic renderer on this engine.
-func (e *Engine) SetPanicProcessor(p PanicProcessor) *Engine {
+func (e *engine) SetPanicProcessor(p PanicProcessor) *engine {
 	e.panicProcessor = p
 	return e
 }
@@ -146,7 +143,7 @@ func detectContentType(data any) string {
 // handed to a registered PanicProcessor reach the client verbatim; anything
 // else is an unexpected crash, logged server-side and answered with a generic
 // 500 so internal details never leak.
-func (e *Engine) catchRuntimePanic(rw ResponseWriter) {
+func (e *engine) catchRuntimePanic(rw responseWriter) {
 	err := recover()
 	if err == nil {
 		return
@@ -194,6 +191,6 @@ func (e *Engine) catchRuntimePanic(rw ResponseWriter) {
 // It routes through the engine's Logger so the sink honors SetLogger; the
 // recovered value and the goroutine stack are recorded as structured fields so a
 // leak-free 500 stays debuggable in any backend.
-func (e *Engine) logRecoveredPanic(err any) {
+func (e *engine) logRecoveredPanic(err any) {
 	e.logger.Error("recovered panic", "error", err, "stack", string(debug.Stack()))
 }

@@ -28,8 +28,9 @@ type (
 	// types, so this map is internal plumbing with no usable public role.
 	filesMap map[string][]*multipart.FileHeader
 
-	// byteSize is a human-readable byte count used by the size setters.
-	byteSize int
+	// ByteSize is a human-readable byte count used by the size setters: the
+	// exported type name tells a caller, at the signature, that the value is bytes.
+	ByteSize int
 
 	// paramClass is the precomputed binding strategy for one handler parameter,
 	// decided once at route-generation time so the request path never re-runs
@@ -79,6 +80,7 @@ var (
 	responseMismatch         = errors.New("response writer type mismatch")
 	maxBodySize              atomic.Int64
 	maxFileMemory            atomic.Int64
+	maxUploadFileSize        atomic.Int64
 	requestType              = reflect.TypeFor[*http.Request]()
 	contextType              = reflect.TypeFor[*Context]()
 	writerType               = reflect.TypeFor[http.ResponseWriter]()
@@ -91,13 +93,15 @@ var (
 // Default limits applied at startup and re-applied defensively if a stored
 // value has been corrupted into a non-positive number.
 const (
-	defaultMaxBodySize   = 10 << 20 // Maximum total request body size: 10 MiB.
-	defaultMaxFileMemory = 32 << 20 // Multipart in-memory threshold, not total upload limit.
+	defaultMaxBodySize       = 5 << 20 // Maximum total request body size: 5 MiB.
+	defaultMaxFileMemory     = 2 << 20 // Multipart in-memory threshold, not total upload limit.
+	defaultMaxUploadFileSize = 1 << 20 // Hard cap on each individual uploaded file: 1 MiB.
 )
 
 func init() {
 	maxBodySize.Store(defaultMaxBodySize)
 	maxFileMemory.Store(defaultMaxFileMemory)
+	maxUploadFileSize.Store(defaultMaxUploadFileSize)
 }
 
 // Per-request scratch reused across the whole process. The wrapper holds only
@@ -130,9 +134,9 @@ func releasePathParams(params map[string]string) {
 // SetMaxBodySize sets the hard limit on the total request body size, applied
 // to every body method (POST, PUT, PATCH), multipart uploads included. A body
 // over the limit is rejected with 413. Panics on a non-positive size.
-func SetMaxBodySize(size byteSize) {
+func SetMaxBodySize(size ByteSize) {
 	if size <= 0 {
-		panic("gbl: max body size must be greater than zero")
+		defaultEngine.failStartup("gbl: max body size must be greater than zero")
 	}
 	maxBodySize.Store(int64(size))
 }
@@ -141,11 +145,24 @@ func SetMaxBodySize(size byteSize) {
 // than size stay in memory, larger ones spill to temporary files. It does not
 // limit the total upload size; see SetMaxBodySize for that. Panics on a
 // non-positive size.
-func SetMaxFileSize(size byteSize) {
+func SetMaxFileSize(size ByteSize) {
 	if size <= 0 {
-		panic("gbl: multipart memory threshold must be greater than zero")
+		defaultEngine.failStartup("gbl: multipart memory threshold must be greater than zero")
 	}
 	maxFileMemory.Store(int64(size))
+}
+
+// SetMaxUploadFileSize sets a hard, per-file cap on every uploaded file
+// (any field, any part): a multipart file whose size exceeds the cap aborts
+// the request with 413, before the handler runs. It defaults to
+// defaultMaxUploadFileSize (1 MiB). Distinct from SetMaxFileSize, which is
+// only the in-memory spill threshold, and from SetMaxBodySize, which caps the
+// total body. Panics on a non-positive size.
+func SetMaxUploadFileSize(size ByteSize) {
+	if size <= 0 {
+		defaultEngine.failStartup("gbl: max upload file size must be greater than zero")
+	}
+	maxUploadFileSize.Store(int64(size))
 }
 
 // serveHTTP is the full request pipeline: method check, route match, HEAD
@@ -157,12 +174,12 @@ func SetMaxFileSize(size byteSize) {
 // The response wrapper, the path-parameter map and the Context are drawn from
 // pools and returned on every exit path. The wrapper handed to middleware and
 // handlers therefore must not be retained past the request.
-func (e *Engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
+func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	rw := responseWriterPool.Get().(*gblResponseWriter)
 	*rw = gblResponseWriter{w: w}
 
 	// Registered first so it runs last: the recover/deferred render below still
-	// needs rw.w, and only afterwards may the wrapper be cleared and recycled.
+	// needs rw.w, and only afterward may the wrapper be cleared and recycled.
 	defer rw.recycle()
 	defer e.catchRuntimePanic(rw)
 
@@ -228,7 +245,7 @@ func cleanupMultipart(r *http.Request) {
 
 // abortUnmatched Answers a request that matched no route, telling "no such
 // path" apart from "path exists, wrong verb".
-func (e *Engine) abortUnmatched(rw *gblResponseWriter, method Method, path string) {
+func (e *engine) abortUnmatched(rw *gblResponseWriter, method httpMethod, path string) {
 	allowed := e.allowFor(path)
 	if len(allowed) == 0 {
 		abort(http.StatusNotFound, http.StatusText(http.StatusNotFound))
@@ -302,7 +319,7 @@ func buildBindPlan(rt reflect.Type) bindPlan {
 		classes:      make([]paramClass, n),
 		structFields: make([][]structField, n),
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		t := rt.In(i)
 		plan.types[i] = t
 
@@ -340,7 +357,7 @@ func buildBindPlan(rt reflect.Type) bindPlan {
 func precomputeStructFields(t reflect.Type) []structField {
 	n := t.NumField()
 	fields := make([]structField, 0, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		field := t.Field(i)
 		if field.PkgPath != null {
 			continue // unexported
@@ -384,6 +401,10 @@ func injectedParameters(
 		name := paramNameAt(names, i)
 
 		switch plan.classes[i] {
+		case classBind:
+			// The common case: a business parameter resolved from path/query/
+			// body/form by the code below this switch, so nothing to inject
+			// here. Breaking out (no continue) reaches that resolution path.
 		case classContext:
 			params[i] = reflect.ValueOf(c)
 			continue
@@ -391,9 +412,9 @@ func injectedParameters(
 			params[i] = reflect.ValueOf(c.Request)
 			continue
 		case classWriter:
-			v, err := injectSpecialParameter(t, c.Writer, c.Request, files, name)
+			v, err := injectSpecialParameter(t, c.writer, c.Request, files, name)
 			if err != nil {
-				return nil, fmt.Errorf("inject parameter %q: %w", name, err)
+				return nil, fmt.Errorf(injectParameterErrFormat, name, err)
 			}
 			params[i] = v
 			continue
@@ -401,7 +422,7 @@ func injectedParameters(
 			headers, _ := lookupFiles(files, name)
 			v, err := bindFileHeaders(t, headers)
 			if err != nil {
-				return nil, fmt.Errorf("inject parameter %q: %w", name, err)
+				return nil, fmt.Errorf(injectParameterErrFormat, name, err)
 			}
 			params[i] = v
 			continue
@@ -422,7 +443,7 @@ func injectedParameters(
 			if len(plan.businessIndexes) == 1 {
 				v, err := decodeJSON(t, body)
 				if err != nil {
-					return nil, fmt.Errorf("JSON parameter %q: %w", name, err)
+					return nil, fmt.Errorf(jsonParameterErrFormat, name, err)
 				}
 				params[i] = v
 				continue
@@ -434,7 +455,7 @@ func injectedParameters(
 			}
 			v, err := decodeJSON(t, raw)
 			if err != nil {
-				return nil, fmt.Errorf("JSON parameter %q: %w", name, err)
+				return nil, fmt.Errorf(jsonParameterErrFormat, name, err)
 			}
 			params[i] = v
 			continue
@@ -805,7 +826,7 @@ func bindTextValue(t reflect.Type, values []string) (reflect.Value, error) {
 
 // parseRequestParameters collects handler-bindable inputs for the request:
 // form values, uploaded files, the raw JSON body and the parsed media type.
-func parseRequestParameters(w http.ResponseWriter, r *http.Request, method Method) (url.Values, filesMap, []byte, string, error) {
+func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpMethod) (url.Values, filesMap, []byte, string, error) {
 	// GBL deliberately applies a strict parameter-source policy by HTTP method.
 	// GET, HEAD, DELETE and OPTIONS may read only URL path parameters (matched by
 	// the router) and URL query parameters. Their request bodies are never parsed
@@ -877,6 +898,20 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method Metho
 		form = r.PostForm
 		if r.MultipartForm != nil {
 			files = r.MultipartForm.File
+		}
+		// Per-file hard cap: any uploaded part larger than the configured
+		// threshold aborts the request before the handler runs. Re-applied
+		// defensively if the stored value has been corrupted to a non-positive one.
+		maxUpload := maxUploadFileSize.Load()
+		if maxUpload <= 0 {
+			maxUpload = defaultMaxUploadFileSize
+		}
+		for _, headers := range files {
+			for _, hdr := range headers {
+				if hdr != nil && hdr.Size > maxUpload {
+					return nil, nil, nil, null, requestBodyTooLargeError
+				}
+			}
 		}
 
 	case mediaType == xWwwFormUrlencoded || mediaType == null:
