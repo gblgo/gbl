@@ -180,11 +180,11 @@ func (e *engine) matchNode(method httpMethod, path string, params map[string]str
 		return nil
 	}
 
-	bufp := segmentPool.Get().(*[]string)
-	segments := splitPathInto((*bufp)[:0], path)
+	bufPool := segmentPool.Get().(*[]string)
+	segments := splitPathInto((*bufPool)[:0], path)
 	handler := searchNode(root, segments, 0, params)
-	*bufp = segments
-	segmentPool.Put(bufp)
+	*bufPool = segments
+	segmentPool.Put(bufPool)
 
 	return handler
 }
