@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"maps"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -129,6 +129,51 @@ func (rw *gblResponseWriter) recycle() {
 func releasePathParams(params map[string]string) {
 	clear(params)
 	pathParamsPool.Put(params)
+}
+
+// paramsPool recycles the reflect argument slice built per request. A pointer to
+// the slice is stored so Get/Put do not box the slice header.
+var paramsPool = sync.Pool{
+	New: func() any { s := make([]reflect.Value, 0, 8); return &s },
+}
+
+// acquireParams returns a zeroed reflect argument slice of length n, reusing a
+// pooled backing array when it is large enough.
+func acquireParams(n int) (*[]reflect.Value, []reflect.Value) {
+	bufPool := paramsPool.Get().(*[]reflect.Value)
+	params := *bufPool
+	if cap(params) < n {
+		params = make([]reflect.Value, n)
+	}
+	params = params[:n]
+	for i := range params {
+		params[i] = reflect.Value{}
+	}
+	return bufPool, params
+}
+
+// releaseParams zeroes the argument slice (so it pins no request value) and
+// returns it to the pool.
+func releaseParams(bufPool *[]reflect.Value, params []reflect.Value) {
+	clear(params)
+	*bufPool = params
+	paramsPool.Put(bufPool)
+}
+
+// bodyBufferPool recycles the buffer used to read a JSON request body, so a
+// small-body request reuses one backing array instead of allocating a fresh
+// read buffer every time. sync.Pool drops its contents at GC, so an oversized
+// body buffer is not pinned indefinitely.
+var bodyBufferPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
+// releaseBodyBuffer returns a body buffer to the pool. The caller must be done
+// with every slice aliasing it: the decoded parameters are independent copies,
+// so this is safe once binding has finished.
+func releaseBodyBuffer(buf *bytes.Buffer) {
+	buf.Reset()
+	bodyBufferPool.Put(buf)
 }
 
 // SetMaxBodySize sets the hard limit on the total request body size, applied
@@ -367,32 +412,33 @@ func precomputeStructFields(t reflect.Type) []structField {
 	return fields
 }
 
-// injectedParameters builds the reflect argument list for a handler call,
-// driven by the handler's precomputed bind plan. Each parameter is injected
-// directly (request, writer, file headers) or bound by name from path
-// parameters, a JSON body, or form values, in that precedence order. Type
-// classification already happened in generateRoute, so nothing here re-inspects
-// the signature with reflection.
+// injectedParameters fills the reflect argument list for a handler call, driven
+// by the handler's precomputed bind plan. Each parameter is injected directly
+// (request, writer, file headers) or bound by name from path parameters, a JSON
+// body, or form values, in that precedence order. Type classification already
+// happened in generateRoute, so nothing here re-inspects the signature with
+// reflection. params is the caller's scratch slice, already sized to the
+// parameter count; the caller recycles it.
 func injectedParameters(
 	c *Context,
 	form url.Values,
 	files filesMap,
 	body []byte,
 	mediaType string,
-) ([]reflect.Value, error) {
+	params []reflect.Value,
+) error {
 	rh := c.rh
 	plan := &rh.plan
 	names := rh.paramNames
-	params := make([]reflect.Value, len(plan.types))
 
 	var jsonFields map[string]json.RawMessage
 	isJSON := isJSONMediaType(mediaType) && hasNonWhitespace(body)
 	if isJSON && len(plan.businessIndexes) > 1 {
 		if err := json.Unmarshal(body, &jsonFields); err != nil {
-			return nil, fmt.Errorf("invalid JSON body: %w", err)
+			return fmt.Errorf("invalid JSON body: %w", err)
 		}
 		if jsonFields == nil {
-			return nil, multipleRequireError
+			return multipleRequireError
 		}
 	}
 
@@ -414,7 +460,7 @@ func injectedParameters(
 		case classWriter:
 			v, err := injectSpecialParameter(t, c.writer, c.Request, files, name)
 			if err != nil {
-				return nil, fmt.Errorf(injectParameterErrFormat, name, err)
+				return fmt.Errorf(injectParameterErrFormat, name, err)
 			}
 			params[i] = v
 			continue
@@ -422,7 +468,7 @@ func injectedParameters(
 			headers, _ := lookupFiles(files, name)
 			v, err := bindFileHeaders(t, headers)
 			if err != nil {
-				return nil, fmt.Errorf(injectParameterErrFormat, name, err)
+				return fmt.Errorf(injectParameterErrFormat, name, err)
 			}
 			params[i] = v
 			continue
@@ -433,7 +479,7 @@ func injectedParameters(
 		if pathValue, ok := lookupString(c.params, name); ok {
 			v, err := bindTextValue(t, []string{pathValue})
 			if err != nil {
-				return nil, fmt.Errorf("path parameter %q: %w", name, err)
+				return fmt.Errorf("path parameter %q: %w", name, err)
 			}
 			params[i] = v
 			continue
@@ -443,7 +489,7 @@ func injectedParameters(
 			if len(plan.businessIndexes) == 1 {
 				v, err := decodeJSON(t, body)
 				if err != nil {
-					return nil, fmt.Errorf(jsonParameterErrFormat, name, err)
+					return fmt.Errorf(jsonParameterErrFormat, name, err)
 				}
 				params[i] = v
 				continue
@@ -451,11 +497,11 @@ func injectedParameters(
 
 			raw, ok := lookupRawJSON(jsonFields, name)
 			if !ok {
-				return nil, fmt.Errorf("JSON field %q not found", name)
+				return fmt.Errorf("JSON field %q not found", name)
 			}
 			v, err := decodeJSON(t, raw)
 			if err != nil {
-				return nil, fmt.Errorf(jsonParameterErrFormat, name, err)
+				return fmt.Errorf(jsonParameterErrFormat, name, err)
 			}
 			params[i] = v
 			continue
@@ -471,7 +517,7 @@ func injectedParameters(
 			v, err = bindFormParameter(t, name, form, c.params, files)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("parameter %q: %w", name, err)
+			return fmt.Errorf("parameter %q: %w", name, err)
 		}
 		params[i] = v
 	}
@@ -479,13 +525,13 @@ func injectedParameters(
 	for i, v := range params {
 		name := paramNameAt(names, i)
 		if !v.IsValid() {
-			return nil, fmt.Errorf("parameter %q was not initialized", name)
+			return fmt.Errorf("parameter %q was not initialized", name)
 		}
 		if !v.Type().AssignableTo(plan.types[i]) {
-			return nil, fmt.Errorf("parameter %q type mismatch: got %s, want %s", name, v.Type(), plan.types[i])
+			return fmt.Errorf("parameter %q type mismatch: got %s, want %s", name, v.Type(), plan.types[i])
 		}
 	}
-	return params, nil
+	return nil
 }
 
 // paramNameAt Bounds-safe lookup of a handler parameter name.
@@ -563,7 +609,8 @@ func lookupValues(values url.Values, name string) ([]string, bool) {
 // and scalars take the first value.
 func bindFormParameter(t reflect.Type, name string, form url.Values, pathParams map[string]string, files filesMap) (reflect.Value, error) {
 	if t.Kind() == reflect.Pointer {
-		// Missing pointer values remain nil instead of allocating an empty value.
+		// A missing non-struct pointer stays nil; a missing *struct is still
+		// allocated (zero-valued) so its fields can be bound individually.
 		if _, ok := lookupString(pathParams, name); !ok {
 			if _, ok = lookupValues(form, name); !ok {
 				if _, ok = lookupFiles(files, name); !ok && t.Elem().Kind() != reflect.Struct {
@@ -824,9 +871,29 @@ func bindTextValue(t reflect.Type, values []string) (reflect.Value, error) {
 	return result, nil
 }
 
+// mergeFormBodyWins merges URL query values with parsed body values, letting the
+// body win on any key present in both: a POST/PUT/PATCH form field overrides a
+// query parameter of the same name. Query-only keys remain available. When either
+// side is empty the other is returned as-is, so the common query-less POST adds
+// no allocation.
+func mergeFormBodyWins(query, body url.Values) url.Values {
+	if len(query) == 0 {
+		return body
+	}
+	if len(body) == 0 {
+		return query
+	}
+	merged := make(url.Values, len(query)+len(body))
+	maps.Copy(merged, query)
+	maps.Copy(merged, body)
+	return merged
+}
+
 // parseRequestParameters collects handler-bindable inputs for the request:
-// form values, uploaded files, the raw JSON body and the parsed media type.
-func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpMethod) (url.Values, filesMap, []byte, string, error) {
+// form values, uploaded files, the JSON body buffer and the parsed media type.
+// The body buffer is pooled; the caller must release it with releaseBodyBuffer
+// once binding is done, since the decoded parameters are independent copies.
+func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpMethod) (url.Values, filesMap, *bytes.Buffer, string, error) {
 	// GBL deliberately applies a strict parameter-source policy by HTTP method.
 	// GET, HEAD, DELETE and OPTIONS may read only URL path parameters (matched by
 	// the router) and URL query parameters. Their request bodies are never parsed
@@ -847,7 +914,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 	var (
 		form      url.Values
 		files     filesMap
-		body      []byte
+		bodyBuf   *bytes.Buffer
 		mediaType string
 	)
 
@@ -863,10 +930,17 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 
 	contentTypeHeader := r.Header.Get(contentType)
 	if contentTypeHeader != null {
-		var err error
-		mediaType, _, err = mime.ParseMediaType(contentTypeHeader)
-		if err != nil {
-			return nil, nil, nil, null, fmt.Errorf("invalid Content-Type: %w", err)
+		// Fast path: a bare "application/json" carries no parameters, so it needs
+		// no mime parsing. Anything else (charset, boundary, +json suffix) still
+		// goes through ParseMediaType.
+		if contentTypeHeader == applicationJson {
+			mediaType = applicationJson
+		} else {
+			var err error
+			mediaType, _, err = mime.ParseMediaType(contentTypeHeader)
+			if err != nil {
+				return nil, nil, nil, null, fmt.Errorf("invalid Content-Type: %w", err)
+			}
 		}
 	}
 
@@ -874,7 +948,13 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 	case isJSONMediaType(mediaType):
 		var err error
 		if r.Body != nil {
-			body, err = io.ReadAll(r.Body)
+			buf := bodyBufferPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			if _, err = buf.ReadFrom(r.Body); err != nil {
+				releaseBodyBuffer(buf)
+			} else {
+				bodyBuf = buf
+			}
 		}
 		if err != nil {
 			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
@@ -894,8 +974,8 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 			}
 			return nil, nil, nil, null, err
 		}
-		// r.PostForm contains both URL query values and multipart text fields.
-		form = r.PostForm
+		// Body text fields win over query on shared keys; query-only keys survive.
+		form = mergeFormBodyWins(r.URL.Query(), r.PostForm)
 		if r.MultipartForm != nil {
 			files = r.MultipartForm.File
 		}
@@ -921,8 +1001,8 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 			}
 			return nil, nil, nil, null, err
 		}
-		// r.PostForm contains both URL query values and URL-encoded body fields.
-		form = r.PostForm
+		// Body fields win over query on shared keys; query-only keys survive.
+		form = mergeFormBodyWins(r.URL.Query(), r.PostForm)
 
 	default:
 		// Unsupported body media types are not interpreted as parameters.
@@ -930,7 +1010,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 		form = r.URL.Query()
 	}
 
-	return form, files, body, mediaType, nil
+	return form, files, bodyBuf, mediaType, nil
 }
 
 // convertToByteArray renders a handler return value as the response body:

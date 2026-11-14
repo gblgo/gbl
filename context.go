@@ -5,6 +5,7 @@
 package gbl
 
 import (
+	"bytes"
 	"encoding/json"
 	"math"
 	"net/http"
@@ -35,7 +36,7 @@ var routeEndpoint HandlerFunc = func(c *Context) { c.invokeHandler() }
 // middleware use to hand data to later links and to the handler.
 //
 // A Context is pooled. It must not be retained past the request that produced
-// it, exactly like the response writer it wraps.
+// it, exactly like the response writer it holds.
 type Context struct {
 	// writer is the framework's pooled response sink. It stays unexported:
 	// handlers own the response by declaring an http.ResponseWriter parameter,
@@ -47,7 +48,6 @@ type Context struct {
 	handlers    []HandlerFunc // this route's merged chain, including the terminal endpoint
 	index       int           // cursor into handlers; abortIndex means "stopped"
 	params      map[string]string
-	query       url.Values // lazily parsed from RawQuery and cached per request by Query
 	rh          *routeHandler
 	method      httpMethod
 	keys        map[string]any
@@ -66,7 +66,13 @@ var contextPool = sync.Pool{
 
 // newContext fetches a Context primed for one request. handlers already holds
 // the merged chain with the endpoint appended, so the caller only runs Next.
-func newContext(w *gblResponseWriter, r *http.Request, params map[string]string, rh *routeHandler, method httpMethod, logger Logger) *Context {
+func newContext(w *gblResponseWriter,
+	r *http.Request,
+	params map[string]string,
+	rh *routeHandler,
+	method httpMethod,
+	logger Logger,
+) *Context {
 	c := contextPool.Get().(*Context)
 	c.writer = w
 	c.Request = r
@@ -76,9 +82,8 @@ func newContext(w *gblResponseWriter, r *http.Request, params map[string]string,
 	c.rh = rh
 	c.method = method
 	c.keys = nil
-	c.query = nil
 	c.bytes = nil
-	c.contentType = rh.hct
+	c.contentType = rh.contentType
 	c.result = nil
 	c.ret = reflect.Value{}
 	c.handled = false
@@ -96,7 +101,6 @@ func (c *Context) recycle() {
 	c.params = nil
 	c.rh = nil
 	c.keys = nil
-	c.query = nil
 	c.bytes = nil
 	c.result = nil
 	c.ret = reflect.Value{}
@@ -152,20 +156,12 @@ func (c *Context) Size() int {
 // first write, so a status set before c.Next() survives into the rendered result.
 func (c *Context) Status(code int) { c.writer.WriteHeader(code) }
 
-// Param returns a matched path parameter by name.
-func (c *Context) Param(name string) string {
+// PathParam returns a matched path parameter by name. It is meant for middleware,
+// which has no automatic binding; a business handler should bind path parameters
+// by naming its arguments instead.
+func (c *Context) PathParam(name string) string {
 	value, _ := lookupString(c.params, name)
 	return value
-}
-
-// Query returns a URL query value by name. The query string is parsed once on
-// the first call and cached on the Context, so repeated lookups within a request
-// do not reparse RawQuery into a fresh map each time.
-func (c *Context) Query(name string) string {
-	if c.query == nil {
-		c.query = c.Request.URL.Query()
-	}
-	return c.query.Get(name)
 }
 
 // Set stores a value under key for later links and the handler.
@@ -176,7 +172,9 @@ func (c *Context) Set(key string, value any) {
 	c.keys[key] = value
 }
 
-// Get returns a value set earlier, reporting whether the key was present.
+// Get returns a value set earlier, reporting whether the key was present. The
+// value is an any; assert it to the type you stored. For a typed result without
+// a manual assertion, see the package helpers Value and MustValue.
 func (c *Context) Get(key string) (any, bool) {
 	value, ok := c.keys[key]
 	return value, ok
@@ -212,7 +210,7 @@ func (c *Context) JSON(status int, value any) {
 	_, _ = c.writer.Write(data)
 }
 
-// AbortWithStatus denies the request with a status and no body, flushing the
+// AbortWithStatus denies the request with a status and no-body, flushing the
 // status immediately since no further write will follow.
 func (c *Context) AbortWithStatus(status int) {
 	c.writer.WriteHeader(status)
@@ -270,24 +268,34 @@ func (c *Context) invokeHandler() {
 	var (
 		form      url.Values
 		files     filesMap
-		body      []byte
+		bodyBuf   *bytes.Buffer
 		mediaType string
 		err       error
 	)
 	if rh.plan.needsParse {
-		form, files, body, mediaType, err = parseRequestParameters(c.writer, c.Request, c.method)
+		form, files, bodyBuf, mediaType, err = parseRequestParameters(c.writer, c.Request, c.method)
 		if err != nil {
 			writeRequestError(err)
 			return
 		}
 	}
 
+	// The pooled body buffer is needed only while binding; the decoded
+	// parameters are independent copies, so release it when this handler returns.
+	var body []byte
+	if bodyBuf != nil {
+		body = bodyBuf.Bytes()
+		defer releaseBodyBuffer(bodyBuf)
+	}
+
 	var in []reflect.Value
+	var paramsBuf *[]reflect.Value
 	if rh.t.NumIn() > 0 {
-		in, err = injectedParameters(c, form, files, body, mediaType)
-		if err != nil {
+		paramsBuf, in = acquireParams(rh.t.NumIn())
+		if err = injectedParameters(c, form, files, body, mediaType, in); err != nil {
 			// A binding failure describes the client's own malformed input, so
 			// the message is safe to echo.
+			releaseParams(paramsBuf, in)
 			abort(http.StatusBadRequest, err.Error())
 			return
 		}
@@ -296,6 +304,7 @@ func (c *Context) invokeHandler() {
 		// message may expose internal rules, so only a generic 400 is returned and
 		// the detail stays in the server log.
 		if vErr := validateBusiness(in, rh.plan.businessIndexes); vErr != nil {
+			releaseParams(paramsBuf, in)
 			c.logger.Error("request validation failed", "error", vErr)
 			abort(http.StatusBadRequest, http.StatusText(http.StatusBadRequest))
 			return
@@ -303,6 +312,9 @@ func (c *Context) invokeHandler() {
 	}
 
 	out := rh.v.Call(in)
+	if paramsBuf != nil {
+		releaseParams(paramsBuf, in)
+	}
 	if len(out) > 0 {
 		c.bytes, err = convertToByteArray(out[0])
 		if err != nil {

@@ -16,7 +16,7 @@ import (
 )
 
 // httpMethod is the internal enum of supported HTTP verbs, indexed against
-// methodNames and the per-method route trees. Its values are unexported and it
+// methodNames and the per-method route trees. Its values are unexported, and it
 // never appears in a public signature — callers always speak in plain strings.
 type httpMethod uint8
 
@@ -37,13 +37,24 @@ var methodNames = [methodCount]string{
 // The upper-casing keeps the lenient behavior GBL has always had, so a
 // lowercase "get" is still treated as "GET".
 func methodOf(name string) (httpMethod, bool) {
-	upper := strings.ToUpper(name)
-	for m, methodName := range methodNames {
-		if methodName == upper {
-			return httpMethod(m), true
-		}
+	switch strings.ToUpper(name) {
+	case "GET":
+		return methodGet, true
+	case "HEAD":
+		return methodHead, true
+	case "POST":
+		return methodPost, true
+	case "PUT":
+		return methodPut, true
+	case "PATCH":
+		return methodPatch, true
+	case "DELETE":
+		return methodDelete, true
+	case "OPTIONS":
+		return methodOptions, true
+	default:
+		return 0, false
 	}
-	return 0, false
 }
 
 // isBodyMethod Reports whether GBL parses a request body for this method.
@@ -60,11 +71,11 @@ func (m httpMethod) isBodyMethod() bool {
 // the precomputed bind plan and the frozen middleware chain. Built once in
 // generateRoute and reused verbatim by every matching request.
 type routeHandler struct {
-	hct        string
-	v          reflect.Value
-	t          reflect.Type
-	paramNames []string
-	plan       bindPlan
+	contentType string
+	v           reflect.Value
+	t           reflect.Type
+	paramNames  []string
+	plan        bindPlan
 	// handlers are this route's frozen request chain: the engine's global
 	// middleware, then the route group's, then the terminal routeEndpoint.
 	// It is assembled once at startup and reused verbatim by every request.
@@ -72,10 +83,14 @@ type routeHandler struct {
 }
 
 // dealPath splits path into per-segment metadata and a normalized route path.
-// A leading empty segment is dropped, ":name" and "{name}" both mark a variable
-// segment and supply its binding name, and malformed patterns (bare ":", "{}",
-// repeated or misplaced markers) abort startup: the reason is logged through the
-// engine before the panic, so a bad registration stays explainable after deploy.
+//
+// Grammar: a path is '/'-separated segments. A segment is either a literal or a
+// variable written as ":name" or "{name}" — both forms bind identically. The
+// marker must lead the segment and appear exactly once: no nesting ("::", "{{"),
+// no marker in the middle ("a:b", "a{b"), and no empty name (":", "{}"). Any
+// violation aborts startup; the reason is logged through the engine before the
+// panic, so a bad registration stays explainable after deploy. In the error
+// texts "***" stands for any offending characters.
 func (e *engine) dealPath(path string) ([]segmentMeta, string) {
 
 	path = strings.TrimSpace(path)
@@ -159,23 +174,25 @@ func (e *engine) generateRoute() {
 		}
 
 		handler := &routeHandler{
-			hct: textPlainCharset,
-			v:   v,
-			t:   t,
+			contentType: textPlainCharset,
+			v:           v,
+			t:           t,
 		}
 
 		if t.NumOut() > 0 {
-			switch t.Out(0).Kind() {
-			case reflect.Bool,
-				reflect.String,
-				reflect.Float32, reflect.Float64,
-				reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-				reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-				handler.hct = textPlainCharset
-			case reflect.Struct, reflect.Pointer, reflect.Interface:
-				handler.hct = applicationJsonCharset
+			out := t.Out(0)
+			switch out.Kind() {
+			case reflect.Struct, reflect.Pointer, reflect.Interface, reflect.Map, reflect.Array:
+				handler.contentType = applicationJsonCharset
+			case reflect.Slice:
+				// []byte is written verbatim; every other slice is JSON-marshaled.
+				if out.Elem().Kind() == reflect.Uint8 {
+					handler.contentType = textPlainCharset
+				} else {
+					handler.contentType = applicationJsonCharset
+				}
 			default:
-				handler.hct = textPlainCharset
+				handler.contentType = textPlainCharset
 			}
 		}
 
@@ -223,15 +240,15 @@ func (e *engine) generateRoute() {
 // for every package except main and never matches a func literal. Position
 // matching fixes both and additionally resolves closures passed as handlers.
 //
-// Two deployments still fall back to positional placeholders, and neither may
-// abort the process:
-//   - the source no longer lives where it was compiled (a multi-stage image,
-//     -trimpath or a bare binary), so the file cannot be parsed;
-//   - the entry line belongs to generated code with no enclosing declaration,
-//     such as the wrapper thunk synthesized for a bound method value.
+// Names cannot be recovered when the source no longer lives where it was
+// compiled (a multi-stage image, -trimpath or a bare binary) so the file cannot
+// be parsed, or when the entry line belongs to generated code with no enclosing
+// declaration (such as the wrapper thunk synthesized for a bound method value).
 //
-// The second return reports whether real names were recovered: callers use it to
-// reject registrations whose binding would otherwise silently send wrong data.
+// The second return reports whether real names were recovered. The caller acts
+// on it: a handler whose binding needs names aborts startup (failStartup), while
+// a self-describing binding (a lone struct, whose fields come from reflection)
+// falls back to positional placeholders and continues.
 func (e *engine) resolveParamNames(v reflect.Value) ([]string, bool) {
 	pc := v.Pointer()
 	funPc := runtime.FuncForPC(pc)
@@ -307,9 +324,10 @@ func findFuncTypeAt(fset *token.FileSet, file *ast.File, line int) *ast.FuncType
 // normalizeParamNames Pads names to exactly count entries, one per parameter.
 //
 // Unnamed parameters contribute nothing to the recovered list, so it can arrive
-// short or empty. Every gap gets a placeholder that cannot collide with a real
-// path, query or JSON key, which keeps binding deterministic rather than letting
-// a later index lookup panic and surface to the client.
+// short or empty. Every gap gets a positional placeholder ("arg0", "arg1", ...),
+// keeping binding deterministic and avoiding a later index-out-of-range panic.
+// The placeholder is an ordinary string, so a request key literally named "arg0"
+// could still match it; name your parameters to avoid that.
 func normalizeParamNames(names []string, count int) []string {
 	normalized := make([]string, count)
 
