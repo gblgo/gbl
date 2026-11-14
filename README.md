@@ -34,7 +34,7 @@ function, type, interface and method, each with a runnable example.
 5. [Middleware (`Use` / `HandlerFunc`)](#5-middleware-use--handlerfunc)
 6. [Serving (`Run` / `Shutdown`)](#6-serving-run--shutdown)
 7. [`Context` reference](#7-context-reference)
-8. [Request-scoped values (`Value` / `MustValue`)](#8-request-scoped-values-value--mustvalue)
+8. [Request-scoped values (`Get` / `Value` / `MustValue`)](#8-request-scoped-values-get--value--mustvalue)
 9. [Aborts & panic (`Abort` / `PanicProcessor` / `HttpStatus`)](#9-aborts--panic-abort--panicprocessor--httpstatus)
 10. [Validation (`Validatable`)](#10-validation-validatable)
 11. [Logging (`Logger` / `BannerLogger` / `NewStdLogger` / `SetLogger` / `AccessLog`)](#11-logging-logger--bannerlogger--newstdlogger--setlogger--accesslog)
@@ -102,6 +102,8 @@ exclusive, not a cascade:
 - **JSON** (`application/json` with a non-empty body): the value comes from the
   JSON body; form and query are never consulted.
 - **Form/query** (any other content type): the value comes from form/query values.
+  On `POST`/`PUT`/`PATCH`, a body field and a query parameter of the same name both
+  bind, with the **body winning**.
 
 Within any source, name matching is exact first, then case-insensitive (mirroring
 `encoding/json`).
@@ -292,7 +294,7 @@ api.
 
 // Scoped middleware runs only for routes registered through this group.
 api.Use(func(c *gbl.Context) {
-    if c.Query("token") == "" {
+    if c.Request.URL.Query().Get("token") == "" {
         c.AbortWithStatus(http.StatusUnauthorized)
         return
     }
@@ -331,7 +333,7 @@ gbl.Use(func(c *gbl.Context) {
 // Admin-only guard: only /admin/* routes run it.
 admin := gbl.Group("/admin")
 admin.Use(func(c *gbl.Context) {
-    if c.Query("token") != "secret" {
+    if c.Request.URL.Query().Get("token") != "secret" {
         c.AbortWithStatus(http.StatusUnauthorized)
         return
     }
@@ -359,18 +361,68 @@ their chain at all.
 type HandlerFunc func(c *Context)
 ```
 
-`HandlerFunc` is one link in the onion chain. Code before `c.Next()` is the
-**request** phase; code after it is the **response** phase. Two different ways
-to stop the chain:
+`HandlerFunc` is one link in the onion chain. The chain is an ordered slice —
+engine `Use` (outermost) → group `Use` → … → the matched handler (innermost) —
+and `Context` keeps a cursor into it.
 
-- **Return from the current middleware function without calling `c.Next()`.**
-  Downstream links and the handler never run; this link has no "response"
-  half at all, because `c.Next()` was never entered.
-- **Call one of the `Abort` methods** (`Abort`, `AbortWithStatus`,
-  `AbortWithStatusJSON`). They push the chain cursor past the end, so
-  **downstream links that have not started yet are skipped**. The
-  `AbortWithStatus` / `AbortWithStatusJSON` variants also write the denial
-  response in the same call.
+**`c.Next()` runs all the links after the current one** (the remaining
+middleware and, finally, the handler) and then returns. Code before `c.Next()`
+is therefore the **request** phase; code after it is the **response** phase,
+which unwinds innermost-first. The framework calls `Next()` once to start the
+chain; each middleware calls it to delegate downstream.
+
+Both phases are code **you write inside a middleware function**, split by the
+`c.Next()` call — they are not the handler and not the framework writing the
+HTTP response. The handler is the innermost business function: it has no
+phases and never calls `Next()`. "Response" names the outbound direction
+(after the handler), not the act of writing bytes: the framework writes the
+staged body to the connection only after the whole chain unwinds. Timing around
+`Next()` therefore measures request-processing time (downstream + handler +
+serialization) — which is why access logs sit in this phase, where the result
+and status are already known.
+
+`Next()` is an ordinary blocking call, not a scheduler: it runs every
+downstream link synchronously and returns only when they have all finished.
+The "response phase" is just the middleware's own code after the call, running
+because the call returned — there is no second mechanism inside `Next`. For a
+chain `[A, B, handler]`, execution flows straight down this diagram:
+
+```text
+request
+  │
+  ▼
+  A.before Next()          ┐
+  │                        │ request phase
+  ▼                        │ (each Next() goes one layer deeper)
+  B.before Next()          ┘
+  │
+  ▼
+  handler                  ── run business, stage the result
+  │
+  ▼
+  B.after Next()           ┐
+  │                        │ response phase
+  ▼                        │ (each Next() returns, unwinding outward)
+  A.after Next()           ┘
+  │
+  ▼
+write staged result
+  │
+  ▼
+response
+```
+
+All nested `Next` calls share one cursor; the innermost call pushes it past
+the end, so each outer loop returns in turn and no link runs twice.
+
+**To stop the chain, call an `Abort` method** (`Abort`, `AbortWithStatus`,
+`AbortWithStatusJSON`). It pushes the cursor past the end, so every link that
+has not started yet — the handler included — is skipped. The `AbortWithStatus`
+/ `AbortWithStatusJSON` variants also write the denial response in the same call.
+
+> Returning from a middleware **without** calling `c.Next()` does **not** stop
+> the chain: the enclosing `Next` loop still advances to the next link. Only
+> `Abort` halts downstream.
 
 > `Abort` stops only **downstream**. It does **not** rewind already-running
 > middleware: upstream links whose `c.Next()` has already returned will still
@@ -378,14 +430,20 @@ to stop the chain:
 > there if you need to skip that too.
 
 ```go
-// Global middleware on the default engine:
+// A middleware: its body is split into two phases by c.Next().
 gbl.Use(func(c *gbl.Context) {
-    c.Set("requestID", newRequestID())
+    // ── request phase: before going downstream ──
     start := time.Now()
-    c.Next()
-    c.Status(http.StatusOK)                 // already set, but shows the call
-    log.Printf("took %s", time.Since(start))
+    c.Set("requestID", newRequestID())
+
+    c.Next() // runs all downstream middleware + the handler, then returns
+
+    // ── response phase: the handler has already finished ──
+    log.Printf("took %s, status %d", time.Since(start), c.StatusCode())
 })
+
+// The handler is plain business logic: no phases, no Next().
+gbl.Get("/ping", func() string { return "pong" })
 
 // gbl.Use is variadic — install several links at once:
 gbl.Use(recoverer, requestID, gbl.AccessLog)
@@ -422,6 +480,78 @@ api.Get("/ping", func() string {
 //   engine after
 ```
 
+### Request lifecycle, end to end
+
+What happens from the moment a request arrives until the response reaches the
+client:
+
+1. **Accept & dispatch.** `net/http` accepts the connection, parses the request
+   and calls the server handler — the engine itself, or a `corsHandler` wrapping
+   it when `SetCorsConfig` was called.
+2. **CORS (only if configured).** `corsHandler` checks `Origin`: a preflight is
+   answered directly, an allowed origin gets the CORS headers, then it delegates
+   to the engine. No `Origin` goes straight to the engine.
+3. **Method & route match.** The engine resolves the verb (unknown → 501) and
+   walks that method's route tree, filling path parameters. An unregistered
+   `HEAD` borrows the `GET` route. No match → 404, or 405 + `Allow` (204 for
+   `OPTIONS`).
+4. **Build the Context.** A pooled `Context` is primed with the request, the
+   matched path params, the route's frozen chain and the logger. The chain is
+   `[global middleware…, group middleware…, endpoint]`.
+5. **Run the chain — `c.Next()`.** The chain is a slice of `HandlerFunc`; its
+   last link is not the business handler itself but `routeEndpoint`, an ordinary
+   middleware whose whole body is `c.invokeHandler()`:
+
+```go
+// the last link of every chain (context.go)
+var routeEndpoint HandlerFunc = func(c *Context) { c.invokeHandler() }
+
+// assembled at startup (route.go): global mw + group mw + routeEndpoint
+chain = append(chain, e.middlewares...)
+chain = append(chain, meta.mw...)
+chain = append(chain, routeEndpoint)
+```
+
+   This chain is built **once, at startup**, by `generateRoute`: registering a
+   route (`Get`/`Post`/…) only queues it; `Run()` then assembles the chain and
+   freezes it into the route's `routeHandler.handlers`, with `routeEndpoint` as
+   the last link. Every request reuses that frozen slice (`newContext` sets
+   `c.handlers = rh.handlers`) — nothing is re-assembled per request.
+
+   `Next()` just loops over this slice calling each link. When it reaches
+   `routeEndpoint`, that call runs `invokeHandler()`, which parses, binds,
+   validates, reflectively calls the business handler (stored in `c.rh`) and
+   serializes the result. The onion nesting:
+
+```text
+engine.Next() → handlers[0]
+└─ global middleware
+   ├─ request-phase code
+   ├─ c.Next() → handlers[1]
+   │  └─ group middleware
+   │     ├─ request-phase code
+   │     ├─ c.Next() → handlers[2]
+   │     │  └─ routeEndpoint
+   │     │     └─ c.invokeHandler():
+   │     │        parse → bind → validate → call handler → serialize c.bytes
+   │     └─ response-phase code (after Next returns)
+   └─ response-phase code (after Next returns)
+```
+
+6. **Write the response.** If a middleware or the handler already wrote a body
+   (`c.JSON`, `c.String`, or an injected `http.ResponseWriter`), that stands.
+   Otherwise the engine writes the staged `c.bytes` with the content type chosen
+   at registration, flushing the recorded status (default 200) first.
+7. **Cleanup.** Multipart temp files are removed; the `Context`, path-param map
+   and response writer are reset and returned to their pools.
+8. **Any panic** along the way is recovered and rendered: an explicit `Abort`
+   reaches the client verbatim, a registered `PanicProcessor` owns rendering,
+   and anything else is logged and answered with a generic 500.
+
+The handler itself (step 5, innermost) is plain business code: it neither calls
+`Next()` nor has phases. The "response phase" belongs to middleware, on the way
+out — which is why timing and access logs read the result there.
+
 ---
 
 ## 6. Serving (`Run` / `Shutdown`)
@@ -433,7 +563,7 @@ stops. On `SIGINT`/`SIGTERM` it performs a graceful shutdown (listener closes,
 in-flight requests get a window to finish). Any fatal startup error panics.
 
 ```go
-gbl.Get("/", func() string { return "hi" })
+gbl.Get("/hi", func() string { return "hi" })
 gbl.Run() // port from application.ini [gbl] port, default :9801
 ```
 
@@ -464,8 +594,15 @@ it, injected as a parameter. It carries the request, the matched path
 parameters and a key/value bag for passing data between links and to the
 handler; the response is written through `c.JSON` / `c.String` / `c.Status`.
 
-> **A `Context` is pooled.** Never retain it past the request that produced it
-> — exactly like the response writer it wraps.
+> **A `Context` is pooled and valid only within the current request.** As soon
+> as the request ends, it is cleared and reused for the next one. So do not store
+> a `*Context` in a global or cache, and do not capture it in a goroutine or
+> callback that runs after the request finishes — you would read another
+> request's data or zero values, and concurrent access is a data race. Copy out
+> whatever you need asynchronously or across requests (e.g. the results of
+> `c.PathParam`, `c.Get`) into your own variables before the request ends.
+> The injected `http.ResponseWriter` is pooled too and follows the same rule:
+> never retain it across requests.
 
 Exported field:
 
@@ -478,9 +615,8 @@ c.Request // *http.Request — the inbound request
 | Method | Purpose |
 |---|---|
 | `Next()` | run the remaining chain (and the handler at its end) |
-| `Param(name) string` | a matched path parameter by name |
-| `Query(name) string` | a URL query value (query string parsed once and cached) |
-| `Set(key, value)` / `Get(key) (any, bool)` | request-scoped values |
+| `PathParam(name) string` | a matched path parameter by name (for middleware; handlers bind path params by name) |
+| `Set(key, value)` / `Get(key) (any, bool)` | request-scoped values (typed helpers: `Value` / `MustValue`, §8) |
 | `JSON(status int, value any)` | write a JSON body with the given status |
 | `String(status int, body string)` | write a plain-text body |
 | `Status(code int)` | record the response status (reaches the wire on first write) |
@@ -496,27 +632,32 @@ c.Request // *http.Request — the inbound request
 ### Examples
 
 ```go
-// Read a path param and a query value.
-gbl.Get("/greet/:name", func(c *gbl.Context) string {
-    return "hello " + c.Param("name") + ", lucky=" + c.Query("n")
-})
-
-// Write the response explicitly (then the auto-serializer stands down).
-gbl.Post("/login", func(c *gbl.Context) {
-    c.JSON(http.StatusOK, map[string]string{"token": "abc123"})
-})
-
-// Deny with a JSON body and stop the chain.
-gbl.Get("/profile", func(c *gbl.Context) {
-    if !isLoggedIn(c) {
-        c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]string{"error": "login required"})
+// Scenario: many endpoints need to know "who is the logged-in user". Requests
+// carry Authorization: Bearer <token>. Auth is cross-cutting — dozens of routes
+// share it, and an unauthenticated call must be rejected before any handler runs
+// — so it lives in ONE middleware that resolves the token to a uid.
+gbl.Use(func(c *gbl.Context) {
+    uid, ok := parseToken(c.Request.Header.Get("Authorization")) // your logic
+    if !ok {
+        c.AbortWithStatus(http.StatusUnauthorized)
         return
     }
-    c.JSON(http.StatusOK, loadProfile(c))
+    c.Set("uid", uid)
+    c.Next()
 })
 
-// Post-chain middleware reads the effective status/size for metrics, and may
-// override the staged result if nothing has been written yet.
+// The handler never parses a token; it just uses the current user. uid comes
+// from the token, not from path/query/body, so auto-binding cannot supply it —
+// Context is the only channel from the middleware to the handler.
+gbl.Get("/orders", func(c *gbl.Context) []Order {
+    v, _ := c.Get("uid") // any
+    return loadOrders(v.(int64))
+})
+
+// Scenario: per-endpoint monitoring — record every request's status, size and
+// latency, and optionally reshape the body. After the handler ran, only Context
+// exposes the staged result and the effective status/size; an injected
+// http.ResponseWriter can write but cannot read any of these.
 gbl.Use(func(c *gbl.Context) {
     c.Next()
     metrics.Observe(c.StatusCode(), c.Size())
@@ -528,15 +669,10 @@ gbl.Use(func(c *gbl.Context) {
 
 ---
 
-## 8. Request-scoped values (`Value` / `MustValue`)
+## 8. Request-scoped values (`Get` / `Value` / `MustValue`)
 
-Middleware stores values with `c.Set`; the handler (or a later link) reads them.
-The generic helpers return a typed value directly.
-
-```go
-func Value[T any](c *Context, key string) (T, bool)   // false on miss / type mismatch
-func MustValue[T any](c *Context, key string) T       // zero value on miss / mismatch
-```
+Middleware stores values with `c.Set`; the handler (or a later link) reads them
+with `c.Get`, which returns the raw `any` — assert it to the type you stored:
 
 ```go
 gbl.Use(func(c *gbl.Context) {
@@ -545,15 +681,21 @@ gbl.Use(func(c *gbl.Context) {
 })
 
 gbl.Get("/me", func(c *gbl.Context) string {
-    uid, ok := gbl.Value[int64](c, "uid")   // ok == true, uid == 7
+    v, ok := c.Get("uid")
     if !ok {
         return "anonymous"
     }
-    return fmt.Sprintf("user %d", uid)
+    return fmt.Sprintf("user %d", v.(int64))
 })
+```
 
-// Or ignore the miss and take the typed value (0 when absent / wrong type):
-name := gbl.MustValue[string](c, "displayName")
+You can also skip the manual assertion with the typed helpers `Value` (returns an
+ok flag) and `MustValue` (zero value on miss). They are package-level functions
+because Go methods cannot carry type parameters:
+
+```go
+uid, ok := gbl.Value[int64](c, "uid")           // ok == true, uid == 7
+name := gbl.MustValue[string](c, "displayName") // "" when absent / wrong type
 ```
 
 ---
@@ -856,20 +998,23 @@ and `kebab-case`.
 [gbl]
 name       = myapp
 port       = 9801
-certFile   = server.crt          ; with keyFile, TLS is enabled
+# certFile + keyFile together enable TLS
+certFile   = server.crt
 keyFile    = server.key
 readTimeout       = 10s
 readHeaderTimeout = 5s
 writeTimeout      = 10s
 idleTimeout       = 60s
 
-; File logging (blank = file logging off, stderr only)
-logDir  = ./logs                 ; auto-creates info.log/warn.log/error.log in the dir
-logFile = ./app.log              ; every level merged into one file (lowest priority)
-; Or set each level explicitly; precedence: per-level path > logDir/<level>.log > logFile
-; infoLog  = ./logs/info.log
-; warnLog  = ./logs/warn.log
-; errorLog = ./logs/error.log
+# File logging (blank = file logging off, stderr only)
+# logDir auto-creates info.log/warn.log/error.log in the dir
+logDir  = ./logs
+# logFile merges every level into one file (lowest priority)
+logFile = ./app.log
+# Or set each level explicitly; precedence: per-level path > logDir/<level>.log > logFile
+# infoLog  = ./logs/info.log
+# warnLog  = ./logs/warn.log
+# errorLog = ./logs/error.log
 ```
 
 | Key | Default | Meaning |
@@ -891,9 +1036,10 @@ sections:
 func ReadIni(path string) (map[string]map[string]string, error)
 ```
 
-Parses a classic INI file into `section -> key -> value`. Blank lines and `#`
-comments are skipped; `[section]` opens a group; `key = value` fills it. A key
-before any section, an empty section name or a line without `=` is a parse
+Parses a classic INI file into `section -> key -> value`. Blank lines and
+full-line `#` or `;` comments are skipped (inline comments are not stripped, so a
+value may contain `#`/`;`); `[section]` opens a group; `key = value` fills it. A
+key before any section, an empty section name or a line without `=` is a parse
 error; a missing file is returned as an error you can test with
 `errors.Is(err, os.ErrNotExist)`.
 

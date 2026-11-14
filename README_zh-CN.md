@@ -22,7 +22,7 @@
 5. [中间件（`Use` / `HandlerFunc`）](#5-中间件use--handlerfunc)
 6. [服务启停（`Run` / `Shutdown`）](#6-服务启停run--shutdown)
 7. [`Context` 详解](#7-context-详解)
-8. [请求级取值（`Value` / `MustValue`）](#8-请求级取值value--mustvalue)
+8. [请求级取值（`Get` / `Value` / `MustValue`）](#8-请求级取值get--value--mustvalue)
 9. [中止与 panic（`Abort` / `PanicProcessor` / `HttpStatus`）](#9-中止与-panicabort--panicprocessor--httpstatus)
 10. [校验（`Validatable`）](#10-校验validatable)
 11. [日志（`Logger` / `BannerLogger` / `NewStdLogger` / `SetLogger` / `AccessLog`）](#11-日志logger--bannerlogger--newstdlogger--setlogger--accesslog)
@@ -83,7 +83,7 @@ handler 就是任意 `func`。gbl 读取它的签名，按**类型 + 名字**装
 对每个业务参数，**先查同名路径参数，命中就直接用**。没命中时，取值来源由 `Content-Type` **二选一**（不是级联回退）：
 
 - **JSON**（`application/json` 且 body 非空）：只从 JSON body 取，form/query 一律不看。
-- **form/query**（其他 content type）：从 form/query 值取。
+- **form/query**（其他 content type）：从 form/query 值取。`POST`/`PUT`/`PATCH` 下，body 字段与同名 query 都能绑定，**body 优先**。
 
 在任一来源内部，名字匹配**先精确、再忽略大小写**（对齐 `encoding/json` 的字段匹配）。
 
@@ -257,7 +257,7 @@ api.
 
 // 分组中间件只作用于经本分组注册的规则。
 api.Use(func(c *gbl.Context) {
-    if c.Query("token") == "" {
+    if c.Request.URL.Query().Get("token") == "" {
         c.AbortWithStatus(http.StatusUnauthorized)
         return
     }
@@ -294,7 +294,7 @@ gbl.Use(func(c *gbl.Context) {
 // admin 分组专用守卫：只有 /admin/* 路由会跑它。
 admin := gbl.Group("/admin")
 admin.Use(func(c *gbl.Context) {
-    if c.Query("token") != "secret" {
+    if c.Request.URL.Query().Get("token") != "secret" {
         c.AbortWithStatus(http.StatusUnauthorized)
         return
     }
@@ -320,22 +320,62 @@ user.Get("/profile", func() string { return "profile" }) // 只有 global
 type HandlerFunc func(c *Context)
 ```
 
-`HandlerFunc` 是洋葱链上的一环。`c.Next()` 之前是**请求阶段**，之后是**响应阶段**。中断链有两条不同的路径：
+`HandlerFunc` 是洋葱链上的一环。整条链是一个有序切片——引擎级 `Use`（最外）→ 分组 `Use` → … → 匹配到的 handler（最内），`Context` 里保存着一个指向当前环的游标。
 
-- **当前这一环的中间件函数自己 `return`（不调 `c.Next()`）**：下游中间件与 handler 都不会执行；本环也不会有“响应阶段”，因为根本没进入 `c.Next()`。
-- **调用 `Abort` 系列方法**（`Abort`、`AbortWithStatus`、`AbortWithStatusJSON`）：它们把游标推到 `abortIndex`，**跳过下游尚未开始的环**（`AbortWithStatus` / `AbortWithStatusJSON` 同时写拒绝响应，一步到位）。
+**`c.Next()` 会执行当前环之后的所有环**（剩余中间件，最后是 handler），然后返回。因此 `c.Next()` 之前是**请求阶段**，之后是**响应阶段**，响应阶段按由内向外回溯。框架启动时调一次 `Next()` 拉起整条链；每个中间件再调它把控制权交给下游。
+
+这两个阶段都是**你在中间件函数里自己写的代码**，以 `c.Next()` 这一行为界——它们不是 handler，也不是框架写 HTTP 响应那个动作。handler 是最内层的业务函数：没有阶段之分，也从不叫 `Next()`。“响应”指的是出站方向（handler 之后），不是写字节这个动作：框架要等整条链回溯完，才把暂存 body 写进连接。所以围着 `Next()` 计时测的是请求处理耗时（下游 + handler + 序列化）——访问日志也放在这一阶段，因为此时结果与状态码已确定。
+
+`Next()` 就是一个普通的阻塞调用，不是什么调度器：它同步跑完下游所有环，等它们全部结束才返回。所谓“响应阶段”，不过是中间件自己在 `Next()` 调用之后的代码——因为调用返回了，自然就接着执行，`Next` 内部并没有第二套机制。以链 `[A, B, handler]` 为例，执行就是沿下图自上而下流动：
+
+```text
+请求
+  │
+  ▼
+  A.Next() 之前            ┐
+  │                        │ 请求阶段
+  ▼                        │ （每调一次 Next() 深入一层）
+  B.Next() 之前            ┘
+  │
+  ▼
+  handler                  ── 执行业务，暂存结果
+  │
+  ▼
+  B.Next() 之后            ┐
+  │                        │ 响应阶段
+  ▼                        │ （Next() 逐层返回，向外回溯）
+  A.Next() 之后            ┘
+  │
+  ▼
+写回暂存结果
+  │
+  ▼
+响应
+```
+
+所有嵌套的 `Next` 共享同一个游标；最内层调用把游标推过末尾，外层各帧便依次返回，任何环都不会被执行两次。
+
+**要中断链，必须调 `Abort` 系列方法**（`Abort`、`AbortWithStatus`、`AbortWithStatusJSON`）：它把游标推到末尾之后，**跳过所有尚未开始的环**（含 handler）。`AbortWithStatus` / `AbortWithStatusJSON` 还会同时写拒绝响应，一步到位。
+
+> 中间件**不调 `c.Next()` 直接 `return` 并不能中断链**：外层的 `Next` 循环仍会推进到下一环。只有 `Abort` 才能拦下下游。
 
 > `Abort` 只向下游中断，**不会**回头打断已经调用过 `c.Next()` 的上游中间件 —— 那些环恢复后仍会执行 `c.Next()` 之后的代码。如需连上游一起打断，在上游环里自己写 `if c.Aborted() { return }`。
 
 ```go
-// 引擎级全局中间件：
+// 一个中间件：函数体被 c.Next() 分成两段。
 gbl.Use(func(c *gbl.Context) {
-    c.Set("requestID", newRequestID())
+    // ── 请求阶段：往下游走之前 ──
     start := time.Now()
-    c.Next()
-    c.Status(http.StatusOK)                 // 状态已设，此处仅演示调用
-    log.Printf("took %s", time.Since(start))
+    c.Set("requestID", newRequestID())
+
+    c.Next() // 先跑完下游所有中间件 + handler，然后才返回
+
+    // ── 响应阶段：此时 handler 已经跑完 ──
+    log.Printf("耗时 %s, 状态 %d", time.Since(start), c.StatusCode())
 })
+
+// handler 只是业务逻辑：没有阶段之分，也不调 Next()。
+gbl.Get("/ping", func() string { return "pong" })
 
 // gbl.Use 是变参，可一次装多环：
 gbl.Use(recoverer, requestID, gbl.AccessLog)
@@ -370,6 +410,51 @@ api.Get("/ping", func() string {
 //   engine after
 ```
 
+### 请求的完整生命周期
+
+从请求到达到响应回到客户端，逐步发生的事：
+
+1. **接收与分发。** `net/http` 接受连接、解析请求，调用 server 的 handler——它就是引擎本身；若调过 `SetCorsConfig`，则是包着引擎的 `corsHandler`。
+2. **CORS（仅配置时）。** `corsHandler` 检查 `Origin`：预检直接应答；允许的来源加上 CORS 头；随后交给引擎。无 `Origin` 则直接进引擎。
+3. **方法与路由匹配。** 引擎解析动词（未知 → 501），在该方法的路由树里匹配并填充路径参数。未注册的 `HEAD` 借用 `GET` 路由。未匹配 → 404，或 405 + `Allow`（`OPTIONS` 则 204）。
+4. **构建 Context。** 从池中取一个 `Context`，装入请求、匹配到的路径参数、该路由冻结的链与 logger。链为 `[全局中间件…, 分组中间件…, 终端 endpoint]`。
+5. **执行链 —— `c.Next()`。** 链是一个 `HandlerFunc` 切片；它的最后一环不是业务 handler 本身，而是 `routeEndpoint`——一个普通中间件，函数体只有一句 `c.invokeHandler()`：
+
+```go
+// 每条链的最后一环（context.go）
+var routeEndpoint HandlerFunc = func(c *Context) { c.invokeHandler() }
+
+// 启动时组装（route.go）：全局中间件 + 分组中间件 + routeEndpoint
+chain = append(chain, e.middlewares...)
+chain = append(chain, meta.mw...)
+chain = append(chain, routeEndpoint)
+```
+
+   这条链是**启动时由 `generateRoute` 一次性建好**的：调 `Get`/`Post`/… 注册路由只是把它排队；`Run()` 才组装链并冻结进该路由的 `routeHandler.handlers`，`routeEndpoint` 就是在这时作为最后一环 append 上去的。每个请求都复用这条冻结的切片（`newContext` 里 `c.handlers = rh.handlers`），不会按请求重新组装。
+
+   `Next()` 就是循环调用这个切片里的每一环。调到 `routeEndpoint` 时，就执行了 `invokeHandler()`：解析、装配、校验、反射调用业务 handler（存在 `c.rh` 里）、序列化结果。洋葱嵌套如下：
+
+```text
+engine.Next() → handlers[0]
+└─ 全局中间件
+   ├─ 请求阶段代码
+   ├─ c.Next() → handlers[1]
+   │  └─ 分组中间件
+   │     ├─ 请求阶段代码
+   │     ├─ c.Next() → handlers[2]
+   │     │  └─ routeEndpoint
+   │     │     └─ c.invokeHandler()：
+   │     │        解析 → 装配 → 校验 → 调用 handler → 序列化 c.bytes
+   │     └─ 响应阶段代码（Next 返回后）
+   └─ 响应阶段代码（Next 返回后）
+```
+
+6. **写回响应。** 若中间件或 handler 已写过 body（`c.JSON`、`c.String` 或注入的 `http.ResponseWriter`），就以它为准。否则引擎用注册时选定的 Content-Type 写出暂存的 `c.bytes`，先 flush 已记录的状态码（默认 200）。
+7. **收尾。** 清理 multipart 临时文件；`Context`、路径参数 map、响应写入器复位并归还对象池。
+8. **任何 panic** 都会被恢复并渲染：显式 `Abort` 原样到达客户端；注册了 `PanicProcessor` 则由它接管渲染；其余一律记日志并回通用 500。
+
+handler 本身（第 5 步最内层）是纯业务代码：既不调 `Next()`，也没有阶段之分。“响应阶段”属于中间件、在回程上——所以计时和访问日志在那里读结果。
+
 ---
 
 ## 6. 服务启停（`Run` / `Shutdown`）
@@ -379,7 +464,7 @@ api.Get("/ping", func() string {
 在配置的地址上启动这唯一的引擎并**阻塞**直到停止。收到 `SIGINT`/`SIGTERM` 时执行优雅停机（关闭监听、给在途请求收尾窗口）。任何致命启动错误都会 panic。
 
 ```go
-gbl.Get("/", func() string { return "hi" })
+gbl.Get("/hi", func() string { return "hi" })
 gbl.Run() // 端口取自 application.ini 的 [gbl] port，默认 :9801
 ```
 
@@ -404,7 +489,7 @@ if err := gbl.Shutdown(ctx); err != nil {
 
 `*Context` 贯穿整条中间件链，当 handler 声明它时会被作为参数注入。它携带请求、匹配到的路径参数，以及一个用于在链路与 handler 之间传递数据的 key/value 袋子；响应经 `c.JSON` / `c.String` / `c.Status` 写出。
 
-> **`Context` 来自对象池。** 绝不能把它保留到产生它的那次请求之后——和它包装的响应写入器一样。
+> **`Context` 是池化复用的对象，只在本次请求内有效。** 请求一结束，它就会被清空并交给下一个请求复用。因此别把 `*Context` 存进全局变量或缓存，也别在请求结束后才运行的 goroutine / 回调里捕获它——那样读到的是别的请求的数据或零值，并发访问还会造成数据竞争。需要异步或跨请求使用的数据，请在请求结束前把用到的值（如 `c.PathParam`、`c.Get` 的结果）拷贝进你自己的变量或结构体。注入的 `http.ResponseWriter` 同样池化，规则一致，不得跨请求持有。
 
 导出字段：
 
@@ -417,9 +502,8 @@ c.Request // *http.Request —— 原始入站请求
 | 方法 | 用途 |
 |---|---|
 | `Next()` | 执行链上剩余部分（到末端即 handler） |
-| `Param(name) string` | 按名字取匹配到的路径参数 |
-| `Query(name) string` | 取 query 值（query 串只解析一次并缓存） |
-| `Set(key, value)` / `Get(key) (any, bool)` | 请求级取值 |
+| `PathParam(name) string` | 按名字取匹配到的路径参数（供中间件用；业务 handler 请按名绑定） |
+| `Set(key, value)` / `Get(key) (any, bool)` | 请求级取值（类型化便利：`Value` / `MustValue`，见 §8） |
 | `JSON(status int, value any)` | 以给定状态写 JSON body |
 | `String(status int, body string)` | 写纯文本 body |
 | `Status(code int)` | 记录响应状态（首次写入时才真正落到线上） |
@@ -435,26 +519,29 @@ c.Request // *http.Request —— 原始入站请求
 ### 示例
 
 ```go
-// 读路径参数与 query 值。
-gbl.Get("/greet/:name", func(c *gbl.Context) string {
-    return "hello " + c.Param("name") + ", lucky=" + c.Query("n")
-})
-
-// 显式写响应（之后自动序列化器就让位）。
-gbl.Post("/login", func(c *gbl.Context) {
-    c.JSON(http.StatusOK, map[string]string{"token": "abc123"})
-})
-
-// 以 JSON body 拒绝并中断链路。
-gbl.Get("/profile", func(c *gbl.Context) {
-    if !isLoggedIn(c) {
-        c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]string{"error": "login required"})
+// 场景：很多接口都要知道“当前登录用户是谁”。请求带 Authorization: Bearer <token>。
+// 鉴权是横切逻辑——几十个接口共用，且未登录必须在进 handler 前统一拦下——
+// 所以放在一个中间件里做一次：把 token 解析成 uid。
+gbl.Use(func(c *gbl.Context) {
+    uid, ok := parseToken(c.Request.Header.Get("Authorization")) // 你的解析逻辑
+    if !ok {
+        c.AbortWithStatus(http.StatusUnauthorized)
         return
     }
-    c.JSON(http.StatusOK, loadProfile(c))
+    c.Set("uid", uid)
+    c.Next()
 })
 
-// 链后中间件读有效状态/大小做埋点；若尚未写 body，还可覆盖暂存结果。
+// handler 不碰 token，只用当前用户。uid 来自 token，而非 path/query/body，
+// 自动绑定给不了——Context 是中间件传给 handler 的唯一通道。
+gbl.Get("/orders", func(c *gbl.Context) []Order {
+    v, _ := c.Get("uid") // any
+    return loadOrders(v.(int64))
+})
+
+// 场景：接口监控——统一记录每个请求的状态码、响应大小与耗时，必要时改写 body。
+// handler 跑完后，只有 Context 能拿到暂存返回值与有效状态/大小；
+// 注入的 http.ResponseWriter 只能写，读不到这些。
 gbl.Use(func(c *gbl.Context) {
     c.Next()
     metrics.Observe(c.StatusCode(), c.Size())
@@ -466,14 +553,9 @@ gbl.Use(func(c *gbl.Context) {
 
 ---
 
-## 8. 请求级取值（`Value` / `MustValue`）
+## 8. 请求级取值（`Get` / `Value` / `MustValue`）
 
-中间件用 `c.Set` 存值，handler（或后续环）读取。泛型辅助函数直接返回带类型的值。
-
-```go
-func Value[T any](c *Context, key string) (T, bool)   // 缺失/类型不符返回 false
-func MustValue[T any](c *Context, key string) T       // 缺失/类型不符返回零值
-```
+中间件用 `c.Set` 存值，handler（或后续环）用 `c.Get` 读取。`Get` 返回原始 `any`，自己断言成存进去的类型：
 
 ```go
 gbl.Use(func(c *gbl.Context) {
@@ -482,15 +564,19 @@ gbl.Use(func(c *gbl.Context) {
 })
 
 gbl.Get("/me", func(c *gbl.Context) string {
-    uid, ok := gbl.Value[int64](c, "uid")   // ok == true, uid == 7
+    v, ok := c.Get("uid")
     if !ok {
         return "anonymous"
     }
-    return fmt.Sprintf("user %d", uid)
+    return fmt.Sprintf("user %d", v.(int64))
 })
+```
 
-// 或者不关心缺失，直接拿带类型的值（缺失/类型不符为 0）：
-name := gbl.MustValue[string](c, "displayName")
+也可以免去手动断言，用类型化助手 `Value`（带 ok）和 `MustValue`（缺失给零值）。做成包级函数，是因为 Go 的方法不能带类型参数：
+
+```go
+uid, ok := gbl.Value[int64](c, "uid")           // ok == true, uid == 7
+name := gbl.MustValue[string](c, "displayName") // 缺失/类型不符为 ""
 ```
 
 ---
@@ -744,20 +830,23 @@ gbl.SetCorsConfig(nil) // 重新关闭 CORS
 [gbl]
 name       = myapp
 port       = 9801
-certFile   = server.crt          ; 与 keyFile 同时给出则启用 TLS
+# certFile 与 keyFile 同时给出则启用 TLS
+certFile   = server.crt
 keyFile    = server.key
 readTimeout       = 10s
 readHeaderTimeout = 5s
 writeTimeout      = 10s
 idleTimeout       = 60s
 
-; 文件日志（留空 = 关闭文件日志，仅 stderr）
-logDir  = ./logs                 ; 在该目录自动创建 info.log/warn.log/error.log
-logFile = ./app.log              ; 所有级别合并进一个文件（优先级最低）
-; 也可逐级显式指定；优先级：逐级路径 > logDir/<level>.log > logFile
-; infoLog  = ./logs/info.log
-; warnLog  = ./logs/warn.log
-; errorLog = ./logs/error.log
+# 文件日志（留空 = 关闭文件日志，仅 stderr）
+# logDir 在该目录自动创建 info.log/warn.log/error.log
+logDir  = ./logs
+# logFile 所有级别合并进一个文件（优先级最低）
+logFile = ./app.log
+# 也可逐级显式指定；优先级：逐级路径 > logDir/<level>.log > logFile
+# infoLog  = ./logs/info.log
+# warnLog  = ./logs/warn.log
+# errorLog = ./logs/error.log
 ```
 
 | 键 | 默认 | 含义 |
@@ -778,7 +867,7 @@ gbl 还把 ini 读取器作为通用配置工具暴露给**你自己的**段：
 func ReadIni(path string) (map[string]map[string]string, error)
 ```
 
-把经典 INI 文件解析为 `section -> key -> value`。空行与 `#` 注释跳过；`[section]` 开一组；`key = value` 填充当前组。某 key 出现在任何 section 之前、空 section 名、或没有 `=` 的行都算解析错误；文件不存在返回的错误可用 `errors.Is(err, os.ErrNotExist)` 判断。
+把经典 INI 文件解析为 `section -> key -> value`。空行与 `#` 或 `;` 开头的整行注释跳过（不剥离行内注释，值里可以含 `#`/`;`）；`[section]` 开一组；`key = value` 填充当前组。某 key 出现在任何 section 之前、空 section 名、或没有 `=` 的行都算解析错误；文件不存在返回的错误可用 `errors.Is(err, os.ErrNotExist)` 判断。
 
 ```go
 cfg, err := gbl.ReadIni("db.ini") // {"db": {"host": "...", "port": "..."}}

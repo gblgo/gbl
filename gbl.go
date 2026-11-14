@@ -83,14 +83,14 @@ func (e *engine) Run() {
 	snapshot := iniSnapshot()
 
 	// Bring logging up first, before anything that can fail on a bad
-	// configuration. The log destinations are plain strings that cannot fail to
-	// parse, so resolving them ahead of the full config means every later startup
-	// error — an invalid config value, a route conflict, a busy port — is recorded
-	// in the configured log file rather than only on stderr. With no destination
-	// configured this leaves the default stderr logger in place and opens no file.
+	// configuration. The log destinations are plain strings, so they cannot fail
+	// to parse. Resolving them ahead of the full config puts every later startup
+	// error in the configured log file, not only on stderr. Such errors include
+	// an invalid config value, a route conflict, and a busy port. With no
+	// destination configured, the default stderr logger stays and no file opens.
 	// If the destination itself is broken, failLoggingSetup falls back to the
-	// console plus a last-resort gbl-start-error.log so the operator can see and
-	// fix the misconfiguration, then still fails fast.
+	// console plus a last-resort gbl-start-error.log. The operator can then see
+	// and fix the misconfiguration, and startup still fails fast.
 	if err := e.setupLogging(loggingConfig(snapshot)); err != nil {
 		e.failLoggingSetup(err)
 	}
@@ -130,14 +130,20 @@ func (e *engine) Run() {
 	e.startMu.Unlock()
 
 	// A signal-triggered graceful shutdown returns nil from Serve; without this
-	// goroutine a bare Serve error would panic and skip listener cleanup.
+	// goroutine a bare Serve error would panic and skip listener cleanup. The done
+	// channel lets the goroutine exit when Serve returns on its own (e.g. a manual
+	// Shutdown), so it never leaks.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	done := make(chan struct{})
 	go func() {
-		<-stop
-		ctx, cancel := context.WithTimeout(context.Background(), cfg.shutdownGracePeriod())
-		defer cancel()
-		_ = e.Shutdown(ctx)
+		select {
+		case <-stop:
+			ctx, cancel := context.WithTimeout(context.Background(), cfg.shutdownGracePeriod())
+			defer cancel()
+			_ = e.Shutdown(ctx)
+		case <-done:
+		}
 	}()
 
 	e.printBanner(cfg, ln.Addr())
@@ -149,6 +155,10 @@ func (e *engine) Run() {
 	} else {
 		serveErr = server.Serve(ln)
 	}
+
+	// Stop watching for signals and release the watcher goroutine.
+	signal.Stop(stop)
+	close(done)
 
 	// ErrServerClosed is the expected result of a graceful shutdown, not a
 	// crash: only genuine failures propagate as a panic.

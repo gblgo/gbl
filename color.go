@@ -30,7 +30,7 @@ var levelColor = map[string]string{
 }
 
 // logMarker is the fixed prefix logLine puts before the level label. colorWriter
-// locates the level by finding it, so tinting never has to re-parse the rest of
+// locates the level by finding it, so tinting never has to reparse the rest of
 // the line.
 var logMarker = []byte("gbl: ")
 

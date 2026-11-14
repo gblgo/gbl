@@ -12,10 +12,12 @@ import (
 )
 
 // ReadIni parses a classic INI file at path into a section -> key -> value map.
-// Blank lines and # comments are skipped, a [section] header opens a new group,
-// and each key = value line fills the current section. A key seen before any
-// section, or a line without "=", is a parse error; a missing file is reported
-// as an os error the caller can test with errors.Is(err, os.ErrNotExist).
+// Blank lines and full-line comments starting with '#' or ';' are skipped, a
+// [section] header opens a new group, and each key = value line fills the current
+// section. Inline comments are not stripped, so a value may itself contain '#'
+// or ';'. A key seen before any section, or a line without "=", is a parse error;
+// a missing file is reported as an os error the caller can test with
+// errors.Is(err, os.ErrNotExist).
 func ReadIni(path string) (map[string]map[string]string, error) {
 
 	file, err := os.Open(path)
@@ -40,8 +42,8 @@ func ReadIni(path string) (map[string]map[string]string, error) {
 		// Remove leading and trailing spaces
 		line := strings.TrimSpace(scanner.Text())
 
-		// Ignore blank lines and comments
-		if line == null || strings.HasPrefix(line, "#") {
+		// Ignore blank lines and full-line comments # or ;.
+		if line == null || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
 
