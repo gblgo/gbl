@@ -14,7 +14,7 @@ import (
 // iniConfigData is the process-wide configuration snapshot.
 //
 // It is written exactly once, inside loadIni, guarded by iniOnce, and is only
-// ever handed out as a copy. Nothing in the package mutates it afterwards, so
+// ever handed out as a copy. Nothing in the package mutates it afterward, so
 // every read is safe from any goroutine at any time: registration code,
 // handlers and the startup path all see the same immutable data.
 var (
