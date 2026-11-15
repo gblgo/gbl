@@ -135,6 +135,15 @@ gbl.Post("/user", func(u User, verbose bool) string {
 
 缺一个顶层成员就是请求期 400，而不是静悄悄给零值 —— 形参名与 JSON key 必须一一对应。
 
+**结构体字段必须导出。** JSON 绑定走 `encoding/json`，只会给导出（大写开头）字段赋值。未导出字段被静默忽略、保持零值，且不报错。
+
+```go
+type User struct {
+    Name string // 导出 —— 从 "name" 键绑定
+    age  int    // 未导出 —— 永远绑不上，恒为 0
+}
+```
+
 **规则 3 —— form/query 模式下结构体字段按字段名（忽略大小写）从路径/form 值填充，故 `:id` 也能填 `u.ID`。**
 
 ```go

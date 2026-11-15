@@ -159,6 +159,17 @@ gbl.Post("/user", func(u User, verbose bool) string {
 A missing top-level member is a request-time 400, not a silent zero value —
 parameter names and JSON keys must line up one-to-one.
 
+**Struct fields must be exported.** JSON binding uses `encoding/json`, which
+only sets exported (capitalized) fields. An unexported field is silently
+ignored and keeps its zero value, with no error reported.
+
+```go
+type User struct {
+    Name string // exported — bound from the "name" key
+    age  int    // unexported — never bound, stays 0
+}
+```
+
 **Rule 3 — in form/query mode a struct's fields are filled from path/form
 values by field name (case-insensitive), so `:id` can populate `u.ID`.**
 
