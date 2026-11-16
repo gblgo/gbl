@@ -154,12 +154,15 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 
 	contentTypeHeader := r.Header.Get(contentType)
 	if contentTypeHeader != null {
-		// Fast path: a bare "application/json" carries no parameters, so it needs
-		// no mime parsing. Anything else (charset, boundary, +json suffix) still
-		// goes through ParseMediaType.
-		if contentTypeHeader == applicationJson {
+		// Fast path: a bare "application/json" or "application/x-www-form-urlencoded"
+		// has no parameters, so it skips mime parsing. Anything else (charset,
+		// boundary, +json suffix) still goes through ParseMediaType.
+		switch contentTypeHeader {
+		case applicationJson:
 			mediaType = applicationJson
-		} else {
+		case xWwwFormUrlencoded:
+			mediaType = xWwwFormUrlencoded
+		default:
 			var err error
 			mediaType, _, err = mime.ParseMediaType(contentTypeHeader)
 			if err != nil {
