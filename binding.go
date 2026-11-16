@@ -52,7 +52,11 @@ type (
 		classes         []paramClass
 		structFields    [][]structField // parallel to types; non-nil only for struct business params
 		businessIndexes []int
-		needsParse      bool
+		// validatableIndexes is the subset of businessIndexes whose type (or its
+		// pointer) implements Validatable, precomputed here so a handler that does
+		// not validate pays no per-request reflection or interface boxing.
+		validatableIndexes []int
+		needsParse         bool
 		// needsNames is true when at least one business parameter must be matched
 		// against the request by its handler parameter name — any scalar, or more
 		// than one business argument (whose JSON members are split by name). A
@@ -81,6 +85,7 @@ var (
 	fileHeaderPtr        = reflect.TypeFor[*multipart.FileHeader]()
 	fileHeaderPs         = reflect.TypeFor[[]*multipart.FileHeader]()
 	fileHeaderSlice      = reflect.TypeFor[[]multipart.FileHeader]()
+	validatableType      = reflect.TypeFor[Validatable]()
 )
 
 // paramsPool recycles the reflect argument slice built per request. A pointer to
@@ -171,6 +176,11 @@ func buildBindPlan(rt reflect.Type) bindPlan {
 			}
 			if !selfDescribing(t) {
 				plan.needsNames = true
+			}
+			// Decide validation opt-in once, by type, so the request path never
+			// boxes a value just to discover it does not implement Validatable.
+			if t.Implements(validatableType) || reflect.PointerTo(t).Implements(validatableType) {
+				plan.validatableIndexes = append(plan.validatableIndexes, i)
 			}
 		case classFiles:
 			// File headers arrive only through a parsed multipart body.

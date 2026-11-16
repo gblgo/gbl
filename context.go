@@ -303,7 +303,7 @@ func (c *Context) invokeHandler() {
 		// handler runs. A validation failure is still the client's fault, but the
 		// message may expose internal rules, so only a generic 400 is returned and
 		// the detail stays in the server log.
-		if vErr := validateBusiness(in, rh.plan.businessIndexes); vErr != nil {
+		if vErr := validateBusiness(in, rh.plan.validatableIndexes); vErr != nil {
 			releaseParams(paramsBuf, in)
 			c.logger.Error("request validation failed", "error", vErr)
 			abort(http.StatusBadRequest, http.StatusText(http.StatusBadRequest))
