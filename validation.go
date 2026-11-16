@@ -18,9 +18,10 @@ type Validatable interface {
 	Validate() error
 }
 
-// validateBusiness runs Validate over every business argument that opted in,
-// returning the first failure. Only the business-parameter indexes are visited:
-// injected request/writer/context/file arguments carry no client data to check.
+// validateBusiness runs Validate over the precomputed validatable indexes,
+// returning the first failure. buildBindPlan already filtered these by type, so
+// a handler whose parameters do not implement Validatable passes an empty slice
+// and pays no per-request reflection or interface boxing.
 func validateBusiness(values []reflect.Value, indexes []int) error {
 	for _, i := range indexes {
 		if i < 0 || i >= len(values) {
