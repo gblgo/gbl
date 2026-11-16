@@ -45,6 +45,9 @@ func (rw *gblResponseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 }
 
+// Header exposes the underlying writer's live header map. Headers are not staged
+// like the status and byte count: net/http snapshots them when the status is
+// flushed, so they must already be on the underlying writer by then.
 func (rw *gblResponseWriter) Header() http.Header {
 	return rw.w.Header()
 }
