@@ -113,6 +113,17 @@ func mergeFormBodyWins(query, body url.Values) url.Values {
 	return merged
 }
 
+// queryValues returns the parsed URL query, or nil when the request carries no
+// query string. Returning nil avoids the empty map url.URL.Query() allocates for
+// an empty RawQuery; form lookups and mergeFormBodyWins already treat nil as "no
+// query values".
+func queryValues(r *http.Request) url.Values {
+	if r.URL.RawQuery == null {
+		return nil
+	}
+	return r.URL.Query()
+}
+
 // parseRequestParameters collects handler-bindable inputs for the request:
 // form values, uploaded files, the JSON body buffer and the parsed media type.
 // The body buffer is pooled; the caller must release it with releaseBodyBuffer
@@ -126,13 +137,10 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 	// Only POST, PUT and PATCH may carry a body GBL reads; every other method
 	// exposes query parameters and leaves the body untouched.
 	if !method.isBodyMethod() {
-		// No query string means nothing to bind from the URL: returning a nil
-		// form avoids the empty url.Values map r.URL.Query() would allocate, and
-		// every form lookup already treats a nil map as "not found".
-		if r.URL.RawQuery == null {
-			return nil, nil, nil, null, nil
-		}
-		return r.URL.Query(), nil, nil, null, nil
+		// Only path and query parameters bind for these methods; the body is never
+		// read. queryValues yields nil for an empty query, so no empty map is
+		// allocated and every form lookup treats nil as "not found".
+		return queryValues(r), nil, nil, null, nil
 	}
 
 	var (
@@ -202,7 +210,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 			return nil, nil, nil, null, err
 		}
 		// Body text fields win over query on shared keys; query-only keys survive.
-		form = mergeFormBodyWins(r.URL.Query(), r.PostForm)
+		form = mergeFormBodyWins(queryValues(r), r.PostForm)
 		if r.MultipartForm != nil {
 			files = r.MultipartForm.File
 		}
@@ -229,12 +237,12 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 			return nil, nil, nil, null, err
 		}
 		// Body fields win over query on shared keys; query-only keys survive.
-		form = mergeFormBodyWins(r.URL.Query(), r.PostForm)
+		form = mergeFormBodyWins(queryValues(r), r.PostForm)
 
 	default:
 		// Unsupported body media types are not interpreted as parameters.
 		// Query parameters are still valid for POST and PUT.
-		form = r.URL.Query()
+		form = queryValues(r)
 	}
 
 	return form, files, bodyBuf, mediaType, nil
