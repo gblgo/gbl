@@ -67,7 +67,7 @@ func (e *engine) UseCors(cc *CorsConfig) *engine {
 	return e
 }
 
-// isPreflightRequest Determine whether it is a preflight request
+// isPreflightRequest reports whether r is a CORS preflight request.
 func isPreflightRequest(r *http.Request) bool {
 	return r.Method == http.MethodOptions && r.Header.Get(accessControlRequestMethod) != null
 }
@@ -78,6 +78,23 @@ func isPreflightRequest(r *http.Request) bool {
 type corsHandler struct {
 	engine *engine
 	config *CorsConfig
+	// Fixed header values joined once at wiring time, so the request path never
+	// re-joins static configuration on every response or preflight.
+	allowMethods  string
+	allowHeaders  string
+	exposeHeaders string
+}
+
+// newCorsHandler wires the CORS layer over e, precomputing the header values that
+// stay constant for the lifetime of the configuration.
+func newCorsHandler(e *engine, cc *CorsConfig) *corsHandler {
+	return &corsHandler{
+		engine:        e,
+		config:        cc,
+		allowMethods:  strings.Join(cc.AllowedMethods, headerComma),
+		allowHeaders:  strings.Join(cc.AllowedHeaders, headerComma),
+		exposeHeaders: strings.Join(cc.ExposedHeaders, headerComma),
+	}
 }
 
 // contains reports whether target matches any value, case-insensitively. It
@@ -115,11 +132,11 @@ func (ch *corsHandler) matchOrigin(origin string) (string, bool) {
 	return null, false
 }
 
-// handlePreflight Handle preflight request
+// handlePreflight answers a CORS preflight request.
 func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 
 	header := w.Header()
-	// Methods to get browser requests
+	// The method the browser intends to use.
 	requestMethod := r.Header.Get(accessControlRequestMethod)
 
 	if !ch.contains(ch.config.AllowedMethods, requestMethod) {
@@ -146,9 +163,9 @@ func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set preflight response headers
-	header.Set(accessControlAllowMethods, strings.Join(ch.config.AllowedMethods, headerComma))
+	header.Set(accessControlAllowMethods, ch.allowMethods)
 
-	header.Set(accessControlAllowHeaders, strings.Join(ch.config.AllowedHeaders, headerComma))
+	header.Set(accessControlAllowHeaders, ch.allowHeaders)
 
 	if ch.config.MaxAge > 0 {
 		header.Set(accessControlMaxAge, strconv.FormatInt(int64(ch.config.MaxAge.Seconds()), 10))
@@ -196,7 +213,7 @@ func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(ch.config.ExposedHeaders) > 0 {
-		header.Set(accessControlExposeHeaders, strings.Join(ch.config.ExposedHeaders, headerComma))
+		header.Set(accessControlExposeHeaders, ch.exposeHeaders)
 	}
 
 	// Handle preflight request

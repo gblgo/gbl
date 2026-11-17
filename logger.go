@@ -208,7 +208,15 @@ func (e *engine) writeStartErrorFile(path string, err error) {
 			"file", path, "error", fErr)
 		return
 	}
-	defer f.Close()
+	// Best-effort diagnostic during a startup abort, with no error to return.
+	// Surface a close failure through the logger rather than ignoring it, as the
+	// open failure above already does.
+	defer func() {
+		if cErr := f.Close(); cErr != nil {
+			e.logger.Warn("could not close the fallback startup-error file",
+				"file", path, "error", cErr)
+		}
+	}()
 
 	_, _ = fmt.Fprintf(f,
 		"%s\ngbl: startup aborted - the configured file logging could not be initialized.\nReason: %v\nFix: check the logFile/logDir/infoLog/warnLog/errorLog value in application.ini; the path must exist and be writable. Then restart.\n\n",

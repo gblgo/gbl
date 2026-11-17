@@ -195,7 +195,7 @@ func (e *engine) buildHandler() http.Handler {
 	if e.cors == nil {
 		return e
 	}
-	return &corsHandler{engine: e, config: e.cors}
+	return newCorsHandler(e, e.cors)
 }
 
 // ServeHTTP lets an engine act directly as an http.Handler, delegating to the

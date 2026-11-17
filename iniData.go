@@ -23,7 +23,7 @@ var (
 	iniLoadErr    error
 )
 
-// loadIni Reads application.ini at most once and freezes the snapshot.
+// loadIni reads application.ini at most once and freezes the snapshot.
 //
 // The file is read on first access instead of inside Run, so configuration is
 // already available while routes and middleware are registered.
@@ -46,7 +46,7 @@ func loadIni() {
 	})
 }
 
-// iniSnapshot Returns the frozen snapshot, panicking only on a broken file.
+// iniSnapshot returns the frozen snapshot, panicking only on a broken file.
 func iniSnapshot() map[string]map[string]string {
 	loadIni()
 	if iniLoadErr != nil {
@@ -55,7 +55,7 @@ func iniSnapshot() map[string]map[string]string {
 	return iniConfigData
 }
 
-// IniBySection Get its configuration items through the section
+// IniBySection returns a copy of the section's configuration items.
 //
 // The returned map is a copy; changing it does not affect the configuration.
 // It may be called before or after Run, from any goroutine.
@@ -73,7 +73,7 @@ func IniBySection(section string) (map[string]string, bool) {
 	return result, true
 }
 
-// IniBySectionAndKey Get the exact configuration item through section and key
+// IniBySectionAndKey returns the exact configuration item for section and key.
 //
 // It may be called before or after Run, from any goroutine.
 func IniBySectionAndKey(section, key string) (string, bool) {

@@ -18,7 +18,7 @@ import (
 // or ';'. A key seen before any section, or a line without "=", is a parse error;
 // a missing file is reported as an os error the caller can test with
 // errors.Is(err, os.ErrNotExist).
-func ReadIni(path string) (map[string]map[string]string, error) {
+func ReadIni(path string) (ini map[string]map[string]string, err error) {
 
 	file, err := os.Open(path)
 
@@ -26,20 +26,21 @@ func ReadIni(path string) (map[string]map[string]string, error) {
 		return nil, fmt.Errorf("error opening file: %w", err)
 	}
 
-	defer func(file *os.File) {
-		if e := file.Close(); e != nil {
-			_ = fmt.Errorf("error closing file: %w", e)
+	// Surface a close failure only when parsing succeeded, so it never masks an
+	// earlier open or parse error.
+	defer func() {
+		if cErr := file.Close(); cErr != nil && err == nil {
+			err = fmt.Errorf("error closing file: %w", cErr)
 		}
-	}(file)
+	}()
 
-	ini := make(map[string]map[string]string)
+	ini = make(map[string]map[string]string)
 
 	section := null
 	scanner := bufio.NewScanner(file)
 
 	for lineNo := 1; scanner.Scan(); lineNo++ {
 
-		// Remove leading and trailing spaces
 		line := strings.TrimSpace(scanner.Text())
 
 		// Ignore blank lines and full-line comments # or ;.
@@ -47,7 +48,7 @@ func ReadIni(path string) (map[string]map[string]string, error) {
 			continue
 		}
 
-		// Analysis Group
+		// A [section] header opens a new group.
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = strings.TrimSpace(line[1 : len(line)-1])
 
