@@ -103,9 +103,7 @@ func acquireParams(n int) (*[]reflect.Value, []reflect.Value) {
 		params = make([]reflect.Value, n)
 	}
 	params = params[:n]
-	for i := range params {
-		params[i] = reflect.Value{}
-	}
+	clear(params)
 	return bufPool, params
 }
 
