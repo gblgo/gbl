@@ -51,7 +51,9 @@ func defaultConfig() *gblConfig {
 	}
 }
 
-// generateConfig Automatically map ini configuration based on struct tags
+// generateConfig resolves the runtime configuration: the defaults overlaid with
+// the [gbl] section of the ini snapshot. Each field's ini key is derived from its
+// name by formatName (lowerCamel and kebab-case); no struct tags are read.
 func generateConfig(ini map[string]map[string]string) (*gblConfig, error) {
 
 	cfg := defaultConfig()
@@ -66,7 +68,7 @@ func generateConfig(ini map[string]map[string]string) (*gblConfig, error) {
 
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
-		// Obtain INI Tag
+		// Match the field name to an ini key, trying both spellings.
 		key1, key2 := formatName(field.Name)
 		raw, exists := values[key1]
 		if !exists {
@@ -88,7 +90,7 @@ func generateConfig(ini map[string]map[string]string) (*gblConfig, error) {
 	return cfg, nil
 }
 
-// setConfigValue Convert a string to the corresponding field type
+// setConfigValue converts a raw ini string to the field's type.
 func setConfigValue(field reflect.Value, value string) error {
 	if !field.CanSet() {
 		return fmt.Errorf("field cannot be set")
@@ -145,8 +147,9 @@ func setConfigValue(field reflect.Value, value string) error {
 	return nil
 }
 
-// formatName Generate keys in two formats
-// Give an example: Name -> name, name; ReadTimeout -> readTimeout, read-timeout
+// formatName derives the two ini key spellings for a field name: lowerCamel and
+// kebab-case. For example Name -> name, name; ReadTimeout -> readTimeout,
+// read-timeout.
 func formatName(s string) (lowerFirst, kebabCase string) {
 	if s == null {
 		return null, null

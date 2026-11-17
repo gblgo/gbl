@@ -31,7 +31,7 @@ var methodNames = [methodCount]string{
 	methodOptions: "OPTIONS",
 }
 
-// methodOf Resolves an HTTP method name, reporting false when GBL does not
+// methodOf resolves an HTTP method name, reporting false when GBL does not
 // implement that verb at all.
 //
 // The upper-casing keeps the lenient behavior GBL has always had, so a
@@ -57,7 +57,7 @@ func methodOf(name string) (httpMethod, bool) {
 	}
 }
 
-// isBodyMethod Reports whether GBL parses a request body for this method.
+// isBodyMethod reports whether GBL parses a request body for this method.
 //
 // GET, HEAD, DELETE and OPTIONS never touch the body, whatever Content-Type the
 // client sent. PATCH joins POST and PUT here because partial updates are its
@@ -229,7 +229,7 @@ func (e *engine) generateRoute() {
 	e.generated = true
 }
 
-// resolveParamNames Recovers a handler's parameter names from its own source file.
+// resolveParamNames recovers a handler's parameter names from its own source file.
 //
 // reflect reports a function's parameter types but never its parameter names, and
 // GBL binds request values by name, so the source recorded in the binary is parsed
@@ -321,7 +321,7 @@ func findFuncTypeAt(fset *token.FileSet, file *ast.File, line int) *ast.FuncType
 	return best
 }
 
-// normalizeParamNames Pads names to exactly count entries, one per parameter.
+// normalizeParamNames pads names to exactly count entries, one per parameter.
 //
 // Unnamed parameters contribute nothing to the recovered list, so it can arrive
 // short or empty. Every gap gets a positional placeholder ("arg0", "arg1", ...),
@@ -343,7 +343,7 @@ func normalizeParamNames(names []string, count int) []string {
 	return normalized
 }
 
-// unnamedParamName Placeholder for a parameter the source did not name.
+// unnamedParamName is the placeholder for a parameter the source did not name.
 func unnamedParamName(index int) string {
 	return "arg" + strconv.Itoa(index)
 }

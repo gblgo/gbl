@@ -121,7 +121,7 @@ func cleanupMultipart(r *http.Request) {
 	}
 }
 
-// abortUnmatched Answers a request that matched no route, telling "no such
+// abortUnmatched answers a request that matched no route, telling "no such
 // path" apart from "path exists, wrong verb".
 func (e *engine) abortUnmatched(rw *gblResponseWriter, method httpMethod, path string) {
 	allowed := e.allowFor(path)
@@ -142,7 +142,7 @@ func (e *engine) abortUnmatched(rw *gblResponseWriter, method httpMethod, path s
 	abort(http.StatusMethodNotAllowed, http.StatusText(http.StatusMethodNotAllowed))
 }
 
-// writeRequestError Maps a request-parsing failure to its status code and
+// writeRequestError maps a request-parsing failure to its status code and
 // aborts the pipeline. Every error reaching here describes the client's own
 // malformed request (bad Content-Type, unparseable body, oversize payload), so
 // its message is safe to send back.

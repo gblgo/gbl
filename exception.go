@@ -55,8 +55,8 @@ func Abort(status int, msg string) {
 	panic(responseAbort{status: status, body: msg})
 }
 
-// abort raises an internal responseAbort panic,
-// the form every framework-generated halt uses so the value is recognized as displayable rather than as a crash.
+// abort raises an internal responseAbort panic. Every framework-generated halt
+// uses this form so the value is recognized as displayable rather than a crash.
 func abort(status int, body string) {
 	panic(responseAbort{status: status, body: body})
 }
@@ -65,7 +65,8 @@ func abort(status int, body string) {
 // meets a reflected value of an unhandled kind.
 var typeRecognitionError = []byte("Reflection Type Identification Exception")
 
-// errorWriteback Exception information is written back according to the reflection type
+// errorWriteback renders a panic payload as response bytes, choosing the form by
+// its reflected kind.
 func errorWriteback(w http.ResponseWriter, err any) []byte {
 	// A value implementing error is written back as its message. Reflecting it
 	// instead walks the concrete type, and the usual errors.New and fmt.Errorf
