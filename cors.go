@@ -78,22 +78,28 @@ func isPreflightRequest(r *http.Request) bool {
 type corsHandler struct {
 	engine *engine
 	config *CorsConfig
-	// Fixed header values joined once at wiring time, so the request path never
-	// re-joins static configuration on every response or preflight.
+	// Fixed header values precomputed once at wiring time, so the request path
+	// never re-joins or re-formats static configuration per response or preflight.
 	allowMethods  string
 	allowHeaders  string
 	exposeHeaders string
+	maxAge        string
 }
 
 // newCorsHandler wires the CORS layer over e, precomputing the header values that
 // stay constant for the lifetime of the configuration.
 func newCorsHandler(e *engine, cc *CorsConfig) *corsHandler {
+	var maxAge string
+	if cc.MaxAge > 0 {
+		maxAge = strconv.FormatInt(int64(cc.MaxAge.Seconds()), 10)
+	}
 	return &corsHandler{
 		engine:        e,
 		config:        cc,
 		allowMethods:  strings.Join(cc.AllowedMethods, headerComma),
 		allowHeaders:  strings.Join(cc.AllowedHeaders, headerComma),
 		exposeHeaders: strings.Join(cc.ExposedHeaders, headerComma),
+		maxAge:        maxAge,
 	}
 }
 
@@ -167,8 +173,8 @@ func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 
 	header.Set(accessControlAllowHeaders, ch.allowHeaders)
 
-	if ch.config.MaxAge > 0 {
-		header.Set(accessControlMaxAge, strconv.FormatInt(int64(ch.config.MaxAge.Seconds()), 10))
+	if ch.maxAge != null {
+		header.Set(accessControlMaxAge, ch.maxAge)
 	}
 
 	header.Add(vary, accessControlRequestMethod)
