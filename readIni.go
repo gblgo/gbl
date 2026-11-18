@@ -17,7 +17,8 @@ import (
 // section. Inline comments are not stripped, so a value may itself contain '#'
 // or ';'. A key seen before any section, or a line without "=", is a parse error;
 // a missing file is reported as an os error the caller can test with
-// errors.Is(err, os.ErrNotExist).
+// errors.Is(err, os.ErrNotExist). A close failure after a successful parse is
+// surfaced as well, never masking an earlier open or parse error.
 func ReadIni(path string) (ini map[string]map[string]string, err error) {
 
 	file, err := os.Open(path)

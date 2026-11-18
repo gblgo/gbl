@@ -198,9 +198,9 @@ func startErrorFilePath() string {
 // writeStartErrorFile drops a plain-language diagnostic into the last-resort
 // fallback file, so an operator who turned on file logging — and therefore
 // expects to read a file, not a console — still finds out exactly what broke and
-// how to fix it. It is best-effort: failing to create even this file is reported
-// on the console and otherwise swallowed, because startup is already aborting and
-// the reason has been printed there.
+// how to fix it. It is best-effort: startup is already aborting and the reason
+// has been printed, so an open or close failure is reported on the console rather
+// than propagated.
 func (e *engine) writeStartErrorFile(path string, err error) {
 	f, fErr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if fErr != nil {
