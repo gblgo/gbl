@@ -334,7 +334,7 @@ func injectedParameters(
 	return nil
 }
 
-// paramNameAt Bounds-safe lookup of a handler parameter name.
+// paramNameAt is a bounds-safe lookup of a handler parameter name.
 //
 // generateRoute pads the recovered names to exactly one per parameter, so this
 // normally just reads the slice. The fallback keeps a name list of any length
@@ -625,10 +625,10 @@ func bindTextValue(t reflect.Type, values []string) (reflect.Value, error) {
 		return result, nil
 	}
 
-	result := reflect.New(t).Elem()
 	if len(values) == 0 {
-		return result, nil
+		return reflect.Zero(t), nil
 	}
+	result := reflect.New(t).Elem()
 
 	// Scalar parameters use the first value. Repeated values should use slices/arrays.
 	value := values[0]

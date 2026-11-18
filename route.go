@@ -233,17 +233,18 @@ func (e *engine) generateRoute() {
 //
 // reflect reports a function's parameter types but never its parameter names, and
 // GBL binds request values by name, so the source recorded in the binary is parsed
-// once per file at startup. The handler is located by SOURCE POSITION — the line
-// the runtime reports for its entry point — rather than by symbol name: a runtime
-// symbol is a full module-qualified path ("github.com/you/pkg.Handler") while the
-// AST records only the package clause ("pkg"), so comparing them silently fails
-// for every package except main and never matches a func literal. Position
-// matching fixes both and additionally resolves closures passed as handlers.
+// once per file at startup. The handler is located by SOURCE POSITION, the line
+// the runtime reports for its entry point, not by symbol name. A runtime symbol
+// is a full module-qualified path ("github.com/you/pkg.Handler"). The AST records
+// only the package clause ("pkg"). Comparing the two silently fails for every
+// package except main, and never matches a func literal. Position matching fixes
+// both and additionally resolves closures passed as handlers.
 //
-// Names cannot be recovered when the source no longer lives where it was
-// compiled (a multi-stage image, -trimpath or a bare binary) so the file cannot
-// be parsed, or when the entry line belongs to generated code with no enclosing
-// declaration (such as the wrapper thunk synthesized for a bound method value).
+// Names cannot be recovered in two cases. First, the source no longer lives
+// where it was compiled (a multi-stage image, -trimpath or a bare binary), so the
+// file cannot be parsed. Second, the entry line belongs to generated code with no
+// enclosing declaration, such as the wrapper thunk synthesized for a bound method
+// value.
 //
 // The second return reports whether real names were recovered. The caller acts
 // on it: a handler whose binding needs names aborts startup (failStartup), while
@@ -292,7 +293,7 @@ func (e *engine) resolveParamNames(v reflect.Value) ([]string, bool) {
 // literal whose source span encloses the given line, or nil when none does.
 // Preferring the smallest enclosing span makes a closure passed as a handler
 // resolve to its own func literal rather than to the function that created it.
-func findFuncTypeAt(fset *token.FileSet, file *ast.File, line int) *ast.FuncType {
+func findFuncTypeAt(fSet *token.FileSet, file *ast.File, line int) *ast.FuncType {
 	var (
 		best     *ast.FuncType
 		bestSpan = -1
@@ -308,8 +309,8 @@ func findFuncTypeAt(fset *token.FileSet, file *ast.File, line int) *ast.FuncType
 			return true
 		}
 
-		start := fset.Position(n.Pos()).Line
-		end := fset.Position(n.End()).Line
+		start := fSet.Position(n.Pos()).Line
+		end := fSet.Position(n.End()).Line
 		if line < start || line > end {
 			return true
 		}

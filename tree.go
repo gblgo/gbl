@@ -189,7 +189,7 @@ func (e *engine) matchNode(method httpMethod, path string, params map[string]str
 	return handler
 }
 
-// allowFor Lists the methods that can actually reach path.
+// allowFor lists the methods that can actually reach path.
 //
 // Every supported method owns a separate tree, so a miss only proves the path is
 // unreachable for that one verb. Probing the rest tells "no such path" apart
@@ -201,7 +201,7 @@ func (e *engine) allowFor(path string) []string {
 	for m := range methodCount {
 		// A fresh map per probe: searchNode cleans up after a failed branch, but
 		// nothing here should depend on that.
-		if e.matchNode(httpMethod(m), path, make(map[string]string)) != nil {
+		if e.matchNode(m, path, make(map[string]string)) != nil {
 			reachable[m] = true
 		}
 	}
