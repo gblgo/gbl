@@ -66,7 +66,7 @@ var contextPool = sync.Pool{
 
 // newContext fetches a Context primed for one request. handlers already holds
 // the merged chain with the endpoint appended, so the caller only runs Next.
-func newContext(w *gblResponseWriter,
+func newContext(w *pooledResponseWriter,
 	r *http.Request,
 	params map[string]string,
 	rh *routeHandler,
