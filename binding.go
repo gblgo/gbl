@@ -60,7 +60,7 @@ type (
 		// writerOK is parallel to types, non-nil only when a parameter is a writer
 		// (classWriter): it records whether the pooled writer satisfies that
 		// parameter's type, decided once here so the request path injects without
-		// re-running reflect's interface-satisfaction probe.
+		// re-running the reflect package's interface-satisfaction probe.
 		writerOK []bool
 		// validatableIndexes is the subset of businessIndexes whose type (or its
 		// pointer) implements Validatable, precomputed here so a handler that does
@@ -233,7 +233,7 @@ func structFieldsOf(t reflect.Type) []structField {
 
 // lowerFirst lowercases the first rune of s, leaving the rest verbatim. It
 // bridges an exported struct field's PascalCase name (Name) to the lowercase
-// key clients usually send (name), so no json tag is needed. Request keys are
+// key clients usually send (name), so no JSON tag is needed. Request keys are
 // matched exactly and never transformed.
 func lowerFirst(s string) string {
 	if s == null {
