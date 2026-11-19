@@ -85,13 +85,13 @@ handler 就是任意 `func`。gbl 读取它的签名，按**类型 + 名字**装
 - **JSON**（`application/json` 且 body 非空）：只从 JSON body 取，form/query 一律不看。
 - **form/query**（其他 content type）：从 form/query 值取。`POST`/`PUT`/`PATCH` 下，body 字段与同名 query 都能绑定，**body 优先**。
 
-在任一来源内部，名字匹配**先精确、再忽略大小写**（对齐 `encoding/json` 的字段匹配）。
+gbl 自己的名字查找一律**精确匹配**：路径/form/query 的 key、或顶层 JSON 成员，都按原样匹配，不做大小写折叠。（JSON body 内部的结构体字段由 `encoding/json` 解码，它按字段名忽略大小写匹配。）
 
-**json tag 可选**：结构体字段写了 `json:"user_name"` 时，form/query 绑定也按 tag 名匹配（与 JSON body 路径一致）；`json:"-"` 的字段跳过绑定。不写 tag 就用 Go 字段名，行为不变。
+**json tag 可选**：结构体字段写了 `json:"user_name"` 时，form/query 绑定也按 tag 名原样匹配；`json:"-"` 的字段跳过绑定。不写 tag 时，框架把字段名首字母转小写得到绑定名（`Name` → `name`、`Id` → `id`）并在注册期缓存，于是 `name` 这样的请求 key 无需 tag 即可绑定。这就是驼峰约定：字段应命名为 `Id` 而非 `ID`（`ID` 会得到 `iD`）。
 
 ```go
 type User struct {
-    ID   int
+    Id   int
     Name string
 }
 
@@ -146,12 +146,12 @@ type User struct {
 }
 ```
 
-**规则 3 —— form/query 模式下结构体字段按绑定名（json tag 名，无 tag 则字段名；忽略大小写）从路径/form 值填充，故 `:id` 也能填 `u.ID`。**
+**规则 3 —— form/query 模式下结构体字段按绑定名（json tag 名原样，无 tag 则字段名首字母转小写）精确匹配，从路径/form 值填充，故 `:id` 也能填 `u.Id`。**
 
 ```go
-// GET /user/42  →  u.ID == 42，来自 :id 路径段
+// GET /user/42  →  u.Id == 42，来自 :id 路径段
 gbl.Get("/user/:id", func(u User) string {
-    return "user " + strconv.Itoa(u.ID)
+    return "user " + strconv.Itoa(u.Id)
 })
 ```
 
@@ -163,7 +163,7 @@ gbl.Get("/user/:id", func(u User) string {
 gbl.Get("/text", func() string { return "plain" })         // text/plain
 gbl.Get("/num", func() int { return 42 })                  // 文本 "42"
 gbl.Get("/json", func() map[string]int { return map[string]int{"n": 3} }) // JSON
-gbl.Get("/obj", func() *User { return &User{ID: 1} })      // JSON
+gbl.Get("/obj", func() *User { return &User{Id: 1} })      // JSON
 gbl.Get("/none", func() { })                               // nil 结果 -> 空 body
 ```
 
@@ -749,7 +749,7 @@ gbl.SetLogger(gbl.NewStdLogger(log.New(f, "", log.LstdFlags)))
 type ByteSize int
 ```
 
-`ByteSize` 是一个具名 `int`，代表字节数 —— 类型名本身就在调用点说明了参数含义。本节讲的是**上传文件**：文件只在携带 `multipart/form-data` 的体方法上装配，文件参数按“字段名与参数名相同的那个文件 part”匹配（先精确、后忽略大小写）。这条文件查找路径与文本 form/query 参数是两条独立的来源，互不相干；支持的参数类型见下表。
+`ByteSize` 是一个具名 `int`，代表字节数 —— 类型名本身就在调用点说明了参数含义。本节讲的是**上传文件**：文件只在携带 `multipart/form-data` 的体方法上装配，文件参数按“字段名与参数名相同的那个文件 part”匹配（精确匹配）。这条文件查找路径与文本 form/query 参数是两条独立的来源，互不相干；支持的参数类型见下表。
 
 ```go
 import "mime/multipart"

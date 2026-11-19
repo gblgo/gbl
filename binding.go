@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 )
 
 // This file holds the parameter-binding subsystem: the precomputed bind plan,
@@ -36,12 +38,12 @@ type (
 
 	// structField is one settable (exported) field of a struct parameter,
 	// cached so bindStruct can skip reflect.Type field introspection per request.
-	// name is the bind name: the JSON tag's name when present, else the Go field
-	// name; lower is its precomputed lowercase form for fold lookups.
+	// name is the exact bind key: the JSON tag's name when present, else the Go
+	// field name with its first letter lowercased, so a lowercase request key
+	// binds to an exported PascalCase field without the user adding any tag.
 	structField struct {
 		index int
 		name  string
-		lower string
 		typ   reflect.Type
 	}
 
@@ -55,6 +57,11 @@ type (
 		classes         []paramClass
 		structFields    [][]structField // parallel to types; non-nil only for struct business params
 		businessIndexes []int
+		// writerOK is parallel to types, non-nil only when a parameter is a writer
+		// (classWriter): it records whether the pooled writer satisfies that
+		// parameter's type, decided once here so the request path injects without
+		// re-running reflect's interface-satisfaction probe.
+		writerOK []bool
 		// validatableIndexes is the subset of businessIndexes whose type (or its
 		// pointer) implements Validatable, precomputed here so a handler that does
 		// not validate pays no per-request reflection or interface boxing.
@@ -84,6 +91,7 @@ var (
 	requestType          = reflect.TypeFor[*http.Request]()
 	contextType          = reflect.TypeFor[*Context]()
 	writerType           = reflect.TypeFor[http.ResponseWriter]()
+	pooledWriterType     = reflect.TypeFor[*pooledResponseWriter]()
 	fileHeaderType       = reflect.TypeFor[multipart.FileHeader]()
 	fileHeaderPtr        = reflect.TypeFor[*multipart.FileHeader]()
 	fileHeaderPs         = reflect.TypeFor[[]*multipart.FileHeader]()
@@ -91,8 +99,10 @@ var (
 	validatableType      = reflect.TypeFor[Validatable]()
 )
 
+// paramsPool recycles the reflect argument slice built per request. A pointer to
+// the slice is stored so Get/Put do not box the slice header.
 var paramsPool = sync.Pool{
-	New: func() any { return new(make([]reflect.Value, 0, 8)) },
+	New: func() any { s := make([]reflect.Value, 0, 8); return &s },
 }
 
 // acquireParams returns a zeroed reflect argument slice of length n, reusing a
@@ -184,9 +194,16 @@ func buildBindPlan(rt reflect.Type) bindPlan {
 		case classFiles:
 			// File headers arrive only through a parsed multipart body.
 			plan.needsParse = true
+		case classWriter:
+			// Decide once whether the pooled writer satisfies this parameter's
+			// type, so the request path injects without re-probing interfaces.
+			if plan.writerOK == nil {
+				plan.writerOK = make([]bool, n)
+			}
+			plan.writerOK[i] = pooledWriterType.AssignableTo(t)
 		default:
-			// classRequest, classWriter and classContext are injected directly and
-			// never force the body/query to be parsed.
+			// classRequest and classContext are injected directly and never force
+			// the body/query to be parsed.
 		}
 	}
 	// More than one business argument is name-dependent even when every one is a
@@ -199,8 +216,9 @@ func buildBindPlan(rt reflect.Type) bindPlan {
 
 // structFieldsCache memorizes field lists per struct type, so nested structs
 // (bound via bindStruct at request time) skip reflection introspection just
-// like top-level parameters. Concurrent first computes store identical slices;
-// the duplicate work is harmless and rare.
+// like top-level parameters. Concurrent first computes may both run; LoadOrStore
+// keeps the first slice so every caller shares one instance. The duplicate
+// compute is harmless and rare.
 var structFieldsCache sync.Map // reflect.Type -> []structField
 
 // structFieldsOf returns the cached bindable-field list of a struct type.
@@ -209,15 +227,31 @@ func structFieldsOf(t reflect.Type) []structField {
 		return cached.([]structField)
 	}
 	fields := computeStructFields(t)
-	structFieldsCache.Store(t, fields)
-	return fields
+	actual, _ := structFieldsCache.LoadOrStore(t, fields)
+	return actual.([]structField)
+}
+
+// lowerFirst lowercases the first rune of s, leaving the rest verbatim. It
+// bridges an exported struct field's PascalCase name (Name) to the lowercase
+// key clients usually send (name), so no json tag is needed. Request keys are
+// matched exactly and never transformed.
+func lowerFirst(s string) string {
+	if s == null {
+		return s
+	}
+	r, size := utf8.DecodeRuneInString(s)
+	if lr := unicode.ToLower(r); lr != r {
+		return string(lr) + s[size:]
+	}
+	return s
 }
 
 // computeStructFields lists a struct type's exported fields in declaration
 // order. Every exported field of a freshly allocated value is settable, so the
 // per-request CanSet/PkgPath checks in bindStruct collapse to this cached slice.
-// A JSON tag's name replaces the Go field name (matching encoding/json, so form
-// and JSON binding agree on names); `json:"-"` drops the field entirely.
+// The bind key is the JSON tag's name when present, else the Go field name with
+// its first letter lowercased — so a lowercase request key binds to an exported
+// PascalCase field without a tag. `json:"-"` drops the field entirely.
 func computeStructFields(t reflect.Type) []structField {
 	n := t.NumField()
 	fields := make([]structField, 0, n)
@@ -226,7 +260,7 @@ func computeStructFields(t reflect.Type) []structField {
 		if field.PkgPath != null {
 			continue // unexported
 		}
-		name := field.Name
+		name := lowerFirst(field.Name)
 		if tag, ok := field.Tag.Lookup("json"); ok {
 			if tag == "-" {
 				continue
@@ -239,7 +273,6 @@ func computeStructFields(t reflect.Type) []structField {
 		fields = append(fields, structField{
 			index: i,
 			name:  name,
-			lower: strings.ToLower(name),
 			typ:   field.Type,
 		})
 	}
@@ -258,7 +291,7 @@ func injectedParameters(
 	form url.Values,
 	files filesMap,
 	body []byte,
-	mediaType string,
+	jsonMedia bool,
 	params []reflect.Value,
 ) error {
 	rh := c.rh
@@ -269,8 +302,7 @@ func injectedParameters(
 	src := &c.src
 
 	var jsonFields map[string]json.RawMessage
-	var jf foldLookup[json.RawMessage]
-	isJSON := isJSONMediaType(mediaType) && hasNonWhitespace(body)
+	isJSON := jsonMedia && hasNonWhitespace(body)
 	if isJSON && len(plan.businessIndexes) > 1 {
 		if err := json.Unmarshal(body, &jsonFields); err != nil {
 			return fmt.Errorf("invalid JSON body: %w", err)
@@ -278,7 +310,6 @@ func injectedParameters(
 		if jsonFields == nil {
 			return multipleRequireError
 		}
-		jf.exact = jsonFields
 	}
 
 	for i := range plan.types {
@@ -297,14 +328,13 @@ func injectedParameters(
 			params[i] = reflect.ValueOf(c.Request)
 			continue
 		case classWriter:
-			v, err := injectSpecialParameter(t, c.writer, c.Request, src, name)
-			if err != nil {
-				return fmt.Errorf(injectParameterErrFormat, name, err)
+			if !plan.writerOK[i] {
+				return fmt.Errorf(injectParameterErrFormat, name, responseMismatch)
 			}
-			params[i] = v
+			params[i] = reflect.ValueOf(c.writer)
 			continue
 		case classFiles:
-			headers, _ := src.filesGet(name, null)
+			headers, _ := src.filesGet(name)
 			v, err := bindFileHeaders(t, headers)
 			if err != nil {
 				return fmt.Errorf(injectParameterErrFormat, name, err)
@@ -315,7 +345,7 @@ func injectedParameters(
 
 		// classBind: a business parameter, resolved from request data. Path
 		// parameters take priority over query/body for scalar arguments too.
-		if pathValue, ok := src.pathGet(name, null); ok {
+		if pathValue, ok := src.pathGet(name); ok {
 			v, err := bindTextValue(t, []string{pathValue})
 			if err != nil {
 				return fmt.Errorf("path parameter %q: %w", name, err)
@@ -330,7 +360,7 @@ func injectedParameters(
 			raw := body
 			if len(plan.businessIndexes) > 1 {
 				var ok bool
-				raw, ok = jf.get(name)
+				raw, ok = jsonFields[name]
 				if !ok {
 					return fmt.Errorf("JSON field %q not found", name)
 				}
@@ -350,7 +380,7 @@ func injectedParameters(
 		if fields := plan.structFields[i]; fields != nil {
 			v, err = bindStructFields(t, fields, src)
 		} else {
-			v, err = bindFormParameter(t, name, null, src)
+			v, err = bindFormParameter(t, name, src)
 		}
 		if err != nil {
 			return fmt.Errorf("parameter %q: %w", name, err)
@@ -359,12 +389,11 @@ func injectedParameters(
 	}
 
 	for i, v := range params {
-		name := paramNameAt(names, i)
 		if !v.IsValid() {
-			return fmt.Errorf("parameter %q was not initialized", name)
+			return fmt.Errorf("parameter %q was not initialized", paramNameAt(names, i))
 		}
 		if !v.Type().AssignableTo(plan.types[i]) {
-			return fmt.Errorf("parameter %q type mismatch: got %s, want %s", name, v.Type(), plan.types[i])
+			return fmt.Errorf("parameter %q type mismatch: got %s, want %s", paramNameAt(names, i), v.Type(), plan.types[i])
 		}
 	}
 	return nil
@@ -399,134 +428,55 @@ func isJSONMediaType(mediaType string) bool {
 		(strings.HasPrefix(mediaType, applicationNoJson) && strings.HasSuffix(mediaType, plusSignJson))
 }
 
-// foldThreshold is the source size where a folded index starts to beat
-// repeated EqualFold scans. Below it a miss scans linearly — building a map
-// for a handful of keys costs more than the scans it saves. At or above it the
-// first miss builds a lowercase index that every later lookup reuses, turning
-// O(lookups × keys) into O(lookups + keys).
-const foldThreshold = 16
-
-// foldIndex builds the lowercase-keyed copy of a source map. First key wins on
-// a fold collision, mirroring the arbitrary pick of a linear scan.
-func foldIndex[V any](m map[string]V) map[string]V {
-	out := make(map[string]V, len(m))
-	for key, v := range m {
-		lk := strings.ToLower(key)
-		if _, seen := out[lk]; !seen {
-			out[lk] = v
-		}
-	}
-	return out
-}
-
-// foldName returns the precomputed lowercase name when one is cached (struct
-// fields), else lowers on demand — reached only on the indexed miss path.
-func foldName(name, lower string) string {
-	if lower != null {
-		return lower
-	}
-	return strings.ToLower(name)
-}
-
 // nameSources bundles the three by-name request sources a binder reads. It
-// lives inside the pooled Context, so priming it costs no allocation. Each
-// source resolves exact-first through sourceGet; the per-source methods stay
-// as thin typed wrappers so call sites keep their concrete value types.
+// lives inside the pooled Context, so priming it costs no allocation. Lookups
+// are exact: the request key must equal the bind name byte-for-byte. Struct
+// field names are pre-lowercased at registration so clients can send lowercase
+// keys without tags; the request data itself is never transformed.
 type nameSources struct {
 	path  map[string]string
 	form  url.Values
 	files filesMap
-
-	pathFold  map[string]string
-	formFold  map[string][]string
-	filesFold map[string][]*multipart.FileHeader
 }
 
-// sourceGet is the shared exact-then-fold lookup behind the three sources.
-// Dictionary indirection from the generic form only reaches the cold paths
-// (EqualFold scan, index build); the exact map hit runs direct.
-func sourceGet[V any](m map[string]V, fold *map[string]V, name, lower string) (V, bool) {
-	if v, ok := m[name]; ok {
-		return v, true
-	}
-	if len(m) < foldThreshold {
-		for key, v := range m {
-			if strings.EqualFold(key, name) {
-				return v, true
-			}
-		}
-		var zero V
-		return zero, false
-	}
-	if *fold == nil {
-		*fold = foldIndex(m)
-	}
-	v, ok := (*fold)[foldName(name, lower)]
+func (s *nameSources) pathGet(name string) (string, bool) {
+	v, ok := s.path[name]
 	return v, ok
 }
 
-func (s *nameSources) pathGet(name, lower string) (string, bool) {
-	return sourceGet(s.path, &s.pathFold, name, lower)
-}
-
-func (s *nameSources) formGet(name, lower string) ([]string, bool) {
-	return sourceGet(s.form, &s.formFold, name, lower)
-}
-
-func (s *nameSources) filesGet(name, lower string) ([]*multipart.FileHeader, bool) {
-	return sourceGet(s.files, &s.filesFold, name, lower)
-}
-
-// foldLookup serves the multi-parameter JSON split, a colder path where the
-// generic form is fine: exact hit first, lazy folded index on miss.
-type foldLookup[V any] struct {
-	exact map[string]V
-	fold  map[string]V
-}
-
-func (f *foldLookup[V]) get(name string) (V, bool) {
-	if v, ok := f.exact[name]; ok {
-		return v, true
-	}
-	if f.fold == nil {
-		f.fold = foldIndex(f.exact)
-	}
-	v, ok := f.fold[strings.ToLower(name)]
+func (s *nameSources) formGet(name string) ([]string, bool) {
+	v, ok := s.form[name]
 	return v, ok
 }
 
-// lookupString finds a map value by exact key first, then case-insensitively.
-// It serves one-off lookups outside the binding path (Context.Param); binders
-// use foldLookup so the scan amortizes across a whole request.
+func (s *nameSources) filesGet(name string) ([]*multipart.FileHeader, bool) {
+	v, ok := s.files[name]
+	return v, ok
+}
+
+// lookupString finds a map value by exact key. It serves one-off lookups outside
+// the binding path (Context.PathParam); request keys are matched verbatim.
 func lookupString(values map[string]string, name string) (string, bool) {
-	if value, ok := values[name]; ok {
-		return value, true
-	}
-	for key, value := range values {
-		if strings.EqualFold(key, name) {
-			return value, true
-		}
-	}
-	return null, false
+	value, ok := values[name]
+	return value, ok
 }
 
 // bindFormParameter binds one non-JSON parameter of any kind: pointers stay nil
 // when their source is absent, structs recurse over their fields, file header
 // types pull from the uploaded files, slices/arrays consume repeated values,
-// and scalars take the first value. lower is name's precomputed lowercase form,
-// or empty to fold lazily only when an exact lookup misses.
-func bindFormParameter(t reflect.Type, name, lower string, src *nameSources) (reflect.Value, error) {
+// and scalars take the first value. name is matched against the request exactly.
+func bindFormParameter(t reflect.Type, name string, src *nameSources) (reflect.Value, error) {
 	if t.Kind() == reflect.Pointer {
 		// A missing non-struct pointer stays nil; a missing *struct is still
 		// allocated (zero-valued) so its fields can be bound individually.
-		if _, ok := src.pathGet(name, lower); !ok {
-			if _, ok = src.formGet(name, lower); !ok {
-				if _, ok = src.filesGet(name, lower); !ok && t.Elem().Kind() != reflect.Struct {
+		if _, ok := src.pathGet(name); !ok {
+			if _, ok = src.formGet(name); !ok {
+				if _, ok = src.filesGet(name); !ok && t.Elem().Kind() != reflect.Struct {
 					return reflect.Zero(t), nil
 				}
 			}
 		}
-		value, err := bindFormParameter(t.Elem(), name, lower, src)
+		value, err := bindFormParameter(t.Elem(), name, src)
 		if err != nil {
 			return reflect.Value{}, err
 		}
@@ -538,11 +488,11 @@ func bindFormParameter(t reflect.Type, name, lower string, src *nameSources) (re
 	}
 
 	if isFileHeaderType(t) {
-		headers, _ := src.filesGet(name, lower)
+		headers, _ := src.filesGet(name)
 		return bindFileHeaders(t, headers)
 	}
 
-	values, _ := src.formGet(name, lower)
+	values, _ := src.formGet(name)
 	switch t.Kind() {
 	case reflect.Array, reflect.Slice:
 		// []byte in a form field is treated as a string's raw bytes.
@@ -579,9 +529,9 @@ func bindFormParameter(t reflect.Type, name, lower string, src *nameSources) (re
 }
 
 // bindStruct fills an exported-field struct from form and path values, matching
-// bind names (JSON tag or Go field name) case-insensitively. The field list is
-// cached per type, so nested structs cost no per-request reflection
-// introspection either.
+// each field's exact bind name (JSON tag, or the field name with its first
+// letter lowercased). The field list is cached per type, so nested structs cost
+// no per-request reflection introspection either.
 func bindStruct(t reflect.Type, src *nameSources) (reflect.Value, error) {
 	return bindStructFields(t, structFieldsOf(t), src)
 }
@@ -597,8 +547,9 @@ func bindStructFields(t reflect.Type, fields []structField, src *nameSources) (r
 		dst := result.Field(field.index)
 
 		// Bind names come from the JSON tag when present, else the Go field
-		// name; matching is case-insensitive. Path wins over query/form values.
-		if pathValue, ok := src.pathGet(field.name, field.lower); ok {
+		// name with its first letter lowercased; matching is exact. Path wins
+		// over query/form values.
+		if pathValue, ok := src.pathGet(field.name); ok {
 			value, err := bindTextValue(field.typ, []string{pathValue})
 			if err != nil {
 				return reflect.Value{}, fmt.Errorf("path field %q: %w", field.name, err)
@@ -607,7 +558,7 @@ func bindStructFields(t reflect.Type, fields []structField, src *nameSources) (r
 			continue
 		}
 
-		value, err := bindFormParameter(field.typ, field.name, field.lower, src)
+		value, err := bindFormParameter(field.typ, field.name, src)
 		if err != nil {
 			return reflect.Value{}, fmt.Errorf("field %q: %w", field.name, err)
 		}
@@ -663,35 +614,6 @@ func decodeJSON(t reflect.Type, data []byte) (reflect.Value, error) {
 		return reflect.Value{}, err
 	}
 	return result.Elem(), nil
-}
-
-// injectSpecialParameter supplies the framework-owned arguments a handler can
-// declare: *http.Request, any http.ResponseWriter implementation, and the file
-// header types, which are matched by parameter name against the uploads.
-func injectSpecialParameter(
-	t reflect.Type,
-	w http.ResponseWriter,
-	r *http.Request,
-	src *nameSources,
-	name string,
-) (reflect.Value, error) {
-	if t == requestType {
-		return reflect.ValueOf(r), nil
-	}
-
-	if t == writerType || t.Implements(writerType) {
-		value := reflect.ValueOf(w)
-		if value.Type().AssignableTo(t) {
-			return value, nil
-		}
-		if t.Kind() == reflect.Interface && value.Type().Implements(t) {
-			return value, nil
-		}
-		return reflect.Value{}, responseMismatch
-	}
-
-	headers, _ := src.filesGet(name, null)
-	return bindFileHeaders(t, headers)
 }
 
 // wrapPointer boxes a bound element value into a fresh pointer of type t,

@@ -125,10 +125,10 @@ func queryValues(r *http.Request) url.Values {
 }
 
 // parseRequestParameters collects handler-bindable inputs for the request:
-// form values, uploaded files, the JSON body buffer and the parsed media type.
+// form values, uploaded files, the JSON body buffer and whether the body is JSON.
 // The body buffer is pooled; the caller must release it with releaseBodyBuffer
 // once binding is done, since the decoded parameters are independent copies.
-func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpMethod) (url.Values, filesMap, *bytes.Buffer, string, error) {
+func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpMethod) (url.Values, filesMap, *bytes.Buffer, bool, error) {
 	// GBL deliberately applies a strict parameter-source policy by HTTP method.
 	// GET, HEAD, DELETE and OPTIONS may read only URL path parameters (matched by
 	// the router) and URL query parameters. Their request bodies are never parsed
@@ -140,7 +140,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 		// Only path and query parameters bind for these methods; the body is never
 		// read. queryValues yields nil for an empty query, so no empty map is
 		// allocated and every form lookup treats nil as "not found".
-		return queryValues(r), nil, nil, null, nil
+		return queryValues(r), nil, nil, false, nil
 	}
 
 	var (
@@ -174,13 +174,14 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 			var err error
 			mediaType, _, err = mime.ParseMediaType(contentTypeHeader)
 			if err != nil {
-				return nil, nil, nil, null, fmt.Errorf("invalid Content-Type: %w", err)
+				return nil, nil, nil, false, fmt.Errorf("invalid Content-Type: %w", err)
 			}
 		}
 	}
 
+	jsonMedia := isJSONMediaType(mediaType)
 	switch {
-	case isJSONMediaType(mediaType):
+	case jsonMedia:
 		var err error
 		if r.Body != nil {
 			buf := bodyBufferPool.Get().(*bytes.Buffer)
@@ -193,9 +194,9 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 		}
 		if err != nil {
 			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
-				return nil, nil, nil, null, requestBodyTooLargeError
+				return nil, nil, nil, false, requestBodyTooLargeError
 			}
-			return nil, nil, nil, null, err
+			return nil, nil, nil, false, err
 		}
 
 	case mediaType == multipartFormData:
@@ -205,9 +206,9 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 		}
 		if err := r.ParseMultipartForm(memory); err != nil {
 			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
-				return nil, nil, nil, null, requestBodyTooLargeError
+				return nil, nil, nil, false, requestBodyTooLargeError
 			}
-			return nil, nil, nil, null, err
+			return nil, nil, nil, false, err
 		}
 		// Body text fields win over query on shared keys; query-only keys survive.
 		form = mergeFormBodyWins(queryValues(r), r.PostForm)
@@ -224,7 +225,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 		for _, headers := range files {
 			for _, hdr := range headers {
 				if hdr != nil && hdr.Size > maxUpload {
-					return nil, nil, nil, null, requestBodyTooLargeError
+					return nil, nil, nil, false, requestBodyTooLargeError
 				}
 			}
 		}
@@ -232,9 +233,9 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 	case mediaType == xWwwFormUrlencoded || mediaType == null:
 		if err := r.ParseForm(); err != nil {
 			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
-				return nil, nil, nil, null, requestBodyTooLargeError
+				return nil, nil, nil, false, requestBodyTooLargeError
 			}
-			return nil, nil, nil, null, err
+			return nil, nil, nil, false, err
 		}
 		// Body fields win over query on shared keys; query-only keys survive.
 		form = mergeFormBodyWins(queryValues(r), r.PostForm)
@@ -245,5 +246,5 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 		form = queryValues(r)
 	}
 
-	return form, files, bodyBuf, mediaType, nil
+	return form, files, bodyBuf, jsonMedia, nil
 }

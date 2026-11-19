@@ -105,16 +105,20 @@ exclusive, not a cascade:
   On `POST`/`PUT`/`PATCH`, a body field and a query parameter of the same name both
   bind, with the **body winning**.
 
-Within any source, name matching is exact first, then case-insensitive (mirroring
-`encoding/json`).
+gbl's own name lookups are **exact**: a path/form/query key, or a top-level JSON
+member, is matched verbatim with no case folding. (A JSON body's struct fields
+are decoded by `encoding/json`, which matches field names case-insensitively.)
 
 **json tags are optional**: a field tagged `json:"user_name"` binds by that tag
-name in form/query too (consistent with the JSON body path); `json:"-"` skips
-the field entirely. Without tags the Go field name is used, unchanged.
+name verbatim in form/query too; `json:"-"` skips the field entirely. Without a
+tag the framework derives the bind name by lowercasing the field's first letter
+(`Name` → `name`, `Id` → `id`) and caches it at registration, so a request key
+like `name` binds with no tag. This is the camelCase convention: name a field
+`Id`, not `ID` (`ID` would derive `iD`).
 
 ```go
 type User struct {
-    ID   int
+    Id   int
     Name string
 }
 
@@ -175,13 +179,13 @@ type User struct {
 ```
 
 **Rule 3 — in form/query mode a struct's fields are filled from path/form
-values by bind name (the json tag name, else the field name; case-insensitive),
-so `:id` can populate `u.ID`.**
+values by bind name (the json tag name verbatim, else the field's first letter
+lowercased), matched exactly, so `:id` can populate `u.Id`.**
 
 ```go
-// GET /user/42  →  u.ID == 42, bound from the :id path segment
+// GET /user/42  →  u.Id == 42, bound from the :id path segment
 gbl.Get("/user/:id", func(u User) string {
-    return "user " + strconv.Itoa(u.ID)
+    return "user " + strconv.Itoa(u.Id)
 })
 ```
 
@@ -194,7 +198,7 @@ the body.
 gbl.Get("/text", func() string { return "plain" })         // text/plain
 gbl.Get("/num", func() int { return 42 })                  // "42" as text
 gbl.Get("/json", func() map[string]int { return map[string]int{"n": 3} }) // JSON
-gbl.Get("/obj", func() *User { return &User{ID: 1} })      // JSON
+gbl.Get("/obj", func() *User { return &User{Id: 1} })      // JSON
 gbl.Get("/none", func() { })                               // nil result -> empty body
 ```
 
@@ -908,7 +912,7 @@ type ByteSize int
 what the argument means at the call site. The rest of this section is about
 **uploaded files**: they bind only on body methods carrying
 `multipart/form-data`, and a file parameter is matched to the file part whose
-field name equals the parameter name (exact, then case-insensitive). This file
+field name equals the parameter name (matched exactly). This file
 lookup is a separate path from text form/query values — the two never share a
 source. See the table below for the accepted parameter types.
 

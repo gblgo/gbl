@@ -89,6 +89,7 @@ func newContext(w *pooledResponseWriter,
 	c.ret = reflect.Value{}
 	c.handled = false
 	c.logger = logger
+	c.src = nameSources{}
 	return c
 }
 
@@ -268,14 +269,14 @@ func (c *Context) invokeHandler() {
 	rh := c.rh
 
 	var (
-		form      url.Values
-		files     filesMap
-		bodyBuf   *bytes.Buffer
-		mediaType string
-		err       error
+		form    url.Values
+		files   filesMap
+		bodyBuf *bytes.Buffer
+		isJSON  bool
+		err     error
 	)
 	if rh.plan.needsParse {
-		form, files, bodyBuf, mediaType, err = parseRequestParameters(c.writer, c.Request, c.method)
+		form, files, bodyBuf, isJSON, err = parseRequestParameters(c.writer, c.Request, c.method)
 		if err != nil {
 			writeRequestError(err)
 			return
@@ -294,7 +295,7 @@ func (c *Context) invokeHandler() {
 	var paramsBuf *[]reflect.Value
 	if rh.t.NumIn() > 0 {
 		paramsBuf, in = acquireParams(rh.t.NumIn())
-		if err = injectedParameters(c, form, files, body, mediaType, in); err != nil {
+		if err = injectedParameters(c, form, files, body, isJSON, in); err != nil {
 			// Binding errors are assembled from reflection internals (parameter
 			// names, Go type strings, strconv detail), so only a generic 400 is
 			// returned and the detail stays in the server log.
