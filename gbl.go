@@ -115,7 +115,7 @@ func (e *engine) Run() {
 	go func() {
 		select {
 		case <-stop:
-			ctx, cancel := context.WithTimeout(context.Background(), cfg.shutdownGracePeriod())
+			ctx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
 			defer cancel()
 			_ = e.Shutdown(ctx)
 		case <-done:
@@ -175,4 +175,4 @@ func (e *engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // shutdownGracePeriod is how long a signal-triggered shutdown waits for
 // in-flight requests before forcing connections closed.
-func (Config) shutdownGracePeriod() time.Duration { return 5 * time.Second }
+const shutdownGracePeriod = 5 * time.Second
