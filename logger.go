@@ -94,7 +94,7 @@ func (s stdLogger) Banner(block string) {
 }
 
 // emit renders "gbl: LEVEL msg key=value ..." and writes it at the caller's
-// depth. Both levels share the standard logger because log itself is
+// depth. All levels share the standard logger because log itself is
 // level-free; the label preserves the distinction for readers.
 func (s stdLogger) emit(level, msg string, kv []any) {
 	line := logLine(level, msg, kv)

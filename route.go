@@ -351,8 +351,7 @@ func unnamedParamName(index int) string {
 
 // warnUnboundParams reports a handler whose parameter names could not be
 // resolved. It routes through the engine Logger at warn level, so the notice
-// honors SetLogger and lands wherever the application's warnings are sent,
-// a dedicated warn file included.
+// honors SetLogger and lands wherever the application's warnings are sent.
 func (e *engine) warnUnboundParams(symbol, reason string) {
 	e.logger.Warn("unbound handler parameters", "handler", symbol, "reason", reason)
 }
