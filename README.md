@@ -40,8 +40,8 @@ function, type, interface and method, each with a runnable example.
 11. [Logging (`Logger` / `BannerLogger` / `NewStdLogger` / `SetLogger` / `AccessLog`)](#11-logging-logger--bannerlogger--newstdlogger--setlogger--accesslog)
 12. [Upload limits (`ByteSize` / `SetMaxBodySize` / `SetMaxFileSize` / `SetMaxUploadFileSize`)](#12-upload-limits-bytesize--setmaxbodysize--setmaxfilesize--setmaxuploadfilesize)
 13. [CORS (`SetCorsConfig` / `CorsConfig`)](#13-cors-setcorsconfig--corsconfig)
-14. [Configuration (`application.ini` / `ReadIni` / `IniBySection` / `IniBySectionAndKey`)](#14-configuration-applicationini--readini--inibysection--inibysectionandkey)
-15. [Startup failures & the log fallback](#15-startup-failures--the-log-fallback)
+14. [Configuration (`Config` / `Configure`)](#14-configuration-config--configure)
+15. [Startup failures (fail-fast)](#15-startup-failures-fail-fast)
 
 > **One engine, many entry points.** gbl exposes a *single* package-level engine.
 > `Get/Post/Use/Group/Run/...` all act on it, so what you register and what you
@@ -108,6 +108,10 @@ exclusive, not a cascade:
 Within any source, name matching is exact first, then case-insensitive (mirroring
 `encoding/json`).
 
+**json tags are optional**: a field tagged `json:"user_name"` binds by that tag
+name in form/query too (consistent with the JSON body path); `json:"-"` skips
+the field entirely. Without tags the Go field name is used, unchanged.
+
 ```go
 type User struct {
     ID   int
@@ -171,7 +175,8 @@ type User struct {
 ```
 
 **Rule 3 — in form/query mode a struct's fields are filled from path/form
-values by field name (case-insensitive), so `:id` can populate `u.ID`.**
+values by bind name (the json tag name, else the field name; case-insensitive),
+so `:id` can populate `u.ID`.**
 
 ```go
 // GET /user/42  →  u.ID == 42, bound from the :id path segment
@@ -575,7 +580,7 @@ in-flight requests get a window to finish). Any fatal startup error panics.
 
 ```go
 gbl.Get("/hi", func() string { return "hi" })
-gbl.Run() // port from application.ini [gbl] port, default :9801
+gbl.Run() // port from Configure, default :9801
 ```
 
 ### `Shutdown(ctx context.Context) error`
@@ -713,10 +718,14 @@ name := gbl.MustValue[string](c, "displayName") // "" when absent / wrong type
 
 ## 9. Aborts & panic (`Abort` / `PanicProcessor` / `HttpStatus`)
 
-gbl's error policy is deliberately strict: **unexpected panics never echo
-internals** (the cause goes to the log; the client gets a generic `500`). Only
-two things reach the client verbatim — an explicit `Abort`, and, if you install
-one, your `PanicProcessor`.
+The error policy of gbl splits echo rights by **who authored the message**:
+**developer-authored text reaches the client verbatim** — an explicit `Abort`,
+your `PanicProcessor` (if installed), and the error text returned by `Validate`;
+**framework-assembled internals never do** — panic causes and binding failures
+(parameter names, Go type strings, strconv detail) go to the server log only,
+with a generic `500` / `400` on the wire. Request-parse errors (bad Content-Type,
+oversize body) describe the client's own request framing and carry no internal
+identifiers, so they are echoed.
 
 ### `Abort(status int, msg string)`
 
@@ -787,21 +796,23 @@ func (s Signup) Validate() error {
     return nil
 }
 
-// The handler never nil-checks; a non-nil Validate error yields a generic 400.
+// The handler never nil-checks; a non-nil Validate error yields a 400 echoing its text.
 gbl.Post("/signup", func(s Signup) string {
     return "signed up: " + s.Email
 })
 ```
 
-A non-nil error stops the request with a **generic 400**; the error text is
-written **only to the server log**, never echoed to the client — so `Validate`
-can describe internal rules freely.
+A non-nil error stops the request with a **400 whose body is the error text
+verbatim** — you wrote the message, so you own what it discloses: write what the
+client should see, and keep anything sensitive out of `Validate`. Framework-side
+binding failures are the opposite: a generic `400` only, with the reflection
+detail in the server log (see section 9).
 
 ---
 
 ## 11. Logging (`Logger` / `BannerLogger` / `NewStdLogger` / `SetLogger` / `AccessLog`)
 
-Every internal message (recovered panic, validation failure, access line) is
+Every internal message (recovered panic, binding failure, access line) is
 routed through the engine `Logger`, so destination/format are the application's
 choice. The default writes `gbl: LEVEL msg k=v` through the standard `log`
 package (and tints the level on a real terminal; plain text when redirected).
@@ -868,11 +879,22 @@ duration), written through the engine `Logger`.
 gbl.Use(gbl.AccessLog)
 ```
 
-> Per-level **file** logging is configuration-driven (see
-> [section 14](#14-configuration-applicationini--readini--inibysection--inibysectionandkey)).
-> With a custom `Logger` installed, the built-in file routing does **not**
-> override your sink; it prints a one-shot startup notice explaining why it
-> stood down.
+### File logging (integration example)
+
+The framework itself prints **only to the console**. To write files, install a
+`Logger` pointed at a file:
+
+```go
+f, err := os.OpenFile("app.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+if err != nil {
+    log.Fatal(err)
+}
+gbl.SetLogger(gbl.NewStdLogger(log.New(f, "", log.LstdFlags)))
+```
+
+For console + file, use `io.MultiWriter(os.Stdout, f)`. Rotation, per-level
+files and richer routing belong to a zap/slog adapter — or the future gbl-boot
+integration layer; the kernel ships no built-in file logging.
 
 ---
 
@@ -999,131 +1021,74 @@ requests. Such a configuration aborts startup before `Run`.
 
 ---
 
-## 14. Configuration (`application.ini` / `ReadIni` / `IniBySection` / `IniBySectionAndKey`)
+## 14. Configuration (`Config` / `Configure`)
 
-At startup gbl reads the `[gbl]` section of `application.ini` in the working
-directory; **omitting the file means all defaults**. Keys accept both `camelCase`
-and `kebab-case`.
+The kernel **reads no configuration file**: defaults work out of the box, and
+overrides live in code. Configuration files (YAML, environment, profiles,
+config centers) are an integration-layer concern — the future gbl-boot will
+resolve those sources and call the same `Configure` entry point.
 
-```ini
-[gbl]
-name       = myapp
-port       = 9801
-# certFile + keyFile together enable TLS
-certFile   = server.crt
-keyFile    = server.key
-readTimeout       = 10s
-readHeaderTimeout = 5s
-writeTimeout      = 10s
-idleTimeout       = 60s
-
-# File logging (blank = file logging off, stderr only)
-# logDir auto-creates info.log/warn.log/error.log in the dir
-logDir  = ./logs
-# logFile merges every level into one file (lowest priority)
-logFile = ./app.log
-# Or set each level explicitly; precedence: per-level path > logDir/<level>.log > logFile
-# infoLog  = ./logs/info.log
-# warnLog  = ./logs/warn.log
-# errorLog = ./logs/error.log
+```go
+type Config struct {
+    Name              string        // application name
+    Port              string        // listen port, without the leading colon
+    CertFile          string        // TLS certificate file path
+    KeyFile           string        // TLS private key file path
+    ReadTimeout       time.Duration // max duration to read an entire request
+    ReadHeaderTimeout time.Duration // max duration to read request headers
+    WriteTimeout      time.Duration // max duration to write an entire response
+    IdleTimeout       time.Duration // max idle wait before a keep-alive connection closes
+}
 ```
 
-| Key | Default | Meaning |
+### `Configure`
+
+```go
+func Configure(fn func(*Config))
+```
+
+`fn` receives the configuration **already filled with defaults**, so it only
+assigns the fields it cares about. Call it before `Run`; passing nil is a
+no-op.
+
+```go
+gbl.Configure(func(c *gbl.Config) {
+    c.Name = "myapp"
+    c.Port = "8080"
+    c.ReadTimeout = 5 * time.Second
+})
+```
+
+| Field | Default | Meaning |
 |---|---|---|
-| `name` | `gbl` | application name |
-| `port` | `9801` | listen port |
-| `certFile` / `keyFile` | empty | both set ⇒ HTTPS enabled |
-| `readTimeout` / `readHeaderTimeout` / `writeTimeout` / `idleTimeout` | 10s / 5s / 10s / 60s | server timeouts |
-| `logFile` | empty | combined log file (coarsest destination) |
-| `logDir` | empty | directory holding auto-named `info.log/warn.log/error.log` |
-| `infoLog` / `warnLog` / `errorLog` | empty | explicit per-level path, highest priority |
+| `Name` | `gbl` | application name |
+| `Port` | `9801` | listen port |
+| `CertFile` / `KeyFile` | empty | both set ⇒ HTTPS enabled |
+| `ReadTimeout` / `ReadHeaderTimeout` / `WriteTimeout` / `IdleTimeout` | 10s / 5s / 10s / 60s | server timeouts |
 
-gbl also exposes the ini reader as a general config utility for **your**
-sections:
+**TLS**: HTTPS turns on when both `CertFile` and `KeyFile` are non-empty,
+re-derived after every `Configure`. Paths reach the standard library verbatim:
+**a relative path resolves against the process working directory at launch**,
+not the executable's directory. If the launch working directory is out of your
+control, build an absolute path inside `Configure`.
 
-### `ReadIni`
-
-```go
-func ReadIni(path string) (map[string]map[string]string, error)
-```
-
-Parses a classic INI file into `section -> key -> value`. Blank lines and
-full-line `#` or `;` comments are skipped (inline comments are not stripped, so a
-value may contain `#`/`;`); `[section]` opens a group; `key = value` fills it. A
-key before any section, an empty section name or a line without `=` is a parse
-error; a missing file is returned as an error you can test with
-`errors.Is(err, os.ErrNotExist)`.
-
-```go
-cfg, err := gbl.ReadIni("db.ini") // {"db": {"host": "...", "port": "..."}}
-if errors.Is(err, os.ErrNotExist) {
-    // no file — apply your own defaults
-}
-```
-
-### `IniBySection` / `IniBySectionAndKey`
-
-Read the **frozen `application.ini` snapshot** (loaded once, safe from any
-goroutine, callable before or after `Run`).
-
-```go
-func IniBySection(section string) (map[string]string, bool)      // a COPY; mutating it is safe
-func IniBySectionAndKey(section, key string) (string, bool)
-```
-
-```go
-// Whole section (a copy — you may modify it freely).
-if db, ok := gbl.IniBySection("db"); ok {
-    fmt.Println(db["host"], db["port"])
-}
-
-// A single value.
-if port, ok := gbl.IniBySectionAndKey("db", "port"); ok {
-    log.Println("db port", port)
-}
-```
-
-> The ini **parsing** is `ReadIni` (any path). `IniBySection` /
-> `IniBySectionAndKey` read gbl's own `application.ini` snapshot. A malformed
-> `application.ini` is fatal on read (fail-fast, see below); a *missing* one is
-> a normal empty configuration.
+> Your own business configuration (database connections, ...) is the
+> application's business — the kernel only manages server runtime parameters.
+> For file/env configuration, parse it in your application and call
+> `Configure`, or wait for gbl-boot.
 
 ---
 
-## 15. Startup failures & the log fallback
+## 15. Startup failures (fail-fast)
 
-Every startup, configuration and registration failure is **fail-fast**: gbl
-first records the reason through the engine `Logger`, then panics — so a
-deployment that dies before serving still leaves the cause in your log, not
-just a bare stack trace. Logging comes up *before* the rest of the config is
-validated, so even an invalid config value is captured.
+Every startup and registration failure is **fail-fast**: gbl first records the
+reason through the engine `Logger`, then panics — so a deployment that dies
+before serving still leaves the cause in your log sink, not just a bare stack
+trace. A busy port, a route conflict and a dangerous CORS policy all take this
+path.
 
-**When the log destination itself is broken** (wrong path, no write permission,
-full disk) there is no file left to record the reason in. gbl falls back three
-ways at once:
-
-1. restores the **default console logger** and prints one line naming the
-   reason and how to fix it;
-2. writes a plain-language diagnostic to **`gbl-start-error.log` beside the
-   running executable** (a location you always know, regardless of the launch
-   working directory);
-3. panics with the reason and a pointer to that file.
-
-```text
-2026-11-13T10:00:00+08:00
-gbl: startup aborted - the configured file logging could not be initialized.
-Reason: open /var/log/gbl/error.log: permission denied
-Fix: check the logFile/logDir/infoLog/warnLog/errorLog value in application.ini; the path must exist and be writable. Then restart.
-```
-
-> - The fallback file appears **only** when file logging is configured but
->   cannot be opened. Never enabling file logging ⇒ no such file, and other
->   startup failures (route conflict, invalid config, busy port) just log to the
->   console.
-> - Under `go run .` the "executable" is a temporary build binary, so the
->   fallback file lands in that temp build directory. When you run a binary
->   produced by `go build`, the fallback file appears right next to that
->   binary.
+Logs go to the console by default, or to your sink when a custom `Logger` is
+installed. The kernel writes no fallback files.
 
 ---
 
