@@ -66,15 +66,42 @@ func (e *engine) renderBanner(cfg *Config, addr net.Addr) string {
 	return strings.TrimRight(bannerArt, "\n") + "\n\n" + strings.Join(lines, "\n") + "\n"
 }
 
-// bannerVersion reports the version the binary was built with, read from the
-// embedded build info so no version constant has to be maintained in source. An
-// untagged or local build yields "(devel)".
+// modulePath is gbl's own module path, matching go.mod. A library is compiled
+// into the consumer's binary as a dependency, not as the main module. This path
+// is the key for picking gbl's version out of the embedded build info.
+const modulePath = "github.com/gblgo/gbl"
+
+// bannerVersion reports the framework version embedded in the running binary.
+// It reads build info, so no version constant has to be maintained in source.
 func bannerVersion() string {
 	info, ok := debug.ReadBuildInfo()
-	if !ok || info.Main.Version == null {
+	if !ok {
 		return "(devel)"
 	}
-	return info.Main.Version
+	return frameworkVersion(info)
+}
+
+// frameworkVersion extracts gbl's version from build info. When gbl is the main
+// module (its own examples and tests), it reads Main.Version. When gbl is a
+// dependency of the consumer's app, it reads gbl's entry in Deps, which carries
+// the tagged version that app requires. A local or replaced build has no tag,
+// so it yields "(devel)".
+func frameworkVersion(info *debug.BuildInfo) string {
+	if info.Main.Path == modulePath {
+		if info.Main.Version != null {
+			return info.Main.Version
+		}
+		return "(devel)"
+	}
+	for _, dep := range info.Deps {
+		if dep.Path == modulePath {
+			if dep.Version != null {
+				return dep.Version
+			}
+			break
+		}
+	}
+	return "(devel)"
 }
 
 // countRoutes totals every handler installed across all method trees. It runs
