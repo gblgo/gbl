@@ -9,9 +9,9 @@ import "reflect"
 // Validatable is the framework's zero-dependency validation convention. A bound
 // business parameter whose type (or whose pointer) implements Validate() error
 // is checked immediately after binding and before the handler runs. Returning a
-// non-nil error stops the request with a 400; the error text is written only to
-// the server log, so validation may freely describe internal rules without
-// leaking them to the client.
+// non-nil error stops the request with a 400 whose body is the error text: the
+// message is authored by the application developer, so echoing it respects
+// their intent — whoever writes it owns what it discloses.
 //
 // Types that do not implement it are bound exactly as before, at no cost.
 type Validatable interface {

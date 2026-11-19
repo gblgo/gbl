@@ -16,8 +16,9 @@ import (
 // responseWriter.go; the dispatch that stages this result lives in handler.go.
 
 // convertToByteArray renders a handler return value as the response body:
-// strings and byte slices pass through, scalars are formatted, composites are
-// JSON-marshaled, and nil pointers/interfaces become an empty body.
+// byte slices pass through, strings are converted and scalars formatted,
+// composites are JSON-marshaled, and nil pointers/interfaces become an empty
+// body.
 func convertToByteArray(val reflect.Value) ([]byte, error) {
 	if !val.IsValid() {
 		return nil, nil

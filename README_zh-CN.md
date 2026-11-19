@@ -28,8 +28,8 @@
 11. [日志（`Logger` / `BannerLogger` / `NewStdLogger` / `SetLogger` / `AccessLog`）](#11-日志logger--bannerlogger--newstdlogger--setlogger--accesslog)
 12. [上传大小限制（`ByteSize` / `SetMaxBodySize` / `SetMaxFileSize` / `SetMaxUploadFileSize`）](#12-上传大小限制bytesize--setmaxbodysize--setmaxfilesize--setmaxuploadfilesize)
 13. [跨域（`SetCorsConfig` / `CorsConfig`）](#13-跨域setcorsconfig--corsconfig)
-14. [配置（`application.ini` / `ReadIni` / `IniBySection` / `IniBySectionAndKey`）](#14-配置applicationini--readini--inibysection--inibysectionandkey)
-15. [启动失败与日志兜底](#15-启动失败与日志兜底)
+14. [配置（`Config` / `Configure`）](#14-配置config--configure)
+15. [启动失败（fail-fast）](#15-启动失败fail-fast)
 
 > **一个引擎，多个入口。** gbl 只暴露*一个*包级引擎。`Get/Post/Use/Group/Run/...`
 > 全部作用于它，所以你注册的规则和你启动的服务必然是同一实例，不存在"注册进第二个引擎"的坑。
@@ -85,11 +85,13 @@ handler 就是任意 `func`。gbl 读取它的签名，按**类型 + 名字**装
 - **JSON**（`application/json` 且 body 非空）：只从 JSON body 取，form/query 一律不看。
 - **form/query**（其他 content type）：从 form/query 值取。`POST`/`PUT`/`PATCH` 下，body 字段与同名 query 都能绑定，**body 优先**。
 
-在任一来源内部，名字匹配**先精确、再忽略大小写**（对齐 `encoding/json` 的字段匹配）。
+gbl 自己的名字查找一律**精确匹配**：路径/form/query 的 key、或顶层 JSON 成员，都按原样匹配，不做大小写折叠。（JSON body 内部的结构体字段由 `encoding/json` 解码，它按字段名忽略大小写匹配。）
+
+**json tag 可选**：结构体字段写了 `json:"user_name"` 时，form/query 绑定也按 tag 名原样匹配；`json:"-"` 的字段跳过绑定。不写 tag 时，框架把字段名首字母转小写得到绑定名（`Name` → `name`、`Id` → `id`）并在注册期缓存，于是 `name` 这样的请求 key 无需 tag 即可绑定。这就是驼峰约定：字段应命名为 `Id` 而非 `ID`（`ID` 会得到 `iD`）。
 
 ```go
 type User struct {
-    ID   int
+    Id   int
     Name string
 }
 
@@ -144,12 +146,12 @@ type User struct {
 }
 ```
 
-**规则 3 —— form/query 模式下结构体字段按字段名（忽略大小写）从路径/form 值填充，故 `:id` 也能填 `u.ID`。**
+**规则 3 —— form/query 模式下结构体字段按绑定名（json tag 名原样，无 tag 则字段名首字母转小写）精确匹配，从路径/form 值填充，故 `:id` 也能填 `u.Id`。**
 
 ```go
-// GET /user/42  →  u.ID == 42，来自 :id 路径段
+// GET /user/42  →  u.Id == 42，来自 :id 路径段
 gbl.Get("/user/:id", func(u User) string {
-    return "user " + strconv.Itoa(u.ID)
+    return "user " + strconv.Itoa(u.Id)
 })
 ```
 
@@ -161,7 +163,7 @@ gbl.Get("/user/:id", func(u User) string {
 gbl.Get("/text", func() string { return "plain" })         // text/plain
 gbl.Get("/num", func() int { return 42 })                  // 文本 "42"
 gbl.Get("/json", func() map[string]int { return map[string]int{"n": 3} }) // JSON
-gbl.Get("/obj", func() *User { return &User{ID: 1} })      // JSON
+gbl.Get("/obj", func() *User { return &User{Id: 1} })      // JSON
 gbl.Get("/none", func() { })                               // nil 结果 -> 空 body
 ```
 
@@ -474,7 +476,7 @@ handler 本身（第 5 步最内层）是纯业务代码：既不调 `Next()`，
 
 ```go
 gbl.Get("/hi", func() string { return "hi" })
-gbl.Run() // 端口取自 application.ini 的 [gbl] port，默认 :9801
+gbl.Run() // 端口来自 Configure 覆盖，默认 :9801
 ```
 
 ### `Shutdown(ctx context.Context) error`
@@ -592,7 +594,7 @@ name := gbl.MustValue[string](c, "displayName") // 缺失/类型不符为 ""
 
 ## 9. 中止与 panic（`Abort` / `PanicProcessor` / `HttpStatus`）
 
-gbl 的错误策略刻意严格：**非预期 panic 永不回显内部信息**（原因进日志，客户端只拿通用 `500`）。只有两样东西会原样到达客户端——显式的 `Abort`，以及（若你装了）你的 `PanicProcessor`。
+gbl 的错误策略按"**消息是谁写的**"划分回显权：**应用开发者写的消息原样到达客户端**——显式的 `Abort`、（若你装了）你的 `PanicProcessor`、以及 `Validate` 返回的错误文本；**框架从内部拼出的消息永不回显**——非预期 panic 的原因、绑定失败的反射细节（参数名、Go 类型、strconv 详情），都只进服务端日志，客户端只拿通用 `500` / `400`。请求解析错误（坏 Content-Type、body 超限等）描述的是客户端自己的请求帧，不含内部标识，故原样回显。
 
 ### `Abort(status int, msg string)`
 
@@ -655,19 +657,19 @@ func (s Signup) Validate() error {
     return nil
 }
 
-// handler 无需判空；Validate 返回非 nil 错误即得通用 400。
+// handler 无需判空；Validate 返回非 nil 错误即 400，错误文本原样回显。
 gbl.Post("/signup", func(s Signup) string {
     return "signed up: " + s.Email
 })
 ```
 
-非 nil 错误会以**通用 400** 中断请求；错误文本**只写进服务端日志**，绝不回显给客户端——所以 `Validate` 里可以放心描述内部规则。
+非 nil 错误会以 **400** 中断请求，**错误文本原样作为响应体**——消息是你自己写的，回显与否的所有权在你：想给客户端看什么就写什么，不想暴露的就别写进 `Validate`。框架侧的绑定失败则相反：只回通用 `400`，反射细节进服务端日志（见第 9 节）。
 
 ---
 
 ## 11. 日志（`Logger` / `BannerLogger` / `NewStdLogger` / `SetLogger` / `AccessLog`）
 
-所有内部消息（恢复的 panic、校验失败、访问日志行）都经引擎 `Logger` 路由，故目的地/格式由应用决定。默认实现经标准库 `log` 输出 `gbl: LEVEL msg k=v`（真终端会给级别上色；重定向时为纯文本）。
+所有内部消息（恢复的 panic、绑定失败、访问日志行）都经引擎 `Logger` 路由，故目的地/格式由应用决定。默认实现经标准库 `log` 输出 `gbl: LEVEL msg k=v`（真终端会给级别上色；重定向时为纯文本）。
 
 ### `Logger`
 
@@ -725,8 +727,19 @@ gbl.SetLogger(appLogger{})
 gbl.Use(gbl.AccessLog)
 ```
 
-> 按级别写**文件**由配置驱动（见[第 14 节](#14-配置applicationini--readini--inibysection--inibysectionandkey)）。
-> 装了自定义 `Logger` 时，内置文件路由**不会覆盖你的 sink**，而是打印一条启动时的提示，说明它就此让路。
+### 文件日志（集成示例）
+
+框架本身**只打印控制台**。要写文件，装一个指向文件的 `Logger` 即可：
+
+```go
+f, err := os.OpenFile("app.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+if err != nil {
+    log.Fatal(err)
+}
+gbl.SetLogger(gbl.NewStdLogger(log.New(f, "", log.LstdFlags)))
+```
+
+想控制台与文件双写，用 `io.MultiWriter(os.Stdout, f)`。日志轮转、按级别分文件等更完整的能力，交给 zap/slog 适配器或未来的 gbl-boot 集成层——内核不内置文件日志。
 
 ---
 
@@ -736,7 +749,7 @@ gbl.Use(gbl.AccessLog)
 type ByteSize int
 ```
 
-`ByteSize` 是一个具名 `int`，代表字节数 —— 类型名本身就在调用点说明了参数含义。本节讲的是**上传文件**：文件只在携带 `multipart/form-data` 的体方法上装配，文件参数按“字段名与参数名相同的那个文件 part”匹配（先精确、后忽略大小写）。这条文件查找路径与文本 form/query 参数是两条独立的来源，互不相干；支持的参数类型见下表。
+`ByteSize` 是一个具名 `int`，代表字节数 —— 类型名本身就在调用点说明了参数含义。本节讲的是**上传文件**：文件只在携带 `multipart/form-data` 的体方法上装配，文件参数按“字段名与参数名相同的那个文件 part”匹配（精确匹配）。这条文件查找路径与文本 form/query 参数是两条独立的来源，互不相干；支持的参数类型见下表。
 
 ```go
 import "mime/multipart"
@@ -831,106 +844,57 @@ gbl.SetCorsConfig(nil) // 重新关闭 CORS
 
 ---
 
-## 14. 配置（`application.ini` / `ReadIni` / `IniBySection` / `IniBySectionAndKey`）
+## 14. 配置（`Config` / `Configure`）
 
-启动时 gbl 读取工作目录下 `application.ini` 的 `[gbl]` 段；**不给文件即全用默认**。键名 `camelCase` 与 `kebab-case` 都接受。
+内核**不读任何配置文件**：默认值开箱即用，要改就在代码里覆盖。配置文件（YAML、环境变量、profile、配置中心）属于集成层的职责——未来的 gbl-boot 会解析这些来源，然后调用同一个 `Configure` 入口。
 
-```ini
-[gbl]
-name       = myapp
-port       = 9801
-# certFile 与 keyFile 同时给出则启用 TLS
-certFile   = server.crt
-keyFile    = server.key
-readTimeout       = 10s
-readHeaderTimeout = 5s
-writeTimeout      = 10s
-idleTimeout       = 60s
-
-# 文件日志（留空 = 关闭文件日志，仅 stderr）
-# logDir 在该目录自动创建 info.log/warn.log/error.log
-logDir  = ./logs
-# logFile 所有级别合并进一个文件（优先级最低）
-logFile = ./app.log
-# 也可逐级显式指定；优先级：逐级路径 > logDir/<level>.log > logFile
-# infoLog  = ./logs/info.log
-# warnLog  = ./logs/warn.log
-# errorLog = ./logs/error.log
+```go
+type Config struct {
+    Name              string        // 应用名
+    Port              string        // 监听端口，不带前导冒号
+    CertFile          string        // TLS 证书文件路径
+    KeyFile           string        // TLS 私钥文件路径
+    ReadTimeout       time.Duration // 读完整个请求的最大时长
+    ReadHeaderTimeout time.Duration // 读完请求头的最大时长
+    WriteTimeout      time.Duration // 写完整个响应的最大时长
+    IdleTimeout       time.Duration // keep-alive 连接的最大空闲等待
+}
 ```
 
-| 键 | 默认 | 含义 |
+### `Configure`
+
+```go
+func Configure(fn func(*Config))
+```
+
+`fn` 拿到的是**已填好默认值**的配置，只赋值你关心的字段即可。在 `Run` 之前调用；传 nil 是空操作。
+
+```go
+gbl.Configure(func(c *gbl.Config) {
+    c.Name = "myapp"
+    c.Port = "8080"
+    c.ReadTimeout = 5 * time.Second
+})
+```
+
+| 字段 | 默认 | 含义 |
 |---|---|---|
-| `name` | `gbl` | 应用名 |
-| `port` | `9801` | 监听端口 |
-| `certFile` / `keyFile` | 空 | 两者都给 ⇒ 启用 HTTPS |
-| `readTimeout` / `readHeaderTimeout` / `writeTimeout` / `idleTimeout` | 10s / 5s / 10s / 60s | 服务端超时 |
-| `logFile` | 空 | 合并日志文件（最粗的目的地） |
-| `logDir` | 空 | 存放自动命名的 `info.log/warn.log/error.log` 的目录 |
-| `infoLog` / `warnLog` / `errorLog` | 空 | 显式逐级路径，优先级最高 |
+| `Name` | `gbl` | 应用名 |
+| `Port` | `9801` | 监听端口 |
+| `CertFile` / `KeyFile` | 空 | 两者都给 ⇒ 启用 HTTPS |
+| `ReadTimeout` / `ReadHeaderTimeout` / `WriteTimeout` / `IdleTimeout` | 10s / 5s / 10s / 60s | 服务端超时 |
 
-gbl 还把 ini 读取器作为通用配置工具暴露给**你自己的**段：
+**TLS**：`CertFile` 与 `KeyFile` 同时非空即启用 HTTPS，每次 `Configure` 后自动重新判定。路径原样交给标准库，**相对路径相对的是进程启动时的工作目录**，不是可执行文件所在目录；部署时工作目录不可控的话，在 `Configure` 里自行拼出绝对路径。
 
-### `ReadIni`
-
-```go
-func ReadIni(path string) (map[string]map[string]string, error)
-```
-
-把经典 INI 文件解析为 `section -> key -> value`。空行与 `#` 或 `;` 开头的整行注释跳过（不剥离行内注释，值里可以含 `#`/`;`）；`[section]` 开一组；`key = value` 填充当前组。某 key 出现在任何 section 之前、空 section 名、或没有 `=` 的行都算解析错误；文件不存在返回的错误可用 `errors.Is(err, os.ErrNotExist)` 判断。
-
-```go
-cfg, err := gbl.ReadIni("db.ini") // {"db": {"host": "...", "port": "..."}}
-if errors.Is(err, os.ErrNotExist) {
-    // 没有文件——套用你自己的默认
-}
-```
-
-### `IniBySection` / `IniBySectionAndKey`
-
-读取**已冻结的 `application.ini` 快照**（只加载一次，任意 goroutine 安全，`Run` 前后都能调）。
-
-```go
-func IniBySection(section string) (map[string]string, bool)      // 返回的是副本，可放心修改
-func IniBySectionAndKey(section, key string) (string, bool)
-```
-
-```go
-// 取整段（副本——可自由修改）。
-if db, ok := gbl.IniBySection("db"); ok {
-    fmt.Println(db["host"], db["port"])
-}
-
-// 取单个值。
-if port, ok := gbl.IniBySectionAndKey("db", "port"); ok {
-    log.Println("db port", port)
-}
-```
-
-> **解析** ini 的是 `ReadIni`（任意路径）。`IniBySection` / `IniBySectionAndKey`
-> 读的是 gbl 自己的 `application.ini` 快照。`application.ini` 存在但格式非法是致命的
-> 读取错误（fail-fast，见下）；文件*缺失*则是正常的空配置。
+> 业务自己的配置（数据库连接等）由应用自理——内核只管服务运行参数。需要文件/环境配置时，在应用里解析后调 `Configure`，或等 gbl-boot。
 
 ---
 
-## 15. 启动失败与日志兜底
+## 15. 启动失败（fail-fast）
 
-所有启动、配置、注册类失败都是 **fail-fast**：gbl 先经引擎 `Logger` 记录原因、再 panic——于是还没开始服务就挂掉的部署，也会在你的日志里留下原因，而不只是一条裸栈。日志先于其余配置校验启动，因此连非法配置值都能被记录。
+所有启动、注册类失败都是 **fail-fast**：gbl 先经引擎 `Logger` 记录原因、再 panic——还没开始服务就挂掉的部署，也会在你的日志 sink 里留下原因，而不只是一条裸栈。端口占用、路由冲突、危险的 CORS 策略都走这条路。
 
-**当日志目的地本身坏掉**（路径错误、无写权限、磁盘满）时，没有文件可供写入原因。gbl 同时走三路兜底：
-
-1. 恢复**默认控制台 logger**，打印一行错误，写明原因与修复方法；
-2. 把一份通俗说明写入**运行中可执行文件旁边的 `gbl-start-error.log`**（一个你永远知道位置的地方，与启动工作目录无关）；
-3. 以原因和指向该文件的提示 panic。
-
-```text
-2026-11-13T10:00:00+08:00
-gbl: startup aborted - the configured file logging could not be initialized.
-Reason: open /var/log/gbl/error.log: permission denied
-Fix: check the logFile/logDir/infoLog/warnLog/errorLog value in application.ini; the path must exist and be writable. Then restart.
-```
-
-> - 兜底文件**仅**在配置了文件日志却打不开时才出现。从未启用文件日志 ⇒ 不会有这个文件，其他启动失败（路由冲突、非法配置、端口占用）只打到控制台。
-> - `go run .` 时的“可执行文件”其实是临时构建产物，兜底文件会落在那个临时构建目录；`go build` 后运行生成的二进制时，兜底文件就落在**该二进制旁边**。
+日志默认只在控制台；装了自定义 `Logger` 就落在你的 sink 里。内核不写任何兜底文件。
 
 ---
 

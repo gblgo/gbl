@@ -4,32 +4,21 @@
 
 package gbl
 
-import (
-	"fmt"
-	"reflect"
-	"strconv"
-	"strings"
-	"time"
-)
+import "time"
 
-// durationType is cached so the time.Duration special case in setConfigValue can
-// compare against it without rebuilding the type on every config field.
-var durationType = reflect.TypeFor[time.Duration]()
-
-// gblConfig is the resolved runtime configuration: defaults from defaultConfig,
-// then overlaid with values read from the [gbl] section of application.ini. Each
-// field maps to an ini key by its name (see formatName); useTLS is derived, not
-// set directly.
-type gblConfig struct {
+// Config is the engine's runtime configuration, set entirely in code. The
+// kernel reads no configuration file: defaults apply as-is, and Configure
+// overlays only the fields the application touches. File-based configuration
+// (YAML, environment, profiles, config centers) belongs to an integration
+// layer that resolves its sources and calls Configure like any other caller.
+//
+// useTLS is derived, not set directly: it turns on when both CertFile and
+// KeyFile are present.
+type Config struct {
 	Name              string        // application name
 	Port              string        // listen port, without the leading colon
 	CertFile          string        // TLS certificate file path
 	KeyFile           string        // TLS private key file path
-	LogFile           string        // combined file for every level; the lowest-specificity destination
-	LogDir            string        // directory holding auto-named info.log/warn.log/error.log
-	InfoLog           string        // explicit path for the info level; beats LogDir and LogFile
-	WarnLog           string        // explicit path for the warn level; beats LogDir and LogFile
-	ErrorLog          string        // explicit path for the error level; beats LogDir and LogFile
 	ReadTimeout       time.Duration // max duration to read an entire request
 	ReadHeaderTimeout time.Duration // max duration to read request headers
 	WriteTimeout      time.Duration // max duration to write an entire response
@@ -37,10 +26,10 @@ type gblConfig struct {
 	useTLS            bool          // derived: true when both CertFile and KeyFile are set
 }
 
-// defaultConfig returns the baseline used when application.ini is absent or omits
-// a key: name "gbl" on port 9801 with the standard server timeouts.
-func defaultConfig() *gblConfig {
-	return &gblConfig{
+// defaultConfig returns the baseline every engine starts from: name "gbl" on
+// port 9801 with the standard server timeouts.
+func defaultConfig() *Config {
+	return &Config{
 		Name:              "gbl",
 		Port:              "9801",
 		ReadTimeout:       10 * time.Second,
@@ -51,125 +40,25 @@ func defaultConfig() *gblConfig {
 	}
 }
 
-// generateConfig resolves the runtime configuration: the defaults overlaid with
-// the [gbl] section of the ini snapshot. Each field's ini key is derived from its
-// name by formatName (lowerCamel and kebab-case); no struct tags are read.
-func generateConfig(ini map[string]map[string]string) (*gblConfig, error) {
+// Configure overlays the default engine's configuration in code. The function
+// receives the live Config already filled with defaults, so it only assigns
+// the fields it cares about:
+//
+//	gbl.Configure(func(c *gbl.Config) {
+//	    c.Port = "8080"
+//	    c.ReadTimeout = 5 * time.Second
+//	})
+//
+// Call it before Run. Passing nil is a no-op.
+func Configure(fn func(*Config)) { defaultEngine.Configure(fn) }
 
-	cfg := defaultConfig()
-
-	values := ini["gbl"]
-	if values == nil {
-		return cfg, nil
+// Configure overlays this engine's configuration. After fn returns, useTLS is
+// re-derived from the certificate and key paths, so setting or clearing either
+// path takes effect without a separate switch.
+func (e *engine) Configure(fn func(*Config)) *engine {
+	if fn != nil {
+		fn(e.cfg)
+		e.cfg.useTLS = e.cfg.CertFile != null && e.cfg.KeyFile != null
 	}
-
-	v := reflect.ValueOf(cfg).Elem()
-	t := v.Type()
-
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		// Match the field name to an ini key, trying both spellings.
-		key1, key2 := formatName(field.Name)
-		raw, exists := values[key1]
-		if !exists {
-			raw, exists = values[key2]
-			if !exists {
-				continue
-			}
-		}
-
-		if err := setConfigValue(v.Field(i), raw); err != nil {
-			return nil, fmt.Errorf("invalid config %s: %w", field.Name, err)
-		}
-	}
-
-	if cfg.CertFile != null && cfg.KeyFile != null {
-		cfg.useTLS = true
-	}
-
-	return cfg, nil
-}
-
-// setConfigValue converts a raw ini string to the field's type.
-func setConfigValue(field reflect.Value, value string) error {
-	if !field.CanSet() {
-		return fmt.Errorf("field cannot be set")
-	}
-
-	// Special handling time.Duration
-	if field.Type() == durationType {
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return err
-		}
-		field.SetInt(int64(d))
-		return nil
-	}
-
-	switch field.Kind() {
-	case reflect.String:
-		field.SetString(value)
-
-	case reflect.Bool:
-		v, err := strconv.ParseBool(value)
-		if err != nil {
-			return err
-		}
-		field.SetBool(v)
-
-	case reflect.Int, reflect.Int8, reflect.Int16,
-		reflect.Int32, reflect.Int64:
-		v, err := strconv.ParseInt(value, 10, field.Type().Bits())
-		if err != nil {
-			return err
-		}
-		field.SetInt(v)
-
-	case reflect.Uint, reflect.Uint8, reflect.Uint16,
-		reflect.Uint32, reflect.Uint64:
-		v, err := strconv.ParseUint(value, 10, field.Type().Bits())
-		if err != nil {
-			return err
-		}
-		field.SetUint(v)
-
-	case reflect.Float32, reflect.Float64:
-		v, err := strconv.ParseFloat(value, field.Type().Bits())
-		if err != nil {
-			return err
-		}
-		field.SetFloat(v)
-
-	default:
-		return fmt.Errorf("unsupported configuration type: %s", field.Type())
-	}
-
-	return nil
-}
-
-// formatName derives the two ini key spellings for a field name: lowerCamel and
-// kebab-case. For example Name -> name, name; ReadTimeout -> readTimeout,
-// read-timeout.
-func formatName(s string) (lowerFirst, kebabCase string) {
-	if s == null {
-		return null, null
-	}
-
-	var result strings.Builder
-
-	for i, r := range s {
-		if r >= 'A' && r <= 'Z' {
-			if i > 0 {
-				result.WriteByte('-')
-			}
-			r += 'a' - 'A'
-		}
-
-		result.WriteRune(r)
-	}
-
-	lowerFirst = strings.ToLower(s[:1]) + s[1:]
-	kebabCase = result.String()
-
-	return lowerFirst, kebabCase
+	return e
 }

@@ -34,8 +34,6 @@ const (
 	vary                          = "Vary"
 	headerTrue                    = "true"
 	headerComma                   = ", "
-	applicationIni                = "application.ini"
-	startErrorLogFile             = "gbl-start-error.log"
 	headerOrigin                  = "Origin"
 	textPlainCharset              = "text/plain; charset=utf-8"
 	multipartFormData             = "multipart/form-data"

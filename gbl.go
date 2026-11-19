@@ -33,8 +33,7 @@ type engine struct {
 	middlewares    []HandlerFunc        // global chain, merged with each group's at generation
 	panicProcessor PanicProcessor       // user hook that renders panic values
 	logger         Logger               // sink for internal and access logs; never nil
-	loggerReplaced bool                 // true once SetLogger installs a custom Logger
-	logFiles       []*os.File           // files opened for level logging; closed by Shutdown
+	cfg            *Config              // runtime configuration; defaults overlaid by Configure
 	cors           *CorsConfig          // nil disables the CORS layer
 	astFileMap     map[string]*ast.File // parsed source files for parameter names
 	fest           *token.FileSet       // file set backing astFileMap
@@ -57,6 +56,7 @@ func newEngine() *engine {
 		astFileMap: make(map[string]*ast.File),
 		fest:       token.NewFileSet(),
 		logger:     newStdLogger(),
+		cfg:        defaultConfig(),
 	}
 }
 
@@ -76,34 +76,10 @@ func Shutdown(ctx context.Context) error { return defaultEngine.Shutdown(ctx) }
 
 // Run is the instance-level counterpart of the package-level Run.
 func (e *engine) Run() {
-	// Read the frozen configuration snapshot once. A missing application.ini
-	// yields an empty snapshot; a file that exists but cannot be parsed panics
-	// here, before logging can be configured — its destinations live in that same
-	// file, so there is nothing to log through yet.
-	snapshot := iniSnapshot()
-
-	// Bring logging up first, before anything that can fail on a bad
-	// configuration. The log destinations are plain strings, so they cannot fail
-	// to parse. Resolving them ahead of the full config puts every later startup
-	// error in the configured log file, not only on stderr. Such errors include
-	// an invalid config value, a route conflict, and a busy port. With no
-	// destination configured, the default stderr logger stays and no file opens.
-	// If the destination itself is broken, failLoggingSetup falls back to the
-	// console plus a last-resort gbl-start-error.log. The operator can then see
-	// and fix the misconfiguration, and startup still fails fast.
-	if err := e.setupLogging(loggingConfig(snapshot)); err != nil {
-		e.failLoggingSetup(err)
-	}
-
-	// Resolve the full configuration now that logging is in place, so a bad value
-	// is reported through the logger before it aborts startup.
-	//
-	// The snapshot is shared with IniBySection and is loaded on first access, so
-	// registration code may already have pinned it.
-	cfg, err := generateConfig(snapshot)
-	if err != nil {
-		e.failStartup(err)
-	}
+	// The configuration is whatever Configure left on the engine, defaults
+	// included. The kernel reads no file; an integration layer resolves its
+	// own sources and calls Configure before Run.
+	cfg := e.cfg
 
 	// Build the routing trees from everything registered so far.
 	e.generateRoute()
@@ -139,7 +115,7 @@ func (e *engine) Run() {
 	go func() {
 		select {
 		case <-stop:
-			ctx, cancel := context.WithTimeout(context.Background(), cfg.shutdownGracePeriod())
+			ctx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
 			defer cancel()
 			_ = e.Shutdown(ctx)
 		case <-done:
@@ -179,13 +155,6 @@ func (e *engine) Shutdown(ctx context.Context) error {
 
 	var err error
 	e.shutdownOnce.Do(func() { err = server.Shutdown(ctx) })
-
-	// Release any files opened for level logging. Close errors are intentionally
-	// dropped, and the slice is cleared so a repeat shutdown closes nothing twice.
-	for _, f := range e.logFiles {
-		_ = f.Close()
-	}
-	e.logFiles = nil
 	return err
 }
 
@@ -206,4 +175,4 @@ func (e *engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // shutdownGracePeriod is how long a signal-triggered shutdown waits for
 // in-flight requests before forcing connections closed.
-func (gblConfig) shutdownGracePeriod() time.Duration { return 5 * time.Second }
+const shutdownGracePeriod = 5 * time.Second

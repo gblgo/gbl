@@ -6,10 +6,11 @@ package gbl
 
 import "net/http"
 
-// responseWriter is gbl's internal response sink handed to handlers, middleware
-// and the panic path. It embeds http.ResponseWriter and adds unexported
-// accessors the framework uses to coordinate deferred writeback — whether a
-// status or body has been committed, the effective status and the byte count.
+// responseWriter is the internal response sink of gbl, handed to handlers,
+// middleware and the panic path. It embeds http.ResponseWriter and adds
+// unexported accessors the framework uses to coordinate deferred writeback —
+// whether a status or body has been committed, the effective status and the
+// byte count.
 // The type stays unexported so none of those internals surface in the public api.
 type responseWriter interface {
 	http.ResponseWriter
@@ -20,11 +21,11 @@ type responseWriter interface {
 	size() int     // body bytes written so far
 }
 
-// gblResponseWriter is the pooled wrapper the engine hands down. It buffers the
+// pooledResponseWriter is the pooled wrapper the engine hands down. It buffers the
 // status and byte count so a panic or post-handler middleware can still flush the
 // right status, and mirrors net/http's rule that the first body write commits
 // whatever status was set beforehand.
-type gblResponseWriter struct {
+type pooledResponseWriter struct {
 	writtenStatus bool                // a body byte has been written
 	headedStatus  bool                // WriteHeader has recorded a status
 	flushedStatus bool                // the status has reached the underlying writer
@@ -36,7 +37,7 @@ type gblResponseWriter struct {
 // WriteHeader records the status. It reaches the wire only when the header is
 // flushed, by Write or an explicit writeHeader, mirroring net/http, where the
 // first Write commits whatever status was set beforehand.
-func (rw *gblResponseWriter) WriteHeader(code int) {
+func (rw *pooledResponseWriter) WriteHeader(code int) {
 	if rw.headedStatus {
 		return
 	}
@@ -48,14 +49,14 @@ func (rw *gblResponseWriter) WriteHeader(code int) {
 // Header exposes the underlying writer's live header map. Headers are not staged
 // like the status and byte count: net/http snapshots them when the status is
 // flushed, so they must already be on the underlying writer by then.
-func (rw *gblResponseWriter) Header() http.Header {
+func (rw *pooledResponseWriter) Header() http.Header {
 	return rw.w.Header()
 }
 
 // Write flushes any recorded status before the body, so a status set earlier
 // (for example by a middleware) is not silently downgraded to 200 once the
 // first byte commits the response.
-func (rw *gblResponseWriter) Write(data []byte) (int, error) {
+func (rw *pooledResponseWriter) Write(data []byte) (int, error) {
 	rw.writtenStatus = true
 	rw.writeHeader()
 	n, err := rw.w.Write(data)
@@ -65,7 +66,7 @@ func (rw *gblResponseWriter) Write(data []byte) (int, error) {
 
 // status reports the response code as it stands or was sent: the recorded one
 // once WriteHeader has run, otherwise net/http's implicit 200 default.
-func (rw *gblResponseWriter) status() int {
+func (rw *pooledResponseWriter) status() int {
 	if rw.headedStatus {
 		return rw.statusCode
 	}
@@ -73,22 +74,22 @@ func (rw *gblResponseWriter) status() int {
 }
 
 // size reports how many body bytes have been written so far.
-func (rw *gblResponseWriter) size() int { return rw.bytesWritten }
+func (rw *pooledResponseWriter) size() int { return rw.bytesWritten }
 
 // written reports whether any body byte has been committed to the wire.
-func (rw *gblResponseWriter) written() bool {
+func (rw *pooledResponseWriter) written() bool {
 	return rw.writtenStatus
 }
 
 // headed reports whether a status code has been recorded.
-func (rw *gblResponseWriter) headed() bool {
+func (rw *pooledResponseWriter) headed() bool {
 	return rw.headedStatus
 }
 
 // writeHeader sends the recorded status to the underlying writer exactly once;
 // with no recorded status it defaults to 200, as net/http does. The guard makes
 // it safe to call before a Write that would otherwise flush again.
-func (rw *gblResponseWriter) writeHeader() {
+func (rw *pooledResponseWriter) writeHeader() {
 	if rw.flushedStatus {
 		return
 	}

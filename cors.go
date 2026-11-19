@@ -84,6 +84,11 @@ type corsHandler struct {
 	allowHeaders  string
 	exposeHeaders string
 	maxAge        string
+	// wildcard records whether AllowedOrigins contains "*", and expose whether
+	// any ExposedHeaders are configured. Both are resolved once here so the
+	// request path never rescans the origin list or rechecks the slice length.
+	wildcard bool
+	expose   bool
 }
 
 // newCorsHandler wires the CORS layer over e, precomputing the header values that
@@ -93,6 +98,13 @@ func newCorsHandler(e *engine, cc *CorsConfig) *corsHandler {
 	if cc.MaxAge > 0 {
 		maxAge = strconv.FormatInt(int64(cc.MaxAge.Seconds()), 10)
 	}
+	var wildcard bool
+	for _, origin := range cc.AllowedOrigins {
+		if strings.EqualFold(origin, asterisk) {
+			wildcard = true
+			break
+		}
+	}
 	return &corsHandler{
 		engine:        e,
 		config:        cc,
@@ -100,11 +112,13 @@ func newCorsHandler(e *engine, cc *CorsConfig) *corsHandler {
 		allowHeaders:  strings.Join(cc.AllowedHeaders, headerComma),
 		exposeHeaders: strings.Join(cc.ExposedHeaders, headerComma),
 		maxAge:        maxAge,
+		wildcard:      wildcard,
+		expose:        len(cc.ExposedHeaders) > 0,
 	}
 }
 
 // contains reports whether target matches any value, case-insensitively. It
-// backs the origin/method/header allow-lists and the "*" wildcard check.
+// backs the origin/method/header allow-lists.
 func (ch *corsHandler) contains(values []string, target string) bool {
 	for _, value := range values {
 		if strings.EqualFold(value, target) {
@@ -119,7 +133,7 @@ func (ch *corsHandler) contains(values []string, target string) bool {
 // credentials are enabled, which forbids wildcards); an allow-listed origin is
 // echoed back verbatim.
 func (ch *corsHandler) matchOrigin(origin string) (string, bool) {
-	if ch.contains(ch.config.AllowedOrigins, asterisk) {
+	if ch.wildcard {
 		if ch.config.AllowCredentials {
 			return null, false
 		}
@@ -218,7 +232,7 @@ func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		header.Set(accessControlAllowCredentials, headerTrue)
 	}
 
-	if len(ch.config.ExposedHeaders) > 0 {
+	if ch.expose {
 		header.Set(accessControlExposeHeaders, ch.exposeHeaders)
 	}
 

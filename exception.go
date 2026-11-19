@@ -115,7 +115,7 @@ func errorWriteback(w http.ResponseWriter, err any) []byte {
 
 // detectContentType picks the Content-Type for a panic payload so it agrees with
 // how errorWriteback renders it: plain text for errors and scalars, JSON for
-// structs and maps.
+// structs, maps, arrays and slices.
 func detectContentType(data any) string {
 	if data == nil {
 		return textPlainCharset
@@ -132,7 +132,7 @@ func detectContentType(data any) string {
 		t = t.Elem()
 	}
 	switch t.Kind() {
-	case reflect.Struct, reflect.Map:
+	case reflect.Struct, reflect.Map, reflect.Array, reflect.Slice:
 		return applicationJsonCharset
 	default:
 		return textPlainCharset

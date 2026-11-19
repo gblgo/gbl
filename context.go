@@ -57,6 +57,7 @@ type Context struct {
 	result      any           // memoized boxed ret, filled only once Result is called
 	handled     bool          // the handler actually ran
 	logger      Logger        // engine's log sink, so validation and access logs honor SetLogger
+	src         nameSources   // per-request by-name binding sources; primed in injectedParameters
 }
 
 // contextPool recycles Context objects across requests.
@@ -66,7 +67,7 @@ var contextPool = sync.Pool{
 
 // newContext fetches a Context primed for one request. handlers already holds
 // the merged chain with the endpoint appended, so the caller only runs Next.
-func newContext(w *gblResponseWriter,
+func newContext(w *pooledResponseWriter,
 	r *http.Request,
 	params map[string]string,
 	rh *routeHandler,
@@ -88,6 +89,7 @@ func newContext(w *gblResponseWriter,
 	c.ret = reflect.Value{}
 	c.handled = false
 	c.logger = logger
+	c.src = nameSources{}
 	return c
 }
 
@@ -105,6 +107,7 @@ func (c *Context) recycle() {
 	c.result = nil
 	c.ret = reflect.Value{}
 	c.logger = nil
+	c.src = nameSources{}
 	contextPool.Put(c)
 }
 
@@ -259,21 +262,21 @@ func (e *engine) Use(middleware ...HandlerFunc) *engine {
 }
 
 // invokeHandler is the terminal chain link: it parses the request (when the
-// route binds anything), builds the reflect argument list, calls the handler and
+// route binds anything), builds the reflection argument list, calls the handler and
 // stages the serialized result on the Context. The caller writes it after the
 // chain unwinds, so a post-handler middleware can inspect Result and override.
 func (c *Context) invokeHandler() {
 	rh := c.rh
 
 	var (
-		form      url.Values
-		files     filesMap
-		bodyBuf   *bytes.Buffer
-		mediaType string
-		err       error
+		form    url.Values
+		files   filesMap
+		bodyBuf *bytes.Buffer
+		isJSON  bool
+		err     error
 	)
 	if rh.plan.needsParse {
-		form, files, bodyBuf, mediaType, err = parseRequestParameters(c.writer, c.Request, c.method)
+		form, files, bodyBuf, isJSON, err = parseRequestParameters(c.writer, c.Request, c.method)
 		if err != nil {
 			writeRequestError(err)
 			return
@@ -292,21 +295,21 @@ func (c *Context) invokeHandler() {
 	var paramsBuf *[]reflect.Value
 	if rh.t.NumIn() > 0 {
 		paramsBuf, in = acquireParams(rh.t.NumIn())
-		if err = injectedParameters(c, form, files, body, mediaType, in); err != nil {
-			// A binding failure describes the client's own malformed input, so
-			// the message is safe to echo.
+		if err = injectedParameters(c, form, files, body, isJSON, in); err != nil {
+			// Binding errors are assembled from reflection internals (parameter
+			// names, Go type strings, strconv detail), so only a generic 400 is
+			// returned and the detail stays in the server log.
 			releaseParams(paramsBuf, in)
-			abort(http.StatusBadRequest, err.Error())
+			c.logger.Error("request binding failed", "error", err)
+			abort(http.StatusBadRequest, http.StatusText(http.StatusBadRequest))
 			return
 		}
 		// Business values that opt into Validatable are checked before the
-		// handler runs. A validation failure is still the client's fault, but the
-		// message may expose internal rules, so only a generic 400 is returned and
-		// the detail stays in the server log.
+		// handler runs. The message is authored by the application developer, so
+		// it is echoed as the 400 body: whoever wrote it owns what it discloses.
 		if vErr := validateBusiness(in, rh.plan.validatableIndexes); vErr != nil {
 			releaseParams(paramsBuf, in)
-			c.logger.Error("request validation failed", "error", vErr)
-			abort(http.StatusBadRequest, http.StatusText(http.StatusBadRequest))
+			abort(http.StatusBadRequest, vErr.Error())
 			return
 		}
 	}

@@ -21,7 +21,7 @@ import (
 // request state between uses.
 var (
 	responseWriterPool = sync.Pool{
-		New: func() any { return &gblResponseWriter{} },
+		New: func() any { return &pooledResponseWriter{} },
 	}
 	pathParamsPool = sync.Pool{
 		New: func() any { return make(map[string]string, 4) },
@@ -32,7 +32,7 @@ var (
 // a finished request's writer — and returns the wrapper for reuse. A named
 // method deferred directly (defer rw.recycle()) avoids the heap-allocated
 // closure that defer func(){...}() would cost on every request.
-func (rw *gblResponseWriter) recycle() {
+func (rw *pooledResponseWriter) recycle() {
 	rw.w = nil
 	responseWriterPool.Put(rw)
 }
@@ -53,8 +53,8 @@ func releasePathParams(params map[string]string) {
 // pools and returned on every exit path. The wrapper handed to middleware and
 // handlers therefore must not be retained past the request.
 func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	rw := responseWriterPool.Get().(*gblResponseWriter)
-	*rw = gblResponseWriter{w: w}
+	rw := responseWriterPool.Get().(*pooledResponseWriter)
+	*rw = pooledResponseWriter{w: w}
 
 	// Registered first so it runs last: the recover/deferred render below still
 	// needs rw.w, and only afterward may the wrapper be cleared and recycled.
@@ -123,7 +123,7 @@ func cleanupMultipart(r *http.Request) {
 
 // abortUnmatched answers a request that matched no route, telling "no such
 // path" apart from "path exists, wrong verb".
-func (e *engine) abortUnmatched(rw *gblResponseWriter, method httpMethod, path string) {
+func (e *engine) abortUnmatched(rw *pooledResponseWriter, method httpMethod, path string) {
 	allowed := e.allowFor(path)
 	if len(allowed) == 0 {
 		abort(http.StatusNotFound, http.StatusText(http.StatusNotFound))
