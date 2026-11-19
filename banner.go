@@ -21,8 +21,8 @@ var bannerArt = `  ┏━╸  ┏┓   ╻
 
 // startupSuccessMessage is the one-line confirmation emitted right after the
 // banner block. Unlike the art it is an ordinary Info record, so it carries the
-// Logger's timestamp and level (and console tint) and lands in the log files as
-// an explicit "we are live" event.
+// Logger's timestamp and level (and console tint) as an explicit "we are live"
+// event.
 const startupSuccessMessage = "started successfully, ready to accept requests"
 
 // printBanner emits the startup banner through the engine's Logger so a
@@ -31,7 +31,7 @@ const startupSuccessMessage = "started successfully, ready to accept requests"
 // present, otherwise as a single Info record, so no timestamp or level label
 // crowds the art. A one-line startupSuccessMessage Info record follows the block,
 // and that line does carry the Logger's timestamp and level like any event.
-func (e *engine) printBanner(cfg *gblConfig, addr net.Addr) {
+func (e *engine) printBanner(cfg *Config, addr net.Addr) {
 	block := e.renderBanner(cfg, addr)
 	if bl, ok := e.logger.(BannerLogger); ok {
 		bl.Banner(block)
@@ -45,7 +45,7 @@ func (e *engine) printBanner(cfg *gblConfig, addr net.Addr) {
 // table. It is layout only; the actual sink is chosen by printBanner. The
 // trailing blank line separates the status table from whatever log line follows
 // (the startup success record) so the block does not crowd it.
-func (e *engine) renderBanner(cfg *gblConfig, addr net.Addr) string {
+func (e *engine) renderBanner(cfg *Config, addr net.Addr) string {
 	scheme := "http"
 	if cfg.useTLS {
 		scheme = "https"
