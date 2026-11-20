@@ -56,7 +56,7 @@ type Context struct {
 	ret         reflect.Value // handler's first return, boxed lazily by Result
 	result      any           // memoized boxed ret, filled only once Result is called
 	handled     bool          // the handler actually ran
-	logger      Logger        // engine's log sink, so validation and access logs honor SetLogger
+	logger      Logger        // engine's log sink, so middleware logging honors SetLogger
 	src         nameSources   // per-request by-name binding sources; primed in injectedParameters
 }
 
@@ -255,8 +255,10 @@ func Use(middleware ...HandlerFunc) { defaultEngine.Use(middleware...) }
 
 // Use appends middleware that run for every route on this engine. They are
 // combined with each route group's middleware at route-generation time, the
-// engine's running outermost. Register all middleware before Run.
+// engine's running outermost. Register all middleware before Run; calling Use
+// afterward panics, because every route chain is already frozen.
 func (e *engine) Use(middleware ...HandlerFunc) *engine {
+	e.assertAssembling("Use")
 	e.middlewares = append(e.middlewares, middleware...)
 	return e
 }

@@ -63,8 +63,11 @@ func releaseBodyBuffer(buf *bytes.Buffer) {
 
 // SetMaxBodySize sets the hard limit on the total request body size, applied
 // to every body method (POST, PUT, PATCH), multipart uploads included. A body
-// over the limit is rejected with 413. Panics on a non-positive size.
+// over the limit is rejected with 413. Panics on a non-positive size, and
+// once the default engine is serving: the limits are assembling input like
+// everything else the frozen request pipeline reads.
 func SetMaxBodySize(size ByteSize) {
+	defaultEngine.assertAssembling("SetMaxBodySize")
 	if size <= 0 {
 		defaultEngine.failStartup("gbl: max body size must be greater than zero")
 	}
@@ -74,8 +77,9 @@ func SetMaxBodySize(size ByteSize) {
 // SetMaxFileSize sets the multipart in-memory threshold: file parts smaller
 // than size stay in memory, larger ones spill to temporary files. It does not
 // limit the total upload size; see SetMaxBodySize for that. Panics on a
-// non-positive size.
+// non-positive size, and once the default engine is serving.
 func SetMaxFileSize(size ByteSize) {
+	defaultEngine.assertAssembling("SetMaxFileSize")
 	if size <= 0 {
 		defaultEngine.failStartup("gbl: multipart memory threshold must be greater than zero")
 	}
@@ -87,8 +91,10 @@ func SetMaxFileSize(size ByteSize) {
 // the request with 413, before the handler runs. It defaults to
 // defaultMaxUploadFileSize (1 MiB). Distinct from SetMaxFileSize, which is
 // only the in-memory spill threshold, and from SetMaxBodySize, which caps the
-// total body. Panics on a non-positive size.
+// total body. Panics on a non-positive size, and once the default engine is
+// serving.
 func SetMaxUploadFileSize(size ByteSize) {
+	defaultEngine.assertAssembling("SetMaxUploadFileSize")
 	if size <= 0 {
 		defaultEngine.failStartup("gbl: max upload file size must be greater than zero")
 	}

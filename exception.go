@@ -26,13 +26,15 @@ type PanicProcessor func(err any) (any, HttpStatus)
 // RegisterPanicProcessor installs the panic renderer on the default engine. As
 // soon as one is registered it owns the rendering of every recovered value,
 // including unexpected crashes, so the caller takes on the responsibility of
-// not echoing internal errors.
+// not echoing internal errors. It is an assembling decision and panics once
+// the engine is serving.
 func RegisterPanicProcessor(p PanicProcessor) {
-	defaultEngine.panicProcessor = p
+	defaultEngine.SetPanicProcessor(p)
 }
 
 // SetPanicProcessor installs the panic renderer on this engine.
 func (e *engine) SetPanicProcessor(p PanicProcessor) *engine {
+	e.assertAssembling("RegisterPanicProcessor")
 	e.panicProcessor = p
 	return e
 }
@@ -68,7 +70,7 @@ var typeRecognitionError = []byte("Reflection Type Identification Exception")
 // errorWriteback renders a panic payload as response bytes, choosing the form by
 // its reflected kind.
 func errorWriteback(w http.ResponseWriter, err any) []byte {
-	// A value implementing error is written back as its message. Reflecting it
+	// A value implementing error is written back as its message. Reflection
 	// instead walks the concrete type, and the usual errors.New and fmt.Errorf
 	// values consist entirely of unexported fields, so the client would receive
 	// an empty "{}" with no information at all. Keeping the message plain also
@@ -93,7 +95,7 @@ func errorWriteback(w http.ResponseWriter, err any) []byte {
 			return []byte(null)
 		}
 		// Unwrap one layer and return the result, passing the element value
-		// itself rather than the reflect.Value wrapper.
+		// itself rather than the reflection wrapper around it.
 		return errorWriteback(w, val.Elem().Interface())
 	case reflect.Bool:
 		bytes = strconv.AppendBool(nil, val.Bool())

@@ -9,8 +9,8 @@ package gbl
 // prefix to each path and attach the group's middleware to routes registered
 // through it; every method returns the group itself, so calls chain fluently.
 type RouteGroup interface {
-	// Use appends middleware scoped to this group.
-	Use(...HandlerFunc) RouteGroup
+	// GroupUse appends middleware scoped to this group.
+	GroupUse(...HandlerFunc) RouteGroup
 	// Get registers a GET handler under the group's prefix.
 	Get(string, any) RouteGroup
 	// Head registers a HEAD handler under the group's prefix.
@@ -48,49 +48,59 @@ func (e *engine) Group(group string) RouteGroup {
 	return &routeGroup{engine: e, group: group}
 }
 
-// Use appends middleware scoped to this group. They run after the engine's
-// global middleware and only for routes registered through this group.
-func (rg *routeGroup) Use(middleware ...HandlerFunc) RouteGroup {
+// GroupUse appends middleware scoped to this group. They run after the engine's
+// global middleware and only for routes registered through this group. Like
+// every assembling API, it panics once the engine has run.
+func (rg *routeGroup) GroupUse(middleware ...HandlerFunc) RouteGroup {
+	rg.engine.assertAssembling("GroupUse")
 	rg.middlewares = append(rg.middlewares, middleware...)
 	return rg
 }
 
 func (rg *routeGroup) Get(path string, fn any) RouteGroup {
+	rg.engine.assertAssembling("Group.Get")
 	rg.engine.registerWith(methodGet, rg.group+path, fn, rg.middlewares)
 	return rg
 }
 
 func (rg *routeGroup) Head(path string, fn any) RouteGroup {
+	rg.engine.assertAssembling("Group.Head")
 	rg.engine.registerWith(methodHead, rg.group+path, fn, rg.middlewares)
 	return rg
 }
 
 func (rg *routeGroup) Post(path string, fn any) RouteGroup {
+	rg.engine.assertAssembling("Group.Post")
 	rg.engine.registerWith(methodPost, rg.group+path, fn, rg.middlewares)
 	return rg
 }
 
 func (rg *routeGroup) Put(path string, fn any) RouteGroup {
+	rg.engine.assertAssembling("Group.Put")
 	rg.engine.registerWith(methodPut, rg.group+path, fn, rg.middlewares)
 	return rg
 }
 
 func (rg *routeGroup) Patch(path string, fn any) RouteGroup {
+	rg.engine.assertAssembling("Group.Patch")
 	rg.engine.registerWith(methodPatch, rg.group+path, fn, rg.middlewares)
 	return rg
 }
 
 func (rg *routeGroup) Delete(path string, fn any) RouteGroup {
+	rg.engine.assertAssembling("Group.Delete")
 	rg.engine.registerWith(methodDelete, rg.group+path, fn, rg.middlewares)
 	return rg
 }
 
 func (rg *routeGroup) Options(path string, fn any) RouteGroup {
+	rg.engine.assertAssembling("Group.Options")
 	rg.engine.registerWith(methodOptions, rg.group+path, fn, rg.middlewares)
 	return rg
 }
 
 func (rg *routeGroup) Match(methods []string, path string, fn any) RouteGroup {
+	rg.engine.assertAssembling("Group.Match")
 	for _, name := range methods {
 		method, known := methodOf(name)
 		if !known {
