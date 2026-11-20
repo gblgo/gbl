@@ -171,6 +171,7 @@ func buildBindPlan(rt reflect.Type) bindPlan {
 		classes:      make([]paramClass, n),
 		structFields: make([][]structField, n),
 	}
+	visited := make(map[reflect.Type]bool)
 	for i := range n {
 		t := rt.In(i)
 		plan.types[i] = t
@@ -183,36 +184,47 @@ func buildBindPlan(rt reflect.Type) bindPlan {
 			plan.needsParse = true
 			if t.Kind() == reflect.Struct {
 				plan.structFields[i] = structFieldsOf(t)
+				prewarmNestedStructs(t, visited)
 			}
 			if !selfDescribing(t) {
 				plan.needsNames = true
 			}
-			// Decide validation opt-in once, by type, so the request path never
-			// boxes a value just to discover it does not implement Validatable.
 			if t.Implements(validatableType) || reflect.PointerTo(t).Implements(validatableType) {
 				plan.validatableIndexes = append(plan.validatableIndexes, i)
 			}
 		case classFiles:
-			// File headers arrive only through a parsed multipart body.
 			plan.needsParse = true
 		case classWriter:
-			// Decide once whether the pooled writer satisfies this parameter's
-			// type, so the request path injects without re-probing interfaces.
 			if plan.writerOK == nil {
 				plan.writerOK = make([]bool, n)
 			}
 			plan.writerOK[i] = pooledWriterType.AssignableTo(t)
 		default:
-			// classRequest and classContext are injected directly and never force
-			// the body/query to be parsed.
 		}
 	}
-	// More than one business argument is name-dependent even when every one is a
-	// struct: a JSON object body is distributed across them by parameter name.
 	if len(plan.businessIndexes) > 1 {
 		plan.needsNames = true
 	}
 	return plan
+}
+
+// prewarmNestedStructs recursively warms the structFieldsCache for every nested
+// struct reachable from t, so request-time binding never pays the sync.Map miss.
+func prewarmNestedStructs(t reflect.Type, visited map[reflect.Type]bool) {
+	if visited[t] {
+		return
+	}
+	visited[t] = true
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return
+	}
+	fields := structFieldsOf(t)
+	for _, f := range fields {
+		prewarmNestedStructs(f.typ, visited)
+	}
 }
 
 // structFieldsCache memorizes field lists per struct type, so nested structs
@@ -237,7 +249,7 @@ func structFieldsOf(t reflect.Type) []structField {
 // key clients usually send (name), so no JSON tag is needed. Request keys are
 // matched exactly and never transformed.
 func lowerFirst(s string) string {
-	if s == null {
+	if s == empty {
 		return s
 	}
 	r, size := utf8.DecodeRuneInString(s)
@@ -258,7 +270,7 @@ func computeStructFields(t reflect.Type) []structField {
 	fields := make([]structField, 0, n)
 	for i := range n {
 		field := t.Field(i)
-		if field.PkgPath != null {
+		if field.PkgPath != empty {
 			continue // unexported
 		}
 		name := lowerFirst(field.Name)
@@ -426,7 +438,7 @@ func hasNonWhitespace(data []byte) bool {
 // application/json or a structured suffix such as application/vnd.api+json.
 func isJSONMediaType(mediaType string) bool {
 	return mediaType == applicationJson ||
-		(strings.HasPrefix(mediaType, applicationNoJson) && strings.HasSuffix(mediaType, plusSignJson))
+		(strings.HasPrefix(mediaType, applicationPrefix) && strings.HasSuffix(mediaType, plusSignJson))
 }
 
 // nameSources bundles the three by-name request sources a binder reads. It
