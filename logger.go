@@ -114,7 +114,7 @@ func logLine(level, msg string, kv []any) string {
 // engine logs through the console helper described above: that console logger
 // is a development aid, and integrating a real logging component simply means
 // plugging its adapter in here.
-func SetLogger(l Logger) { defaultEngine.SetLogger(l) }
+func SetLogger(l Logger) { defaultEngine.setLogger(l) }
 
 // Info logs at info level through the Logger installed on the default engine.
 // The three package-level log functions are the ergonomic entry for business
@@ -130,12 +130,12 @@ func Warn(msg string, keysAndValues ...any) { defaultEngine.logger.Warn(msg, key
 // Error logs at error level through the Logger installed on the default engine.
 func Error(msg string, keysAndValues ...any) { defaultEngine.logger.Error(msg, keysAndValues...) }
 
-// SetLogger installs a Logger on this engine. It is safe to call at any point
+// setLogger installs a Logger on this engine. It is safe to call at any point
 // during assembling, before or after routes and middleware are registered;
 // passing nil leaves the current logger untouched. Once the engine runs the
 // logger is frozen like every other assembling input, and calling this again
 // panics.
-func (e *engine) SetLogger(l Logger) *engine {
+func (e *engine) setLogger(l Logger) *engine {
 	e.assertAssembling("SetLogger")
 	if l != nil {
 		e.logger = l
