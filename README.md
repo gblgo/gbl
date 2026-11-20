@@ -283,18 +283,6 @@ gbl.Delete("/items/:id", func(id string, hard bool) string {
 // Handler receives: id="7", hard=true
 ```
 
-### `Match` — one handler, several verbs
-
-```go
-// Verb names are standard HTTP verbs, accepted in any case ("GET" or
-// http.MethodGet); an unsupported verb aborts startup.
-gbl.Match([]string{http.MethodGet, http.MethodPost, http.MethodPut}, "/multi", multiHandler)
-gbl.Match([]string{"GET", "DELETE"}, "/multi2", multi2Handler)
-```
-
-`Match(methods []string, path string, fn any)` registers `fn` for exactly the
-named methods.
-
 ---
 
 ## 4. Groups (`Group` / `RouteGroup`)
@@ -327,7 +315,7 @@ api.Get("/secret", func() string { return "top" })        // /api/secret
 
 ```go
 type RouteGroup interface {
-    Use(...HandlerFunc) RouteGroup
+    GroupUse(...HandlerFunc) RouteGroup
     Get(string, any) RouteGroup
     Head(string, any) RouteGroup
     Post(string, any) RouteGroup
@@ -335,11 +323,10 @@ type RouteGroup interface {
     Patch(string, any) RouteGroup
     Delete(string, any) RouteGroup
     Options(string, any) RouteGroup
-    Match([]string, string, any) RouteGroup
 }
 ```
 
-> Group middleware is scoped: `Group("/admin").Use(...)` only runs for routes
+> Group middleware is scoped: `Group("/admin").GroupUse(...)` only runs for routes
 > **registered through that group** — it does not leak onto sibling routes or into
 > the engine-level `Use` chain.
 
@@ -352,7 +339,7 @@ gbl.Use(func(c *gbl.Context) {
 
 // Admin-only guard: only /admin/* routes run it.
 admin := gbl.Group("/admin")
-admin.Use(func(c *gbl.Context) {
+admin.GroupUse(func(c *gbl.Context) {
     if c.Request.URL.Query().Get("token") != "secret" {
         c.AbortWithStatusString(http.StatusUnauthorized, "invalid token")
         return
@@ -760,7 +747,6 @@ c.Request // *http.Request — the inbound request
 | `Next()` | run the remaining chain (and the handler at its end) |
 | `PathParam(name) string` | a matched path parameter by name (for middleware; handlers bind path params by name) |
 | `Set(key, value)` / `Get(key) (any, bool)` | request-scoped values (typed helpers: `Value` / `MustValue`, §8) |
-| `Status(code int)` | record the response status (reaches the wire on first write) |
 | `Result() any` | the handler's return value as `any` (valid after `Next()`); the boxing happens once, on first read |
 | `IsWritten() bool` | whether a body has already been committed |
 | `StatusCode() int` | the status that will be / was sent (200 default) |
