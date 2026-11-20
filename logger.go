@@ -13,7 +13,7 @@ import (
 
 // Logger is the minimal, zero-dependency logging contract of gbl. The framework
 // routes every message it emits internally — a recovered panic, a validation
-// failure, an access-log line — through the engine's Logger. It never binds
+// failure — through the engine's Logger. It never binds
 // hard to a specific package. So the destination, the format and (where the
 // implementation supports them) the structured fields are all the
 // application's choice.
@@ -24,7 +24,7 @@ import (
 // Implement the interface and install it with SetLogger; a one-line adapter is
 // enough. File logging is one such integration: the framework itself only
 // prints to the console, and an application that wants files installs a Logger
-// (or wraps AccessLog in middleware) that writes there.
+// that writes there.
 type Logger interface {
 	Info(msg string, keysAndValues ...any)
 	Warn(msg string, keysAndValues ...any)
@@ -41,75 +41,58 @@ type BannerLogger interface {
 	Banner(block string)
 }
 
-// stdLogger is the default Logger. It writes through the standard library's log
-// package, so output keeps the familiar date/time prefix and can be redirected
-// globally with log.SetOutput. A nil l means "use the package-level logger".
+// stdLogger is the default Logger and a deliberate development aid: it prints
+// only to the console (with level tinting on a real terminal) and offers no
+// files, rotation or routing — an application that integrates a real logging
+// component replaces it through SetLogger.
 //
-// The package-level output is upgraded to a level-tinting writer at init while it
-// still points at os.Stderr, so the default console is colored on a real terminal
-// without giving up log.SetOutput redirection.
+// It writes through a private *log.Logger, not the standard library's
+// package-level one, which keeps framework and application isolated in both
+// directions: the application's log.SetOutput and log.SetFlags calls never
+// move or restyle framework lines, and the framework never reaches into the
+// application's own log.Println output. The private logger sits on a
+// level-tinting writer over os.Stderr, so framework lines keep the familiar
+// date/time prefix and are colored without polluting the global logger.
+// Sending framework logs somewhere else has exactly one path: install a
+// Logger with SetLogger.
 type stdLogger struct {
 	l *log.Logger
 }
 
-// newStdLogger builds the default logger backed by the log package's global
-// logger.
-func newStdLogger() stdLogger { return stdLogger{} }
-
-// init upgrades the standard library's default log output to a level-tinting
-// writer, but only while it still points at os.Stderr — that is, the program has
-// not redirected logging itself. The wrapper is a pure pass-through unless stderr
-// is a real terminal, so redirected output, pipes and tests are unaffected, and
-// calling log.SetOutput later replaces the wrapper outright.
-func init() {
-	if log.Writer() == os.Stderr {
-		log.SetOutput(consoleWriter(os.Stderr))
-	}
+// newStdLogger builds the default logger. The tinting decision is made once,
+// here: consoleWriter hands back the bare os.Stderr when the destination is
+// not a color-capable terminal (or NO_COLOR is set), so pipes, redirects and
+// CI carry no wrapper layer and no escape codes at all.
+func newStdLogger() stdLogger {
+	return stdLogger{l: log.New(consoleWriter(os.Stderr), "", log.LstdFlags)}
 }
-
-// NewStdLogger adapts any *log.Logger to the gbl Logger interface, so callers
-// who already configure a standard logger (a specific writer, flags, prefix) can
-// hand it to gbl without writing an implementation:
-//
-//	gbl.SetLogger(gbl.NewStdLogger(myLogger))
-//
-// This is also the shortest path to file logging: point a *log.Logger at an
-// open file (or an io.MultiWriter) and install it.
-func NewStdLogger(l *log.Logger) Logger { return stdLogger{l: l} }
 
 func (s stdLogger) Info(msg string, kv ...any)  { s.emit("INFO", msg, kv) }
 func (s stdLogger) Warn(msg string, kv ...any)  { s.emit("WARN", msg, kv) }
 func (s stdLogger) Error(msg string, kv ...any) { s.emit("ERROR", msg, kv) }
 
-// Banner writes the startup block straight to the sink, bypassing logLine so the
-// art keeps its alignment and no date/level label is glued to its first line.
-// Only the underlying writer is reused, so SetOutput and a NewStdLogger target
-// are still honored.
+// Banner writes the startup block straight to the sink's underlying writer,
+// bypassing the private logger so the art keeps its alignment and no
+// date/level label is glued to its first line. The tinting writer is still
+// underneath and passes the block through untouched: it carries no level
+// word for the scanner to find.
 func (s stdLogger) Banner(block string) {
-	w := log.Writer()
-	if s.l != nil {
-		w = s.l.Writer()
-	}
-	_, _ = fmt.Fprint(w, "\n"+block+"\n")
+	_, _ = fmt.Fprint(s.l.Writer(), "\n"+block+"\n")
 }
 
-// emit renders "gbl: LEVEL msg key=value ..." and writes it at the caller's
-// depth. All levels share the standard logger because log itself is
-// level-free; the label preserves the distinction for readers.
+// emit renders "LEVEL msg key=value ..." and writes it through the private
+// logger at a caller depth that resolves file/line information (when the
+// flags ask for it) to the business call site. All levels share the one
+// logger because log itself is level-free; the label preserves the
+// distinction for readers.
 func (s stdLogger) emit(level, msg string, kv []any) {
-	line := logLine(level, msg, kv)
-	if s.l != nil {
-		_ = s.l.Output(3, line)
-		return
-	}
-	_ = log.Output(3, line)
+	_ = s.l.Output(3, logLine(level, msg, kv))
 }
 
 // logLine assembles the plain-text form. Pairs print as key=value; a dangling
 // trailing value (odd count) is appended bare so no information is dropped.
 func logLine(level, msg string, kv []any) string {
 	var b strings.Builder
-	b.WriteString("gbl: ")
 	b.WriteString(level)
 	b.WriteByte(' ')
 	b.WriteString(msg)
@@ -127,13 +110,33 @@ func logLine(level, msg string, kv []any) string {
 }
 
 // SetLogger installs a Logger on the default engine. Passing nil is ignored, so
-// the framework always keeps a working logger.
+// the framework always keeps a working logger. Until it is called the default
+// engine logs through the console helper described above: that console logger
+// is a development aid, and integrating a real logging component simply means
+// plugging its adapter in here.
 func SetLogger(l Logger) { defaultEngine.SetLogger(l) }
 
-// SetLogger installs a Logger on this engine. It is safe to call before or after
-// routes and middleware are registered; passing nil leaves the current logger
-// untouched.
+// Info logs at info level through the Logger installed on the default engine.
+// The three package-level log functions are the ergonomic entry for business
+// code: once a logger is injected with SetLogger it is the framework's sink,
+// and calling it through the framework's own API is the intended use — no need
+// to keep or fetch a reference. msg describes the event, followed by
+// alternating key/value pairs (see Logger).
+func Info(msg string, keysAndValues ...any) { defaultEngine.logger.Info(msg, keysAndValues...) }
+
+// Warn logs at warn level through the Logger installed on the default engine.
+func Warn(msg string, keysAndValues ...any) { defaultEngine.logger.Warn(msg, keysAndValues...) }
+
+// Error logs at error level through the Logger installed on the default engine.
+func Error(msg string, keysAndValues ...any) { defaultEngine.logger.Error(msg, keysAndValues...) }
+
+// SetLogger installs a Logger on this engine. It is safe to call at any point
+// during assembling, before or after routes and middleware are registered;
+// passing nil leaves the current logger untouched. Once the engine runs the
+// logger is frozen like every other assembling input, and calling this again
+// panics.
 func (e *engine) SetLogger(l Logger) *engine {
+	e.assertAssembling("SetLogger")
 	if l != nil {
 		e.logger = l
 	}
