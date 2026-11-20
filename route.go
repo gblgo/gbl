@@ -71,15 +71,17 @@ func (m httpMethod) isBodyMethod() bool {
 // the precomputed bind plan and the frozen middleware chain. Built once in
 // generateRoute and reused verbatim by every matching request.
 type routeHandler struct {
+	// 24-byte fields (reflect.Value, slices)
+	v          reflect.Value
+	paramNames []string
+	handlers   []HandlerFunc // this route's frozen request chain: the engine's global middleware, then the route group's, then the terminal routeEndpoint. It is assembled once at startup and reused verbatim by every request.
+
+	// bindPlan (152 bytes)
+	plan bindPlan
+
+	// 16-byte fields (string, interface)
 	contentType string
-	v           reflect.Value
 	t           reflect.Type
-	paramNames  []string
-	plan        bindPlan
-	// handlers are this route's frozen request chain: the engine's global
-	// middleware, then the route group's, then the terminal routeEndpoint.
-	// It is assembled once at startup and reused verbatim by every request.
-	handlers []HandlerFunc
 }
 
 // dealPath splits path into per-segment metadata and a normalized route path.

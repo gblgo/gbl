@@ -26,12 +26,17 @@ type responseWriter interface {
 // right status, and mirrors net/http's rule that the first body write commits
 // whatever status was set beforehand.
 type pooledResponseWriter struct {
-	writtenStatus bool                // a body byte has been written
-	headedStatus  bool                // WriteHeader has recorded a status
-	flushedStatus bool                // the status has reached the underlying writer
-	statusCode    int                 // recorded status code
-	bytesWritten  int                 // total body bytes passed to the underlying writer
-	w             http.ResponseWriter // wrapped sink, reset per request; never retained across requests
+	// 16-byte fields (interface)
+	w http.ResponseWriter // wrapped sink, reset per request; never retained across requests
+
+	// 8-byte fields (int)
+	statusCode   int // recorded status code
+	bytesWritten int // total body bytes passed to the underlying writer
+
+	// 1-byte fields (bool)
+	writtenStatus bool // a body byte has been written
+	headedStatus  bool // WriteHeader has recorded a status
+	flushedStatus bool // the status has reached the underlying writer
 }
 
 // WriteHeader records the status. It reaches the wire only when the header is
