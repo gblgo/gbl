@@ -109,6 +109,14 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = rw.Write(c.bytes)
 	}
+
+	// Release the pooled response buffer if the handler staged a result. This runs
+	// on both the staged-commit path (after Write) and the direct-write path (when
+	// middleware or the handler bypassed staging), so the buffer is never leaked.
+	if c.responseBuf != nil {
+		responseBufferPool.Put(c.responseBuf)
+		c.responseBuf = nil
+	}
 }
 
 // cleanupMultipart releases any temporary files a parsed multipart request left
