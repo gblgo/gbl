@@ -35,7 +35,7 @@ function, type, interface and method, each with a runnable example.
 6. [Serving (`Run` / `Shutdown`)](#6-serving-run--shutdown)
 7. [`Context` reference](#7-context-reference)
 8. [Request-scoped values (`Get` / `Value` / `MustValue`)](#8-request-scoped-values-get--value--mustvalue)
-9. [Aborts & panic (`Abort` / `PanicProcessor` / `HttpStatus`)](#9-aborts--panic-abort--panicprocessor--httpstatus)
+9. [Aborts & panic (`PanicProcessor` / `HttpStatus`)](#9-aborts--panic-panicprocessor--httpstatus)
 10. [Validation (`Validatable`)](#10-validation-validatable)
 11. [Logging (`Logger` / `BannerLogger` / `SetLogger` / `Info` / `Warn` / `Error`)](#11-logging-logger--bannerlogger--setlogger--info--warn--error)
 12. [Upload limits (`ByteSize` / `SetMaxBodySize` / `SetMaxFileSize` / `SetMaxUploadFileSize`)](#12-upload-limits-bytesize--setmaxbodysize--setmaxfilesize--setmaxuploadfilesize)
@@ -315,7 +315,7 @@ api.
 // Scoped middleware runs only for routes registered through this group.
 api.Use(func(c *gbl.Context) {
     if c.Request.URL.Query().Get("token") == "" {
-        c.AbortWithStatus(http.StatusUnauthorized)
+        c.AbortWithStatusString(http.StatusUnauthorized, "missing token")
         return
     }
     c.Next()
@@ -354,7 +354,7 @@ gbl.Use(func(c *gbl.Context) {
 admin := gbl.Group("/admin")
 admin.Use(func(c *gbl.Context) {
     if c.Request.URL.Query().Get("token") != "secret" {
-        c.AbortWithStatus(http.StatusUnauthorized)
+        c.AbortWithStatusString(http.StatusUnauthorized, "invalid token")
         return
     }
     c.Next()
@@ -432,22 +432,139 @@ write staged result
 response
 ```
 
+**How `Next()` works internally**: Each call to `c.Next()` increments a shared
+cursor and loops through the remaining handlers. When a middleware calls
+`c.Next()`, it **recursively enters** the `Next()` function again, creating a
+new stack frame. All nested calls share the same cursor (`c.index`), so the
+innermost call pushes it past the end, causing each outer loop to exit in turn.
+This is why no handler runs twice, and why the response phase unwinds in
+reverse order (innermost-first).
+
 All nested `Next` calls share one cursor; the innermost call pushes it past
 the end, so each outer loop returns in turn and no link runs twice.
 
-**To stop the chain, call an `Abort` method** (`Abort`, `AbortWithStatus`,
+**To stop the chain, call an `Abort` method** (`Abort`, `AbortWithStatusString`,
 `AbortWithStatusJSON`). It pushes the cursor past the end, so every link that
-has not started yet — the handler included — is skipped. The `AbortWithStatus`
+has not started yet — the handler included — is skipped. The `AbortWithStatusString`
 / `AbortWithStatusJSON` variants also write the denial response in the same call.
 
 > Returning from a middleware **without** calling `c.Next()` does **not** stop
 > the chain: the enclosing `Next` loop still advances to the next link. Only
 > `Abort` halts downstream.
 
-> `Abort` stops only **downstream**. It does **not** rewind already-running
-> middleware: upstream links whose `c.Next()` has already returned will still
-> execute their "after `Next()`" code. Guard with `if c.Aborted() { return }`
-> there if you need to skip that too.
+> **`Abort` stops only downstream, not upstream.** Middleware that has already
+> called `c.Next()` will still execute its "after `Next()`" code when `Next()`
+> returns, even if a downstream link aborted. This is by design: access logs,
+> metrics and cleanup code in the response phase must run regardless of whether
+> the request succeeded or was rejected.
+
+```go
+// Example: Abort in a downstream middleware
+gbl.Use(func(c *gbl.Context) {
+    log.Println("mw1: before Next")
+    c.Next()
+    log.Println("mw1: after Next")  // ← This STILL runs even if mw2 aborts
+})
+
+gbl.Use(func(c *gbl.Context) {
+    log.Println("mw2: before Abort")
+    c.AbortWithStatusString(401, "unauthorized")
+    log.Println("mw2: after Abort")  // ← This DOES NOT run (unreachable)
+    // mw2 returns, Next() returns to mw1
+})
+
+gbl.Get("/api", func() string {
+    log.Println("handler")  // ← This DOES NOT run (aborted)
+    return "secret"
+})
+
+// Request GET /api logs:
+//   mw1: before Next
+//   mw2: before Abort
+//   mw1: after Next        ← post-Next code always runs
+// Response: 401 unauthorized
+```
+
+**To skip post-Next code when aborted**, check `c.Aborted()`:
+
+```go
+gbl.Use(func(c *gbl.Context) {
+    c.Next()
+    if !c.Aborted() {
+        log.Println("success path")  // ← only runs when not aborted
+    } else {
+        log.Println("abort path")    // ← only runs when aborted
+    }
+})
+```
+
+> **Why does post-Next code always run?** `c.Next()` is an ordinary function
+> call that creates a stack frame. When a downstream middleware aborts, it sets
+> a flag (`index = abortIndex`) and returns, but the upstream `Next()` call is
+> already on the stack and must wait for the function to return. This is Go's
+> normal function call behavior — there is no way to forcibly exit a stack frame
+> without `panic`, which would be inappropriate for control flow.
+
+**This is by design, not a limitation.** Post-Next code must run regardless of
+success or failure:
+
+```go
+// Access logging: every request needs a log entry, including rejected ones
+gbl.Use(func(c *gbl.Context) {
+    start := time.Now()
+    c.Next()
+    // This runs even when aborted, so you can log 401/403 rejections
+    log.Printf("%s %s %d %v", 
+        c.Request.Method, 
+        c.Request.URL.Path,
+        c.StatusCode(),  // ← 401 if aborted, 200 if success
+        time.Since(start))
+})
+
+// Authentication middleware
+gbl.Use(func(c *gbl.Context) {
+    if !authenticated {
+        c.AbortWithStatusString(401, "unauthorized")
+        return
+    }
+    c.Next()
+})
+
+// Request: GET /api (unauthenticated)
+// Flow: logger(before) → auth → Abort(401) → logger(after: logs 401)
+// Output: GET /api 401 1.2ms  ← rejected requests are still logged
+```
+
+If Abort forcibly exited the entire chain, the logger's post-Next code would
+never run, and you would lose all logs for rejected requests — making it
+impossible to monitor authentication failure rates or audit security events.
+
+**Flexibility: you choose what runs.** Use `c.Aborted()` to conditionally
+execute post-Next logic:
+
+```go
+gbl.Use(func(c *gbl.Context) {
+    c.Next()
+    
+    // Always run: metrics for all requests (success + failure)
+    metrics.Record(c.StatusCode(), c.Size())
+    
+    // Only on success: cache the result
+    if !c.Aborted() {
+        cache.Store(key, c.Result())
+    }
+    
+    // Only on abort: audit rejections
+    if c.Aborted() {
+        audit.LogRejection(c.Request, c.StatusCode())
+    }
+})
+```
+
+**Industry standard.** Gin, the most popular Go web framework, uses the exact
+same design: Abort stops downstream but post-Next code in upstream middleware
+always runs. This is the standard pattern for Go web frameworks with
+middleware chains.
 
 ```go
 // A middleware: its body is split into two phases by c.Next().
@@ -564,9 +681,9 @@ engine.Next() → handlers[0]
    at registration, flushing the recorded status (default 200) first.
 7. **Cleanup.** Multipart temp files are removed; the `Context`, path-param map
    and response writer are reset and returned to their pools.
-8. **Any panic** along the way is recovered and rendered: an explicit `Abort`
-   reaches the client verbatim, a registered `PanicProcessor` owns rendering,
-   and anything else is logged and answered with a generic 500.
+8. **Any panic** along the way is recovered and rendered: a framework-generated
+   abort reaches the client verbatim, a registered `PanicProcessor` owns
+   rendering, and anything else is logged and answered with a generic 500.
 
 The handler itself (step 5, innermost) is plain business code: it neither calls
 `Next()` nor has phases. The "response phase" belongs to middleware, on the way
@@ -643,8 +760,6 @@ c.Request // *http.Request — the inbound request
 | `Next()` | run the remaining chain (and the handler at its end) |
 | `PathParam(name) string` | a matched path parameter by name (for middleware; handlers bind path params by name) |
 | `Set(key, value)` / `Get(key) (any, bool)` | request-scoped values (typed helpers: `Value` / `MustValue`, §8) |
-| `JSON(status int, value any)` | write a JSON body with the given status |
-| `String(status int, body string)` | write a plain-text body |
 | `Status(code int)` | record the response status (reaches the wire on first write) |
 | `Result() any` | the handler's return value as `any` (valid after `Next()`); the boxing happens once, on first read |
 | `IsWritten() bool` | whether a body has already been committed |
@@ -652,8 +767,8 @@ c.Request // *http.Request — the inbound request
 | `Size() int` | effective response body length |
 | `Aborted() bool` | whether the chain has been stopped |
 | `Abort()` | stop the chain, write nothing |
-| `AbortWithStatus(status int)` | deny with a status, no body |
-| `AbortWithStatusJSON(status int, value any)` | deny with a JSON body |
+| `AbortWithStatusString(status int, body string)` | deny with a plain-text body |
+| `AbortWithStatusJSON(status int, body any)` | deny with a JSON body |
 
 ### Examples
 
@@ -665,7 +780,7 @@ c.Request // *http.Request — the inbound request
 gbl.Use(func(c *gbl.Context) {
     uid, ok := parseToken(c.Request.Header.Get("Authorization")) // your logic
     if !ok {
-        c.AbortWithStatus(http.StatusUnauthorized)
+        c.AbortWithStatusString(http.StatusUnauthorized, "unauthorized")
         return
     }
     c.Set("uid", uid)
@@ -681,14 +796,14 @@ gbl.Get("/orders", func(c *gbl.Context) []Order {
 })
 
 // Scenario: per-endpoint monitoring — record every request's status, size and
-// latency, and optionally reshape the body. After the handler ran, only Context
-// exposes the staged result and the effective status/size; an injected
-// http.ResponseWriter can write but cannot read any of these.
+// latency. After the handler ran, only Context exposes the staged result and
+// the effective status/size; an injected http.ResponseWriter can write but
+// cannot read any of these.
 gbl.Use(func(c *gbl.Context) {
     c.Next()
     metrics.Observe(c.StatusCode(), c.Size())
-    if res, ok := c.Result().(string); ok && !c.IsWritten() {
-        c.String(http.StatusOK, strings.ToUpper(res)) // override the default body
+    if c.Aborted() {
+        log.Printf("request aborted with status %d", c.StatusCode())
     }
 })
 ```
@@ -726,31 +841,16 @@ name := gbl.MustValue[string](c, "displayName") // "" when absent / wrong type
 
 ---
 
-## 9. Aborts & panic (`Abort` / `PanicProcessor` / `HttpStatus`)
+## 9. Aborts & panic (`PanicProcessor` / `HttpStatus`)
 
 The error policy of gbl splits echo rights by **who authored the message**:
-**developer-authored text reaches the client verbatim** — an explicit `Abort`,
-your `PanicProcessor` (if installed), and the error text returned by `Validate`;
+**developer-authored text reaches the client verbatim** — your `PanicProcessor`
+(if installed) and the error text returned by `Validate`;
 **framework-assembled internals never do** — panic causes and binding failures
 (parameter names, Go type strings, strconv detail) go to the server log only,
 with a generic `500` / `400` on the wire. Request-parse errors (bad Content-Type,
 oversize body) describe the client's own request framing and carry no internal
 identifiers, so they are echoed.
-
-### `Abort(status int, msg string)`
-
-```go
-gbl.Get("/admin", func(c *gbl.Context) {
-    if !isAdmin(c) {
-        gbl.Abort(http.StatusForbidden, "forbidden") // status+msg DO reach the client
-    }
-    // ... a bare panic here would be a generic 500, msg hidden
-})
-```
-
-Unlike a bare `panic`, `Abort`'s message is guaranteed to reach the client. (The
-`Context` also has `Abort`-family methods that take status/body — see
-[section 7](#7-context-reference).)
 
 ### `PanicProcessor` / `RegisterPanicProcessor` / `HttpStatus`
 

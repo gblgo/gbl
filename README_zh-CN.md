@@ -23,7 +23,7 @@
 6. [服务启停（`Run` / `Shutdown`）](#6-服务启停run--shutdown)
 7. [`Context` 详解](#7-context-详解)
 8. [请求级取值（`Get` / `Value` / `MustValue`）](#8-请求级取值get--value--mustvalue)
-9. [中止与 panic（`Abort` / `PanicProcessor` / `HttpStatus`）](#9-中止与-panicabort--panicprocessor--httpstatus)
+9. [中止与 panic（`PanicProcessor` / `HttpStatus`）](#9-中止与-panicpanicprocessor--httpstatus)
 10. [校验（`Validatable`）](#10-校验validatable)
 11. [日志（`Logger` / `BannerLogger` / `SetLogger` / `Info` / `Warn` / `Error`）](#11-日志logger--bannerlogger--setlogger--info--warn--error)
 12. [上传大小限制（`ByteSize` / `SetMaxBodySize` / `SetMaxFileSize` / `SetMaxUploadFileSize`）](#12-上传大小限制bytesize--setmaxbodysize--setmaxfilesize--setmaxuploadfilesize)
@@ -269,7 +269,7 @@ api.
 // 分组中间件只作用于经本分组注册的规则。
 api.Use(func(c *gbl.Context) {
     if c.Request.URL.Query().Get("token") == "" {
-        c.AbortWithStatus(http.StatusUnauthorized)
+        c.AbortWithStatusString(http.StatusUnauthorized, "missing token")
         return
     }
     c.Next()
@@ -306,7 +306,7 @@ gbl.Use(func(c *gbl.Context) {
 admin := gbl.Group("/admin")
 admin.Use(func(c *gbl.Context) {
     if c.Request.URL.Query().Get("token") != "secret" {
-        c.AbortWithStatus(http.StatusUnauthorized)
+        c.AbortWithStatusString(http.StatusUnauthorized, "invalid token")
         return
     }
     c.Next()
@@ -337,7 +337,7 @@ type HandlerFunc func(c *Context)
 
 这两个阶段都是**你在中间件函数里自己写的代码**，以 `c.Next()` 这一行为界——它们不是 handler，也不是框架写 HTTP 响应那个动作。handler 是最内层的业务函数：没有阶段之分，也从不叫 `Next()`。“响应”指的是出站方向（handler 之后），不是写字节这个动作：框架要等整条链回溯完，才把暂存 body 写进连接。所以围着 `Next()` 计时测的是请求处理耗时（下游 + handler + 序列化）——访问日志也放在这一阶段，因为此时结果与状态码已确定。
 
-`Next()` 就是一个普通的阻塞调用，不是什么调度器：它同步跑完下游所有环，等它们全部结束才返回。所谓“响应阶段”，不过是中间件自己在 `Next()` 调用之后的代码——因为调用返回了，自然就接着执行，`Next` 内部并没有第二套机制。以链 `[A, B, handler]` 为例，执行就是沿下图自上而下流动：
+`Next()` 就是一个普通的阻塞调用，不是什么调度器：它同步跑完下游所有环，等它们全部结束才返回。所谓”响应阶段”，不过是中间件自己在 `Next()` 调用之后的代码——因为调用返回了，自然就接着执行，`Next` 内部并没有第二套机制。以链 `[A, B, handler]` 为例，执行就是沿下图自上而下流动：
 
 ```text
 请求
@@ -364,13 +364,111 @@ type HandlerFunc func(c *Context)
 响应
 ```
 
+**`Next()` 的内部机制**：每次调用 `c.Next()` 都会递增一个共享的游标，然后循环调用剩余的 handler。当中间件调用 `c.Next()` 时，它会**递归地再次进入** `Next()` 函数，创建新的栈帧。所有嵌套调用共享同一个游标（`c.index`），最内层的调用把游标推过末尾，导致每个外层循环依次退出。这就是为什么没有 handler 会被执行两次，以及为什么响应阶段按反向顺序（由内向外）回溯。
+
 所有嵌套的 `Next` 共享同一个游标；最内层调用把游标推过末尾，外层各帧便依次返回，任何环都不会被执行两次。
 
-**要中断链，必须调 `Abort` 系列方法**（`Abort`、`AbortWithStatus`、`AbortWithStatusJSON`）：它把游标推到末尾之后，**跳过所有尚未开始的环**（含 handler）。`AbortWithStatus` / `AbortWithStatusJSON` 还会同时写拒绝响应，一步到位。
+**要中断链，必须调 `Abort` 系列方法**（`Abort`、`AbortWithStatusString`、`AbortWithStatusJSON`）：它把游标推到末尾之后，**跳过所有尚未开始的环**（含 handler）。`AbortWithStatusString` / `AbortWithStatusJSON` 还会同时写拒绝响应，一步到位。
 
 > 中间件**不调 `c.Next()` 直接 `return` 并不能中断链**：外层的 `Next` 循环仍会推进到下一环。只有 `Abort` 才能拦下下游。
 
-> `Abort` 只向下游中断，**不会**回头打断已经调用过 `c.Next()` 的上游中间件 —— 那些环恢复后仍会执行 `c.Next()` 之后的代码。如需连上游一起打断，在上游环里自己写 `if c.Aborted() { return }`。
+> **`Abort` 只向下游中断，不会中断上游。** 已经调用过 `c.Next()` 的中间件，即使下游被 Abort 了，它们的 `c.Next()` 仍会返回，返回后的代码仍会执行。这是设计意图：访问日志、指标统计和清理代码必须无论请求成功还是被拒绝都要运行。
+
+```go
+// 示例：下游中间件 Abort
+gbl.Use(func(c *gbl.Context) {
+    log.Println("mw1: Next 之前")
+    c.Next()
+    log.Println("mw1: Next 之后")  // ← 即使 mw2 Abort 了，这行仍会执行
+})
+
+gbl.Use(func(c *gbl.Context) {
+    log.Println("mw2: Abort 之前")
+    c.AbortWithStatusString(401, "unauthorized")
+    log.Println("mw2: Abort 之后")  // ← 这行不会执行（在 Abort 之后）
+    // mw2 返回，Next() 返回到 mw1
+})
+
+gbl.Get("/api", func() string {
+    log.Println("handler")  // ← 这行不会执行（被 Abort 跳过）
+    return "secret"
+})
+
+// 请求 GET /api 的日志输出：
+//   mw1: Next 之前
+//   mw2: Abort 之前
+//   mw1: Next 之后        ← Next 之后的代码总是执行
+// 响应：401 unauthorized
+```
+
+**要在 Abort 时跳过 Next 之后的代码**，检查 `c.Aborted()`：
+
+```go
+gbl.Use(func(c *gbl.Context) {
+    c.Next()
+    if !c.Aborted() {
+        log.Println("成功路径")  // ← 只在未 Abort 时执行
+    } else {
+        log.Println("中断路径")  // ← 只在 Abort 时执行
+    }
+})
+```
+
+> **为什么 Next 之后的代码总是执行？** `c.Next()` 是一个普通的函数调用，会创建栈帧。当下游中间件 Abort 时，它只是设置一个标志（`index = abortIndex`）然后返回，但上游的 `Next()` 调用已经在栈上，必须等待函数返回。这是 Go 的正常函数调用行为——除了 `panic` 之外没有办法强制退出栈帧，而 panic 不适合用于控制流。
+
+**这是设计意图，不是限制。** Next 之后的代码必须无论成功还是失败都执行：
+
+```go
+// 访问日志：每个请求都需要日志记录，包括被拒绝的
+gbl.Use(func(c *gbl.Context) {
+    start := time.Now()
+    c.Next()
+    // 即使 Abort 了这里也会执行，所以你可以记录 401/403 拒绝
+    log.Printf("%s %s %d %v", 
+        c.Request.Method, 
+        c.Request.URL.Path,
+        c.StatusCode(),  // ← Abort 时是 401，成功时是 200
+        time.Since(start))
+})
+
+// 认证中间件
+gbl.Use(func(c *gbl.Context) {
+    if !authenticated {
+        c.AbortWithStatusString(401, "unauthorized")
+        return
+    }
+    c.Next()
+})
+
+// 请求：GET /api（未认证）
+// 流程：logger(before) → auth → Abort(401) → logger(after: 记录 401)
+// 输出：GET /api 401 1.2ms  ← 被拒绝的请求仍然有日志
+```
+
+如果 Abort 强制退出整个链，日志中间件的 Next 之后的代码就永远不会执行，你会丢失所有被拒绝请求的日志——无法监控认证失败率或审计安全事件。
+
+**灵活性：由你选择执行什么。** 用 `c.Aborted()` 来条件性执行 Next 之后的逻辑：
+
+```go
+gbl.Use(func(c *gbl.Context) {
+    c.Next()
+    
+    // 总是执行：所有请求的指标统计（成功 + 失败）
+    metrics.Record(c.StatusCode(), c.Size())
+    
+    // 只在成功时执行：缓存结果
+    if !c.Aborted() {
+        cache.Store(key, c.Result())
+    }
+    
+    // 只在 Abort 时执行：审计拒绝事件
+    if c.Aborted() {
+        audit.LogRejection(c.Request, c.StatusCode())
+    }
+})
+```
+
+**业界标准。** Gin（最流行的 Go web 框架）采用完全相同的设计：Abort 阻止下游，但上游中间件的 Next 之后的代码总是执行。这是 Go web 框架中间件链的标准模式。
 
 ```go
 // 一个中间件：函数体被 c.Next() 分成两段。
@@ -462,7 +560,7 @@ engine.Next() → handlers[0]
 
 6. **写回响应。** 若中间件或 handler 已写过 body（`c.JSON`、`c.String` 或注入的 `http.ResponseWriter`），就以它为准。否则引擎用注册时选定的 Content-Type 写出暂存的 `c.bytes`，先 flush 已记录的状态码（默认 200）。
 7. **收尾。** 清理 multipart 临时文件；`Context`、路径参数 map、响应写入器复位并归还对象池。
-8. **任何 panic** 都会被恢复并渲染：显式 `Abort` 原样到达客户端；注册了 `PanicProcessor` 则由它接管渲染；其余一律记日志并回通用 500。
+8. **任何 panic** 都会被恢复并渲染：框架自身生成的中止原样到达客户端；注册了 `PanicProcessor` 则由它接管渲染；其余一律记日志并回通用 500。
 
 handler 本身（第 5 步最内层）是纯业务代码：既不调 `Next()`，也没有阶段之分。“响应阶段”属于中间件、在回程上——所以计时和访问日志在那里读结果。
 
@@ -520,8 +618,6 @@ c.Request // *http.Request —— 原始入站请求
 | `Next()` | 执行链上剩余部分（到末端即 handler） |
 | `PathParam(name) string` | 按名字取匹配到的路径参数（供中间件用；业务 handler 请按名绑定） |
 | `Set(key, value)` / `Get(key) (any, bool)` | 请求级取值（类型化便利：`Value` / `MustValue`，见 §8） |
-| `JSON(status int, value any)` | 以给定状态写 JSON body |
-| `String(status int, body string)` | 写纯文本 body |
 | `Status(code int)` | 记录响应状态（首次写入时才真正落到线上） |
 | `Result() any` | handler 返回值的 `any` 形态（`Next()` 之后有效）；首次读取时才做装箱 |
 | `IsWritten() bool` | body 是否已提交 |
@@ -529,8 +625,8 @@ c.Request // *http.Request —— 原始入站请求
 | `Size() int` | 有效响应体长度 |
 | `Aborted() bool` | 链路是否已中断 |
 | `Abort()` | 中断链路，不写任何内容 |
-| `AbortWithStatus(status int)` | 以某状态拒绝，无 body |
-| `AbortWithStatusJSON(status int, value any)` | 以 JSON body 拒绝 |
+| `AbortWithStatusString(status int, body string)` | 以纯文本 body 拒绝 |
+| `AbortWithStatusJSON(status int, body any)` | 以 JSON body 拒绝 |
 
 ### 示例
 
@@ -541,7 +637,7 @@ c.Request // *http.Request —— 原始入站请求
 gbl.Use(func(c *gbl.Context) {
     uid, ok := parseToken(c.Request.Header.Get("Authorization")) // 你的解析逻辑
     if !ok {
-        c.AbortWithStatus(http.StatusUnauthorized)
+        c.AbortWithStatusString(http.StatusUnauthorized, "unauthorized")
         return
     }
     c.Set("uid", uid)
@@ -555,14 +651,14 @@ gbl.Get("/orders", func(c *gbl.Context) []Order {
     return loadOrders(v.(int64))
 })
 
-// 场景：接口监控——统一记录每个请求的状态码、响应大小与耗时，必要时改写 body。
+// 场景：接口监控——统一记录每个请求的状态码、响应大小与耗时。
 // handler 跑完后，只有 Context 能拿到暂存返回值与有效状态/大小；
 // 注入的 http.ResponseWriter 只能写，读不到这些。
 gbl.Use(func(c *gbl.Context) {
     c.Next()
     metrics.Observe(c.StatusCode(), c.Size())
-    if res, ok := c.Result().(string); ok && !c.IsWritten() {
-        c.String(http.StatusOK, strings.ToUpper(res)) // 覆盖默认 body
+    if c.Aborted() {
+        log.Printf("请求被中断，状态码 %d", c.StatusCode())
     }
 })
 ```
@@ -597,22 +693,9 @@ name := gbl.MustValue[string](c, "displayName") // 缺失/类型不符为 ""
 
 ---
 
-## 9. 中止与 panic（`Abort` / `PanicProcessor` / `HttpStatus`）
+## 9. 中止与 panic（`PanicProcessor` / `HttpStatus`）
 
-gbl 的错误策略按"**消息是谁写的**"划分回显权：**应用开发者写的消息原样到达客户端**——显式的 `Abort`、（若你装了）你的 `PanicProcessor`、以及 `Validate` 返回的错误文本；**框架从内部拼出的消息永不回显**——非预期 panic 的原因、绑定失败的反射细节（参数名、Go 类型、strconv 详情），都只进服务端日志，客户端只拿通用 `500` / `400`。请求解析错误（坏 Content-Type、body 超限等）描述的是客户端自己的请求帧，不含内部标识，故原样回显。
-
-### `Abort(status int, msg string)`
-
-```go
-gbl.Get("/admin", func(c *gbl.Context) {
-    if !isAdmin(c) {
-        gbl.Abort(http.StatusForbidden, "forbidden") // status+msg 确实到达客户端
-    }
-    // ... 这里一个裸 panic 会是通用 500，细节被隐藏
-})
-```
-
-与裸 `panic` 不同，`Abort` 的消息保证到达客户端。（`Context` 上也有带状态/body 的 `Abort` 系列方法，见[第 7 节](#7context-详解)。）
+gbl 的错误策略按"**消息是谁写的**"划分回显权：**应用开发者写的消息原样到达客户端**——（若你装了）你的 `PanicProcessor`、以及 `Validate` 返回的错误文本；**框架从内部拼出的消息永不回显**——非预期 panic 的原因、绑定失败的反射细节（参数名、Go 类型、strconv 详情），都只进服务端日志，客户端只拿通用 `500` / `400`。请求解析错误（坏 Content-Type、body 超限等）描述的是客户端自己的请求帧，不含内部标识，故原样回显。
 
 ### `PanicProcessor` / `RegisterPanicProcessor` / `HttpStatus`
 
