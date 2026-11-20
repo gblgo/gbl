@@ -32,12 +32,12 @@ type engine struct {
 	routeMetaSlice []*routeMeta         // registrations queued before generateRoute
 	middlewares    []HandlerFunc        // global chain, merged with each group's at generation
 	panicProcessor PanicProcessor       // user hook that renders panic values
-	logger         Logger               // sink for internal and access logs; never nil
+	logger         Logger               // sink for internal logs; never nil
 	cfg            *Config              // runtime configuration; defaults overlaid by Configure
 	cors           *CorsConfig          // nil disables the CORS layer
 	astFileMap     map[string]*ast.File // parsed source files for parameter names
 	fest           *token.FileSet       // file set backing astFileMap
-	generated      bool                 // routes have been inserted into the trees
+	generated      bool                 // routes frozen into trees; also gates the read-only-after-Run contract
 	server         *http.Server         // live server, set by Run; nil before start
 	shutdownOnce   sync.Once            // collapse signal and manual shutdown
 	startMu        sync.Mutex           // guards listener/server assignment
@@ -76,6 +76,13 @@ func Shutdown(ctx context.Context) error { return defaultEngine.Shutdown(ctx) }
 
 // Run is the instance-level counterpart of the package-level Run.
 func (e *engine) Run() {
+	// The engine serves exactly once: a second Run would re-enter startup on a
+	// frozen route set, so it is a misuse of the same contract the assembling
+	// guards below enforce.
+	if e.generated {
+		panic("gbl.Run called twice; the engine serves only once")
+	}
+
 	// The configuration is whatever Configure left on the engine, defaults
 	// included. The kernel reads no file; an integration layer resolves its
 	// own sources and calls Configure before Run.
@@ -176,3 +183,19 @@ func (e *engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // shutdownGracePeriod is how long a signal-triggered shutdown waits for
 // in-flight requests before forcing connections closed.
 const shutdownGracePeriod = 5 * time.Second
+
+// assertAssembling is the engine's read-only-after-Run contract: route
+// registration, middleware, loggers, CORS, configuration, panic renderers and
+// size limits are all assembling-time decisions, merged into frozen structures
+// by generateRoute. Calling one of those setters afterward cannot take effect
+// (the chains are built, the handler is wired, the config is copied), so
+// instead of silently swallowing the call the engine fails fast: a wrong
+// registration ORDER is a programming error exactly like a wrong registration
+// CONTENT, and deserves the same loud treatment. The panic is raised without
+// the failStartup log because the process is past startup: the caller is a
+// running program holding a stack trace that names its own mistake.
+func (e *engine) assertAssembling(op string) {
+	if e.generated {
+		panic("gbl." + op + " must be called before Run; the engine is read-only while serving")
+	}
+}

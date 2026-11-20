@@ -29,10 +29,32 @@ var levelColor = map[string]string{
 	"ERROR": ansiRed,
 }
 
-// logMarker is the fixed prefix logLine puts before the level label. colorWriter
-// locates the level by finding it, so tinting never has to reparse the rest of
-// the line.
-var logMarker = []byte("gbl: ")
+// maxLevelScanTokens bounds the level-label scan. logLine always puts the
+// label first, and the standard logger's optional header precedes it with at
+// most date, time and file:line tokens. Stopping early also keeps an incidental
+// all-caps word in a message body from ever reaching the tint lookup.
+const maxLevelScanTokens = 4
+
+// findLevel locates the level label: the first whitespace-delimited token that
+// names a known level. It returns the label's byte range and its tint, and
+// reports false when the line carries none — a label-less line is a foreign
+// write (the startup banner, for example) and must pass through untouched.
+func findLevel(p []byte) (start, end int, ansi string, found bool) {
+	for offset, scanned := 0, 0; offset < len(p) && scanned < maxLevelScanTokens; scanned++ {
+		stop := offset
+		for stop < len(p) && p[stop] != ' ' && p[stop] != '\n' {
+			stop++
+		}
+		if color, ok := levelColor[string(p[offset:stop])]; ok {
+			return offset, stop, color, true
+		}
+		if stop == len(p) {
+			break
+		}
+		offset = stop + 1
+	}
+	return 0, 0, "", false
+}
 
 // colorBufPool recycles the scratch buffer colorWriter assembles a tinted line
 // in, so an enabled console adds no per-line allocation once warm.
@@ -62,19 +84,8 @@ func (c colorWriter) Write(p []byte) (int, error) {
 		return c.w.Write(p)
 	}
 
-	idx := bytes.Index(p, logMarker)
-	if idx < 0 {
-		return c.w.Write(p)
-	}
-	levelStart := idx + len(logMarker)
-	rel := bytes.IndexByte(p[levelStart:], ' ')
-	if rel < 0 {
-		return c.w.Write(p)
-	}
-	levelEnd := levelStart + rel
-
-	color, ok := levelColor[string(p[levelStart:levelEnd])]
-	if !ok {
+	levelStart, levelEnd, color, found := findLevel(p)
+	if !found {
 		return c.w.Write(p)
 	}
 
@@ -107,12 +118,20 @@ func isTerminal(f *os.File) bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }
 
+// noColorRequested reports whether the de facto NO_COLOR convention asks for
+// plain output: the variable is set and non-empty, whatever it holds.
+func noColorRequested() bool {
+	return os.Getenv("NO_COLOR") != null
+}
+
 // consoleWriter returns f wrapped in a colorWriter when f is a terminal that can
 // render ANSI, and f itself otherwise. On Windows the VT-processing mode must be
 // switched on first; if that fails the writer stays plain rather than leaking
-// raw escape codes into a console that would not interpret them.
+// raw escape codes into a console that would not interpret them. It is the
+// framework's own development aid for the default console, not an offered entry
+// point: users who integrate a logging component take that library's coloring.
 func consoleWriter(f *os.File) io.Writer {
-	if !isTerminal(f) {
+	if noColorRequested() || !isTerminal(f) {
 		return f
 	}
 	return colorWriter{w: f, enabled: enableConsoleVT(f)}

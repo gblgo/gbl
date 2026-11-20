@@ -16,7 +16,7 @@ import (
 // that renders it. The raw string's backticks preserve the alignment
 // byte-for-byte, so the box-drawing art stays intact without any escaping.
 var bannerArt = `  ┏━╸  ┏┓   ╻
-  ┃╺┓  ┣┻┓  ┃      zero-dependency Go web framework
+  ┃╺┓  ┣┻┓  ┃
   ┗━┛  ┗━┛  ┗━╸`
 
 // startupSuccessMessage is the one-line confirmation emitted right after the
@@ -66,9 +66,10 @@ func (e *engine) renderBanner(cfg *Config, addr net.Addr) string {
 	return strings.TrimRight(bannerArt, "\n") + "\n\n" + strings.Join(lines, "\n") + "\n"
 }
 
-// modulePath is gbl's own module path, matching go.mod. A library is compiled
-// into the consumer's binary as a dependency, not as the main module. This path
-// is the key for picking gbl's version out of the embedded build info.
+// modulePath is the module path of gbl itself, matching go.mod. A library is
+// compiled into the consumer's binary as a dependency, not as the main module.
+// This path is the key for picking the version of gbl out of the embedded
+// build info.
 const modulePath = "github.com/gblgo/gbl"
 
 // bannerVersion reports the framework version embedded in the running binary.
@@ -81,9 +82,9 @@ func bannerVersion() string {
 	return frameworkVersion(info)
 }
 
-// frameworkVersion extracts gbl's version from build info. When gbl is the main
-// module (its own examples and tests), it reads Main.Version. When gbl is a
-// dependency of the consumer's app, it reads gbl's entry in Deps, which carries
+// frameworkVersion extracts the version of gbl from build info. When gbl is the
+// main module (its own examples and tests), it reads Main.Version. When gbl is a
+// dependency of the consumer's app, it reads the gbl entry in Deps, which carries
 // the tagged version that app requires. A local or replaced build has no tag,
 // so it yields "(devel)".
 func frameworkVersion(info *debug.BuildInfo) string {

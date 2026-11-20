@@ -46,18 +46,15 @@ func (cc *CorsConfig) validate() error {
 // SetCorsConfig installs the CORS configuration on the default engine; Run
 // then wraps the handler chain with it. A nil configuration disables CORS.
 // A configuration rejected by this security policy (see validate) aborts
-// startup here, before Run.
+// startup here, before Run. Like every assembling API it panics once the
+// engine is serving: the handler chain has already been built.
 func SetCorsConfig(cc *CorsConfig) {
-	if cc != nil {
-		if err := cc.validate(); err != nil {
-			defaultEngine.failStartup(err)
-		}
-	}
-	defaultEngine.cors = cc
+	defaultEngine.UseCors(cc)
 }
 
 // UseCors installs the CORS configuration on this engine.
 func (e *engine) UseCors(cc *CorsConfig) *engine {
+	e.assertAssembling("SetCorsConfig")
 	if cc != nil {
 		if err := cc.validate(); err != nil {
 			e.failStartup(err)

@@ -22,8 +22,11 @@ func (e *engine) register(method httpMethod, path string, fn any) {
 
 // registerWith queues a route together with the middleware of the group it was
 // registered through; the engine's global middleware are merged in later, at
-// route-generation time.
+// route-generation time. The public verbs check the read-only-after-Run
+// contract themselves under their user-facing name; this assertion is the
+// internal backstop for any call site that bypasses them.
 func (e *engine) registerWith(method httpMethod, path string, fn any, mw []HandlerFunc) {
+	e.assertAssembling("registerWith")
 	e.routeMetaSlice = append(e.routeMetaSlice,
 		&routeMeta{
 			method: method,
@@ -36,6 +39,7 @@ func (e *engine) registerWith(method httpMethod, path string, fn any, mw []Handl
 
 // Get registers a handler for GET requests at path.
 func Get(path string, fn any) {
+	defaultEngine.assertAssembling("Get")
 	defaultEngine.register(methodGet, path, fn)
 }
 
@@ -44,30 +48,35 @@ func Get(path string, fn any) {
 // Registering it is optional: an unregistered HEAD automatically reuses the GET
 // route for the same path.
 func Head(path string, fn any) {
+	defaultEngine.assertAssembling("Head")
 	defaultEngine.register(methodHead, path, fn)
 }
 
 // Post registers a handler for POST requests at path. The request body is read
 // and bound according to its Content-Type.
 func Post(path string, fn any) {
+	defaultEngine.assertAssembling("Post")
 	defaultEngine.register(methodPost, path, fn)
 }
 
 // Put registers a handler for PUT requests at path. The request body is read and
 // bound according to its Content-Type.
 func Put(path string, fn any) {
+	defaultEngine.assertAssembling("Put")
 	defaultEngine.register(methodPut, path, fn)
 }
 
 // Patch registers a handler for PATCH requests at path. The request body is read
 // and bound according to its Content-Type.
 func Patch(path string, fn any) {
+	defaultEngine.assertAssembling("Patch")
 	defaultEngine.register(methodPatch, path, fn)
 }
 
 // Delete registers a handler for DELETE requests at path. Like GET, DELETE never
 // reads the request body; only path and query parameters bind.
 func Delete(path string, fn any) {
+	defaultEngine.assertAssembling("Delete")
 	defaultEngine.register(methodDelete, path, fn)
 }
 
@@ -77,6 +86,7 @@ func Delete(path string, fn any) {
 // header listing the methods the path really supports, so registering a handler
 // opts that path out of the automatic answer.
 func Options(path string, fn any) {
+	defaultEngine.assertAssembling("Options")
 	defaultEngine.register(methodOptions, path, fn)
 }
 
@@ -91,6 +101,7 @@ func Match(methods []string, path string, fn any) {
 
 // Match is the instance-level counterpart of package-level Match.
 func (e *engine) Match(methods []string, path string, fn any) {
+	e.assertAssembling("Match")
 	for _, name := range methods {
 		method, known := methodOf(name)
 		if !known {

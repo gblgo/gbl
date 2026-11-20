@@ -66,7 +66,7 @@ func (m httpMethod) isBodyMethod() bool {
 	return m == methodPost || m == methodPut || m == methodPatch
 }
 
-// routeHandler is a compiled route: the reflect handle to the user function,
+// routeHandler is a compiled route: the reflection handle to the user function,
 // the content type chosen for its return value, the recovered parameter names,
 // the precomputed bind plan and the frozen middleware chain. Built once in
 // generateRoute and reused verbatim by every matching request.
@@ -231,7 +231,8 @@ func (e *engine) generateRoute() {
 
 // resolveParamNames recovers a handler's parameter names from its own source file.
 //
-// reflect reports a function's parameter types but never its parameter names, and
+// The reflection package reports a function's parameter types but never its
+// parameter names, and
 // GBL binds request values by name, so the source recorded in the binary is parsed
 // once per file at startup. The handler is located by SOURCE POSITION, the line
 // the runtime reports for its entry point, not by symbol name. A runtime symbol
