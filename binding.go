@@ -37,7 +37,8 @@ type (
 	paramClass uint8
 
 	// structField is one settable (exported) field of a struct parameter,
-	// cached so bindStruct can skip reflect.Type field introspection per request.
+	// cached so bindStruct can skip reflection-based field introspection per
+	// request.
 	// name is the exact bind key: the JSON tag's name when present, else the Go
 	// field name with its first letter lowercased, so a lowercase request key
 	// binds to an exported PascalCase field without the user adding any tag.
@@ -60,7 +61,7 @@ type (
 		// writerOK is parallel to types, non-nil only when a parameter is a writer
 		// (classWriter): it records whether the pooled writer satisfies that
 		// parameter's type, decided once here so the request path injects without
-		// re-running the reflect package's interface-satisfaction probe.
+		// re-running the reflection package's interface-satisfaction probe.
 		writerOK []bool
 		// validatableIndexes is the subset of businessIndexes whose type (or its
 		// pointer) implements Validatable, precomputed here so a handler that does
@@ -99,13 +100,13 @@ var (
 	validatableType      = reflect.TypeFor[Validatable]()
 )
 
-// paramsPool recycles the reflect argument slice built per request. A pointer to
-// the slice is stored so Get/Put do not box the slice header.
+// paramsPool recycles the reflection argument slice built per request. A pointer
+// to the slice is stored so Get/Put do not box the slice header.
 var paramsPool = sync.Pool{
 	New: func() any { s := make([]reflect.Value, 0, 8); return &s },
 }
 
-// acquireParams returns a zeroed reflect argument slice of length n, reusing a
+// acquireParams returns a zeroed reflection argument slice of length n, reusing a
 // pooled backing array when it is large enough.
 func acquireParams(n int) (*[]reflect.Value, []reflect.Value) {
 	bufPool := paramsPool.Get().(*[]reflect.Value)
@@ -537,9 +538,9 @@ func bindStruct(t reflect.Type, src *nameSources) (reflect.Value, error) {
 }
 
 // bindStructFields populates a fresh struct of type t from a precomputed field
-// list, so the request path skips reflect.Type field introspection entirely. The
-// per-field precedence matches bindStruct: a path value wins over form/query, and
-// everything else falls through to bindFormParameter.
+// list, so the request path skips reflection-based field introspection entirely.
+// The per-field precedence matches bindStruct: a path value wins over
+// form/query, and everything else falls through to bindFormParameter.
 func bindStructFields(t reflect.Type, fields []structField, src *nameSources) (reflect.Value, error) {
 	result := reflect.New(t).Elem()
 
