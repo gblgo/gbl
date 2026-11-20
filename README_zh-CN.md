@@ -271,7 +271,7 @@ api.Get("/secret", func() string { return "top" })        // /api/secret
 
 ```go
 type RouteGroup interface {
-    Use(...HandlerFunc) RouteGroup
+    GroupUse(...HandlerFunc) RouteGroup
     Get(string, any) RouteGroup
     Head(string, any) RouteGroup
     Post(string, any) RouteGroup
@@ -282,7 +282,7 @@ type RouteGroup interface {
 }
 ```
 
-> 分组中间件有作用域：`Group("/admin").Use(...)` 只给**通过该分组注册的路由**跑，不会泄到同级的其他路由，也不会进引擎级 `Use` 链。
+> 分组中间件有作用域：`Group("/admin").GroupUse(...)` 只给**通过该分组注册的路由**跑，不会泄到同级的其他路由，也不会进引擎级 `Use` 链。
 
 ```go
 // 全局中间件：所有路由都会打这一行。
@@ -293,7 +293,7 @@ gbl.Use(func(c *gbl.Context) {
 
 // admin 分组专用守卫：只有 /admin/* 路由会跑它。
 admin := gbl.Group("/admin")
-admin.Use(func(c *gbl.Context) {
+admin.GroupUse(func(c *gbl.Context) {
     if c.Request.URL.Query().Get("token") != "secret" {
         c.AbortWithStatusString(http.StatusUnauthorized, "invalid token")
         return

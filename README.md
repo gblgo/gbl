@@ -315,7 +315,7 @@ api.Get("/secret", func() string { return "top" })        // /api/secret
 
 ```go
 type RouteGroup interface {
-    Use(...HandlerFunc) RouteGroup
+    GroupUse(...HandlerFunc) RouteGroup
     Get(string, any) RouteGroup
     Head(string, any) RouteGroup
     Post(string, any) RouteGroup
@@ -326,7 +326,7 @@ type RouteGroup interface {
 }
 ```
 
-> Group middleware is scoped: `Group("/admin").Use(...)` only runs for routes
+> Group middleware is scoped: `Group("/admin").GroupUse(...)` only runs for routes
 > **registered through that group** — it does not leak onto sibling routes or into
 > the engine-level `Use` chain.
 
@@ -339,7 +339,7 @@ gbl.Use(func(c *gbl.Context) {
 
 // Admin-only guard: only /admin/* routes run it.
 admin := gbl.Group("/admin")
-admin.Use(func(c *gbl.Context) {
+admin.GroupUse(func(c *gbl.Context) {
     if c.Request.URL.Query().Get("token") != "secret" {
         c.AbortWithStatusString(http.StatusUnauthorized, "invalid token")
         return
