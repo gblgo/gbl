@@ -124,7 +124,7 @@ func mergeFormBodyWins(query, body url.Values) url.Values {
 // an empty RawQuery; form lookups and mergeFormBodyWins already treat nil as "no
 // query values".
 func queryValues(r *http.Request) url.Values {
-	if r.URL.RawQuery == null {
+	if r.URL.RawQuery == empty {
 		return nil
 	}
 	return r.URL.Query()
@@ -167,7 +167,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 	}
 
 	contentTypeHeader := r.Header.Get(contentType)
-	if contentTypeHeader != null {
+	if contentTypeHeader != empty {
 		// Fast path: a bare "application/json" or "application/x-www-form-urlencoded"
 		// has no parameters, so it skips mime parsing. Anything else (charset,
 		// boundary, +json suffix) still goes through ParseMediaType.
@@ -204,6 +204,10 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 			}
 			return nil, nil, nil, false, err
 		}
+		if bodyBuf != nil && !hasNonWhitespace(bodyBuf.Bytes()) {
+			releaseBodyBuffer(bodyBuf)
+			return nil, nil, nil, false, errors.New("JSON body is empty")
+		}
 
 	case mediaType == multipartFormData:
 		memory := maxFileMemory.Load()
@@ -236,7 +240,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpM
 			}
 		}
 
-	case mediaType == xWwwFormUrlencoded || mediaType == null:
+	case mediaType == xWwwFormUrlencoded || mediaType == empty:
 		if err := r.ParseForm(); err != nil {
 			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 				return nil, nil, nil, false, requestBodyTooLargeError
