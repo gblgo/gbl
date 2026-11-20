@@ -89,14 +89,14 @@ func bannerVersion() string {
 // so it yields "(devel)".
 func frameworkVersion(info *debug.BuildInfo) string {
 	if info.Main.Path == modulePath {
-		if info.Main.Version != null {
+		if info.Main.Version != empty {
 			return info.Main.Version
 		}
 		return "(devel)"
 	}
 	for _, dep := range info.Deps {
 		if dep.Path == modulePath {
-			if dep.Version != null {
+			if dep.Version != empty {
 				return dep.Version
 			}
 			break
@@ -148,7 +148,7 @@ func displayHost(addr net.Addr) string {
 		return addr.String()
 	}
 	switch host {
-	case null, "0.0.0.0", "::", "[::]":
+	case empty, "0.0.0.0", "::":
 		host = "localhost"
 	}
 	return host + colon + port
