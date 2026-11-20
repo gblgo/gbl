@@ -37,7 +37,7 @@ function, type, interface and method, each with a runnable example.
 8. [Request-scoped values (`Get` / `Value` / `MustValue`)](#8-request-scoped-values-get--value--mustvalue)
 9. [Aborts & panic (`Abort` / `PanicProcessor` / `HttpStatus`)](#9-aborts--panic-abort--panicprocessor--httpstatus)
 10. [Validation (`Validatable`)](#10-validation-validatable)
-11. [Logging (`Logger` / `BannerLogger` / `NewStdLogger` / `SetLogger` / `AccessLog`)](#11-logging-logger--bannerlogger--newstdlogger--setlogger--accesslog)
+11. [Logging (`Logger` / `BannerLogger` / `SetLogger` / `Info` / `Warn` / `Error`)](#11-logging-logger--bannerlogger--setlogger--info--warn--error)
 12. [Upload limits (`ByteSize` / `SetMaxBodySize` / `SetMaxFileSize` / `SetMaxUploadFileSize`)](#12-upload-limits-bytesize--setmaxbodysize--setmaxfilesize--setmaxuploadfilesize)
 13. [CORS (`SetCorsConfig` / `CorsConfig`)](#13-cors-setcorsconfig--corsconfig)
 14. [Configuration (`Config` / `Configure`)](#14-configuration-config--configure)
@@ -466,7 +466,7 @@ gbl.Use(func(c *gbl.Context) {
 gbl.Get("/ping", func() string { return "pong" })
 
 // gbl.Use is variadic — install several links at once:
-gbl.Use(recoverer, requestID, gbl.AccessLog)
+gbl.Use(recoverer, requestID)
 ```
 
 The middleware chain, in order: engine-level `Use` (outermost) → group `Use` →
@@ -586,6 +586,12 @@ in-flight requests get a window to finish). Any fatal startup error panics.
 gbl.Get("/hi", func() string { return "hi" })
 gbl.Run() // port from Configure, default :9801
 ```
+
+> **The engine is read-only while serving.** `Run` freezes every assembling
+> decision — route registration, `Use`, `SetLogger`, `Configure`, CORS, size
+> limits and the panic processor. Calling any of them after `Run` (or calling
+> `Run` twice) panics with an explicit *"must be called before Run"* message
+> instead of being silently swallowed.
 
 ### `Shutdown(ctx context.Context) error`
 
@@ -814,12 +820,30 @@ detail in the server log (see section 9).
 
 ---
 
-## 11. Logging (`Logger` / `BannerLogger` / `NewStdLogger` / `SetLogger` / `AccessLog`)
+## 11. Logging (`Logger` / `BannerLogger` / `SetLogger` / `Info` / `Warn` / `Error`)
 
-Every internal message (recovered panic, binding failure, access line) is
-routed through the engine `Logger`, so destination/format are the application's
-choice. The default writes `gbl: LEVEL msg k=v` through the standard `log`
-package (and tints the level on a real terminal; plain text when redirected).
+Two sources, one exit. Every message the framework emits internally (a
+recovered panic, a binding failure, a startup abort) and every business line
+written through `gbl.Info` / `gbl.Warn` / `gbl.Error` flows through the single
+`Logger` installed on the engine. Destination, format and coloring are then
+entirely the sink's business.
+
+### The default console (a development aid)
+
+Until you call `SetLogger`, framework and facade logs print to the console:
+
+```
+2026-11-20 16:12:38 INFO started port=9801
+```
+
+* Shape: `LEVEL msg key=value ...` behind the standard date/time prefix.
+* The level word is tinted on a real terminal — green `INFO`, yellow `WARN`,
+  red `ERROR`. Piped, redirected or CI output stays plain text, and setting
+  the `NO_COLOR` environment variable opts out even on a terminal.
+* The default sink is a **private** `log.Logger`: the global standard-library
+  logger is never touched. Your `log.SetOutput` / `log.SetFlags` calls do not
+  move or restyle framework lines, and framework logging never captures or
+  colors your own `log.Println` output. The two channels are fully isolated.
 
 ### `Logger`
 
@@ -833,6 +857,7 @@ type Logger interface {
 
 `msg` describes the event, then alternating key/value pairs. A structured
 backend (zap/slog) consumes them directly; the default keeps a plain-text shape.
+This interface is *the* integration contract: implement it, install it, done.
 
 ### `SetLogger`
 
@@ -840,14 +865,24 @@ backend (zap/slog) consumes them directly; the default keeps a plain-text shape.
 gbl.SetLogger(myLogger)   // nil is ignored, so a working logger always remains
 ```
 
-To adapt an existing `*log.Logger` (your own writer/flags/prefix) without
-implementing the interface, use `NewStdLogger`:
+Like every assembling API it must run **before `Run`** (the engine is read-only
+while serving, §6). Integrating zap/slog/zerolog is a thin adapter that
+forwards `msg` and the pairs to your logger instance — style decisions
+(whether the level word appears in the text at all) belong to that library.
+
+### `Info` / `Warn` / `Error` (business entry)
 
 ```go
-// func NewStdLogger(l *log.Logger) Logger
-myLogger := log.New(os.Stdout, "app ", log.LstdFlags|log.Lmsgprefix)
-gbl.SetLogger(gbl.NewStdLogger(myLogger))
+gbl.Get("/user", func(id string) string {
+    gbl.Info("user loaded", "id", id) // → the engine's installed Logger
+    return fetch(id)
+})
 ```
+
+The package-level trio is the ergonomic entry for business code: once a logger
+is injected with `SetLogger` it is the framework's sink, and calling through
+these functions needs no reference to keep or fetch. Framework-internal events
+use the same exit, so one install decides where *all* logs land.
 
 ### `BannerLogger` (optional)
 
@@ -874,31 +909,48 @@ func (l appLogger) Banner(block string) {   // optional companion
 gbl.SetLogger(appLogger{})
 ```
 
-### `AccessLog`
+### Request monitoring is yours
 
-A ready-made middleware: one line per request (method, path, status, size,
-duration), written through the engine `Logger`.
+The framework ships no access-log middleware on purpose. Watching how APIs are
+called is an application concern, and the chain already gives you everything
+one line of middleware needs — install your own:
 
 ```go
-gbl.Use(gbl.AccessLog)
+gbl.Use(func(c *Context) {
+    start := time.Now()
+    c.Next()
+    gbl.Info("access", "path", c.Request.URL.Path,
+        "status", c.StatusCode(), "size", c.Size(), "cost", time.Since(start))
+})
 ```
 
 ### File logging (integration example)
 
-The framework itself prints **only to the console**. To write files, install a
-`Logger` pointed at a file:
+The framework itself prints **only to the console**. To write files, implement
+the interface against any writer — for instance the standard `log` package
+pointed at a file:
 
 ```go
+type fileLogger struct{ l *log.Logger }
+
+func (s fileLogger) Info(msg string, kv ...any)  { s.emit("INFO", msg, kv) }
+func (s fileLogger) Warn(msg string, kv ...any)  { s.emit("WARN", msg, kv) }
+func (s fileLogger) Error(msg string, kv ...any) { s.emit("ERROR", msg, kv) }
+
+func (s fileLogger) emit(level, msg string, kv []any) {
+    s.l.Printf("%s %s %v", level, msg, kv)
+}
+
 f, err := os.OpenFile("app.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 if err != nil {
     log.Fatal(err)
 }
-gbl.SetLogger(gbl.NewStdLogger(log.New(f, "", log.LstdFlags)))
+gbl.SetLogger(fileLogger{l: log.New(f, "", log.LstdFlags)})
 ```
 
-For console + file, use `io.MultiWriter(os.Stdout, f)`. Rotation, per-level
-files and richer routing belong to a zap/slog adapter — or the future gbl-boot
-integration layer; the kernel ships no built-in file logging.
+Rotation, per-level files, console+file fan-out and richer routing belong to a
+zap/slog adapter — or the future gbl-boot integration layer; the kernel ships no
+built-in file logging.
 
 ---
 
