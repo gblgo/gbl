@@ -607,7 +607,6 @@ c.Request // *http.Request —— 原始入站请求
 | `Next()` | 执行链上剩余部分（到末端即 handler） |
 | `PathParam(name) string` | 按名字取匹配到的路径参数（供中间件用；业务 handler 请按名绑定） |
 | `Set(key, value)` / `Get(key) (any, bool)` | 请求级取值（类型化便利：`Value` / `MustValue`，见 §8） |
-| `Status(code int)` | 记录响应状态（首次写入时才真正落到线上） |
 | `Result() any` | handler 返回值的 `any` 形态（`Next()` 之后有效）；首次读取时才做装箱 |
 | `IsWritten() bool` | body 是否已提交 |
 | `StatusCode() int` | 将要/已经发送的状态码（默认 200） |

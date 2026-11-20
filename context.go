@@ -166,10 +166,6 @@ func (c *Context) Size() int {
 	return 0
 }
 
-// Status records the response status. Like net/http it reaches the wire on the
-// first write, so a status set before c.Next() survives into the rendered result.
-func (c *Context) Status(code int) { c.writer.WriteHeader(code) }
-
 // PathParam returns a matched path parameter by name. It is meant for middleware,
 // which has no automatic binding; a business handler should bind path parameters
 // by naming its arguments instead.

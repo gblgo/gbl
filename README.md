@@ -747,7 +747,6 @@ c.Request // *http.Request — the inbound request
 | `Next()` | run the remaining chain (and the handler at its end) |
 | `PathParam(name) string` | a matched path parameter by name (for middleware; handlers bind path params by name) |
 | `Set(key, value)` / `Get(key) (any, bool)` | request-scoped values (typed helpers: `Value` / `MustValue`, §8) |
-| `Status(code int)` | record the response status (reaches the wire on first write) |
 | `Result() any` | the handler's return value as `any` (valid after `Next()`); the boxing happens once, on first read |
 | `IsWritten() bool` | whether a body has already been committed |
 | `StatusCode() int` | the status that will be / was sent (200 default) |
