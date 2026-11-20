@@ -29,11 +29,11 @@ type PanicProcessor func(err any) (any, HttpStatus)
 // not echoing internal errors. It is an assembling decision and panics once
 // the engine is serving.
 func RegisterPanicProcessor(p PanicProcessor) {
-	defaultEngine.SetPanicProcessor(p)
+	defaultEngine.setPanicProcessor(p)
 }
 
-// SetPanicProcessor installs the panic renderer on this engine.
-func (e *engine) SetPanicProcessor(p PanicProcessor) *engine {
+// setPanicProcessor installs the panic renderer on this engine.
+func (e *engine) setPanicProcessor(p PanicProcessor) *engine {
 	e.assertAssembling("RegisterPanicProcessor")
 	e.panicProcessor = p
 	return e
@@ -42,19 +42,11 @@ func (e *engine) SetPanicProcessor(p PanicProcessor) *engine {
 // responseAbort is the panic value used to end a request early with a specific
 // status and a message that is safe to send to the client. The framework raises
 // it for its own answers (404, 405, 413, 501, request-parse and serialization
-// failures); Abort raises it on the user's behalf. Any other recovered value is
-// treated as an unexpected crash and never echoed to the client.
+// failures). Any other recovered value is treated as an unexpected crash and
+// never echoed to the client.
 type responseAbort struct {
 	status int
 	body   string
-}
-
-// Abort ends the current request immediately, returning the given status and a
-// plain-text body to the client. It must be called from within a handler or
-// middleware. Unlike a bare panic, the message is guaranteed to reach the
-// client; a panic of any other value yields a generic 500.
-func Abort(status int, msg string) {
-	panic(responseAbort{status: status, body: msg})
 }
 
 // abort raises an internal responseAbort panic. Every framework-generated halt
@@ -92,7 +84,7 @@ func errorWriteback(w http.ResponseWriter, err any) []byte {
 	case reflect.Pointer, reflect.Interface:
 		// A nil pointer/interface has no element to unwrap.
 		if val.IsNil() {
-			return []byte(null)
+			return []byte(empty)
 		}
 		// Unwrap one layer and return the result, passing the element value
 		// itself rather than the reflection wrapper around it.

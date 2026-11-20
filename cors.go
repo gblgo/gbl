@@ -49,11 +49,11 @@ func (cc *CorsConfig) validate() error {
 // startup here, before Run. Like every assembling API it panics once the
 // engine is serving: the handler chain has already been built.
 func SetCorsConfig(cc *CorsConfig) {
-	defaultEngine.UseCors(cc)
+	defaultEngine.useCors(cc)
 }
 
-// UseCors installs the CORS configuration on this engine.
-func (e *engine) UseCors(cc *CorsConfig) *engine {
+// useCors installs the CORS configuration on this engine.
+func (e *engine) useCors(cc *CorsConfig) *engine {
 	e.assertAssembling("SetCorsConfig")
 	if cc != nil {
 		if err := cc.validate(); err != nil {
@@ -66,7 +66,7 @@ func (e *engine) UseCors(cc *CorsConfig) *engine {
 
 // isPreflightRequest reports whether r is a CORS preflight request.
 func isPreflightRequest(r *http.Request) bool {
-	return r.Method == http.MethodOptions && r.Header.Get(accessControlRequestMethod) != null
+	return r.Method == http.MethodOptions && r.Header.Get(accessControlRequestMethod) != empty
 }
 
 // corsHandler is the http.Handler inserted outside the engine when a CorsConfig
@@ -75,54 +75,61 @@ func isPreflightRequest(r *http.Request) bool {
 type corsHandler struct {
 	engine *engine
 	config *CorsConfig
-	// Fixed header values precomputed once at wiring time, so the request path
-	// never re-joins or re-formats static configuration per response or preflight.
 	allowMethods  string
 	allowHeaders  string
 	exposeHeaders string
 	maxAge        string
-	// wildcard records whether AllowedOrigins contains "*", and expose whether
-	// any ExposedHeaders are configured. Both are resolved once here so the
-	// request path never rescans the origin list or rechecks the slice length.
 	wildcard bool
 	expose   bool
+	allowedOriginsMap map[string]struct{}
+	allowedMethodsMap map[string]struct{}
+	allowedHeadersMap map[string]struct{}
 }
 
-// newCorsHandler wires the CORS layer over e, precomputing the header values that
-// stay constant for the lifetime of the configuration.
+// newCorsHandler wires the CORS layer over e, precomputing the header values and
+// allow-list maps that stay constant for the lifetime of the configuration.
 func newCorsHandler(e *engine, cc *CorsConfig) *corsHandler {
 	var maxAge string
 	if cc.MaxAge > 0 {
 		maxAge = strconv.FormatInt(int64(cc.MaxAge.Seconds()), 10)
 	}
 	var wildcard bool
+	originsMap := make(map[string]struct{}, len(cc.AllowedOrigins))
 	for _, origin := range cc.AllowedOrigins {
-		if strings.EqualFold(origin, asterisk) {
+		lower := strings.ToLower(origin)
+		originsMap[lower] = struct{}{}
+		if lower == asterisk {
 			wildcard = true
-			break
 		}
 	}
+	methodsMap := make(map[string]struct{}, len(cc.AllowedMethods))
+	for _, m := range cc.AllowedMethods {
+		methodsMap[strings.ToLower(m)] = struct{}{}
+	}
+	headersMap := make(map[string]struct{}, len(cc.AllowedHeaders))
+	for _, h := range cc.AllowedHeaders {
+		headersMap[strings.ToLower(h)] = struct{}{}
+	}
 	return &corsHandler{
-		engine:        e,
-		config:        cc,
-		allowMethods:  strings.Join(cc.AllowedMethods, headerComma),
-		allowHeaders:  strings.Join(cc.AllowedHeaders, headerComma),
-		exposeHeaders: strings.Join(cc.ExposedHeaders, headerComma),
-		maxAge:        maxAge,
-		wildcard:      wildcard,
-		expose:        len(cc.ExposedHeaders) > 0,
+		engine:            e,
+		config:            cc,
+		allowMethods:      strings.Join(cc.AllowedMethods, headerComma),
+		allowHeaders:      strings.Join(cc.AllowedHeaders, headerComma),
+		exposeHeaders:     strings.Join(cc.ExposedHeaders, headerComma),
+		maxAge:            maxAge,
+		wildcard:          wildcard,
+		expose:            len(cc.ExposedHeaders) > 0,
+		allowedOriginsMap: originsMap,
+		allowedMethodsMap: methodsMap,
+		allowedHeadersMap: headersMap,
 	}
 }
 
-// contains reports whether target matches any value, case-insensitively. It
-// backs the origin/method/header allow-lists.
-func (ch *corsHandler) contains(values []string, target string) bool {
-	for _, value := range values {
-		if strings.EqualFold(value, target) {
-			return true
-		}
-	}
-	return false
+// containsInMap reports whether target matches any key in the precomputed map,
+// case-insensitively.
+func containsInMap(m map[string]struct{}, target string) bool {
+	_, ok := m[strings.ToLower(target)]
+	return ok
 }
 
 // matchOrigin resolves the Access-Control-Allow-Origin value for an origin and
@@ -132,65 +139,47 @@ func (ch *corsHandler) contains(values []string, target string) bool {
 func (ch *corsHandler) matchOrigin(origin string) (string, bool) {
 	if ch.wildcard {
 		if ch.config.AllowCredentials {
-			return null, false
+			return empty, false
 		}
-		// The literal "*" must reach the browser: an empty
-		// Access-Control-Allow-Origin value fails the CORS check exactly like a
-		// missing one, so returning "" here silently rejected every cross-origin
-		// response.
 		return asterisk, true
 	}
-
-	// Compared case-insensitively, consistent with the wildcard check above.
-	if ch.contains(ch.config.AllowedOrigins, origin) {
+	if containsInMap(ch.allowedOriginsMap, origin) {
 		return origin, true
 	}
-
-	return null, false
+	return empty, false
 }
 
 // handlePreflight answers a CORS preflight request.
 func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
-
 	header := w.Header()
-	// The method the browser intends to use.
 	requestMethod := r.Header.Get(accessControlRequestMethod)
 
-	if !ch.contains(ch.config.AllowedMethods, requestMethod) {
+	if !containsInMap(ch.allowedMethodsMap, requestMethod) {
 		http.Error(w, corsMethodNotAllowed, http.StatusForbidden)
 		return
 	}
 
-	// Get the headers of the browser request
 	requestHeaders := r.Header.Get(accessControlRequestHeaders)
-
-	if requestHeaders != null {
+	if requestHeaders != empty {
 		for h := range strings.SplitSeq(requestHeaders, comma) {
 			h = strings.TrimSpace(h)
-
-			if h == null {
+			if h == empty {
 				continue
 			}
-
-			if !ch.contains(ch.config.AllowedHeaders, h) {
+			if !containsInMap(ch.allowedHeadersMap, h) {
 				http.Error(w, corsHeaderNotAllowed, http.StatusForbidden)
 				return
 			}
 		}
 	}
 
-	// Set preflight response headers
 	header.Set(accessControlAllowMethods, ch.allowMethods)
-
 	header.Set(accessControlAllowHeaders, ch.allowHeaders)
-
-	if ch.maxAge != null {
+	if ch.maxAge != empty {
 		header.Set(accessControlMaxAge, ch.maxAge)
 	}
-
 	header.Add(vary, accessControlRequestMethod)
 	header.Add(vary, accessControlRequestHeaders)
-
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -202,7 +191,7 @@ func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	origin := strings.TrimSpace(r.Header.Get(headerOrigin))
 
 	// Non-cross-origin request
-	if origin == null {
+	if origin == empty {
 		ch.engine.serveHTTP(w, r)
 		return
 	}

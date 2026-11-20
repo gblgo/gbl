@@ -90,12 +90,12 @@ type routeHandler struct {
 // no marker in the middle ("a:b", "a{b"), and no empty name (":", "{}"). Any
 // violation aborts startup; the reason is logged through the engine before the
 // panic, so a bad registration stays explainable after deploy. In the error
-// texts "***" stands for any offending characters.
+// texts `***` stands for any offending characters.
 func (e *engine) dealPath(path string) ([]segmentMeta, string) {
 
 	path = strings.TrimSpace(path)
 
-	if path == null {
+	if path == empty {
 		e.failStartup("when registering a route, the path cannot be empty")
 	}
 
@@ -104,7 +104,7 @@ func (e *engine) dealPath(path string) ([]segmentMeta, string) {
 	segments := make([]string, 0, len(parts))
 
 	for _, part := range parts {
-		if part == null {
+		if part == empty {
 			continue
 		}
 		meta := segmentMeta{segment: part, isVar: false}
@@ -124,7 +124,7 @@ func (e *engine) dealPath(path string) ([]segmentMeta, string) {
 			e.failStartup("when registering a route, the path cannot be '/}' or '/}***}***}' or '/}}', etc")
 		}
 
-		if strings.TrimSuffix(strings.TrimPrefix(part, leftCurlyBrace), rightCurlyBrace) == null {
+		if strings.TrimSuffix(strings.TrimPrefix(part, leftCurlyBrace), rightCurlyBrace) == empty {
 			e.failStartup("when registering a route, the path cannot be '/{}'")
 		}
 
@@ -337,7 +337,7 @@ func normalizeParamNames(names []string, count int) []string {
 		if i < len(names) {
 			normalized[i] = names[i]
 		}
-		if normalized[i] == null {
+		if normalized[i] == empty {
 			normalized[i] = unnamedParamName(i)
 		}
 	}

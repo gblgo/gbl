@@ -121,7 +121,7 @@ func isTerminal(f *os.File) bool {
 // noColorRequested reports whether the de facto NO_COLOR convention asks for
 // plain output: the variable is set and non-empty, whatever it holds.
 func noColorRequested() bool {
-	return os.Getenv("NO_COLOR") != null
+	return os.Getenv("NO_COLOR") != empty
 }
 
 // consoleWriter returns f wrapped in a colorWriter when f is a terminal that can

@@ -66,16 +66,16 @@ func newEngine() *engine {
 // On SIGINT or SIGTERM it performs a graceful shutdown instead of exiting
 // abruptly: the listener closes and in-flight requests get a window to finish.
 // Any fatal startup error panics, matching the framework's existing contract.
-func Run() { defaultEngine.Run() }
+func Run() { defaultEngine.run() }
 
 // Shutdown gracefully stops the server started by Run, waiting for active
 // requests until ctx expires. It is safe to call more than once and from
 // another goroutine than Run; calling it before Run returns "http: Server
 // closed".
-func Shutdown(ctx context.Context) error { return defaultEngine.Shutdown(ctx) }
+func Shutdown(ctx context.Context) error { return defaultEngine.shutdown(ctx) }
 
-// Run is the instance-level counterpart of the package-level Run.
-func (e *engine) Run() {
+// run is the instance-level counterpart of the package-level Run.
+func (e *engine) run() {
 	// The engine serves exactly once: a second Run would re-enter startup on a
 	// frozen route set, so it is a misuse of the same contract the assembling
 	// guards below enforce.
@@ -124,7 +124,7 @@ func (e *engine) Run() {
 		case <-stop:
 			ctx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
 			defer cancel()
-			_ = e.Shutdown(ctx)
+			_ = e.shutdown(ctx)
 		case <-done:
 		}
 	}()
@@ -150,8 +150,8 @@ func (e *engine) Run() {
 	}
 }
 
-// Shutdown is the instance-level counterpart of the package-level Shutdown.
-func (e *engine) Shutdown(ctx context.Context) error {
+// shutdown is the instance-level counterpart of the package-level Shutdown.
+func (e *engine) shutdown(ctx context.Context) error {
 	e.startMu.Lock()
 	server := e.server
 	e.startMu.Unlock()

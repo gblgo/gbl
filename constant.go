@@ -24,7 +24,7 @@ const (
 // are single-sourced rather than scattered across the code: delimiter/empty
 // shortcuts, HTTP header names, media types and fixed error/response texts.
 const (
-	null                          = ""
+	empty                         = ""
 	slash                         = "/"
 	colon                         = ":"
 	comma                         = ","
@@ -40,7 +40,7 @@ const (
 	xWwwFormUrlencoded            = "application/x-www-form-urlencoded"
 	applicationJson               = "application/json"
 	applicationJsonCharset        = "application/json; charset=utf-8"
-	applicationNoJson             = "application/"
+	applicationPrefix             = "application/"
 	plusSignJson                  = "+json"
 	contentType                   = "Content-Type"
 	allow                         = "Allow"
@@ -56,7 +56,6 @@ const (
 	corsMethodNotAllowed          = "CORS method not allowed"
 	corsHeaderNotAllowed          = "CORS header not allowed"
 	responseSerializationFailed   = "response serialization failed"
-	unknownHTTPMethodPrefix       = "unknown http method: "
 	injectParameterErrFormat      = "inject parameter %q: %w"
 	jsonParameterErrFormat        = "JSON parameter %q: %w"
 )

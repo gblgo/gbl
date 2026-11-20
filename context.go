@@ -37,27 +37,36 @@ var routeEndpoint HandlerFunc = func(c *Context) { c.invokeHandler() }
 //
 // A Context is pooled. It must not be retained past the request that produced
 // it, exactly like the response writer it holds.
+//
+// Field order is optimized for memory alignment: larger fields (slices, interfaces)
+// come first, smaller scalars (bool, uint8) are grouped at the end to minimize padding.
 type Context struct {
+	// 24-byte fields (slice header, reflect.Value, struct with 3 maps)
+	handlers []HandlerFunc // this route's merged chain, including the terminal endpoint
+	bytes    []byte        // serialized handler result
+	ret      reflect.Value // handler's first return, boxed lazily by Result
+	src      nameSources   // per-request by-name binding sources; primed in injectedParameters
+
+	// 16-byte fields (interface = type + data pointer, string = pointer + len)
 	// writer is the framework's pooled response sink. It stays unexported:
 	// handlers own the response by declaring an http.ResponseWriter parameter,
 	// and it must never be stored beyond the request.
-	writer responseWriter
-	// Request is the inbound HTTP request.
-	Request *http.Request
+	writer      responseWriter
+	contentType string // result content type chosen at registration
+	result      any    // memoized boxed ret, filled only once Result is called
+	logger      Logger // engine's log sink, so middleware logging honors SetLogger
 
-	handlers    []HandlerFunc // this route's merged chain, including the terminal endpoint
+	// 8-byte fields (pointers, int, map)
+	Request     *http.Request
 	index       int           // cursor into handlers; abortIndex means "stopped"
 	params      map[string]string
 	rh          *routeHandler
-	method      httpMethod
 	keys        map[string]any
-	bytes       []byte        // serialized handler result
-	contentType string        // result content type chosen at registration
-	ret         reflect.Value // handler's first return, boxed lazily by Result
-	result      any           // memoized boxed ret, filled only once Result is called
-	handled     bool          // the handler actually ran
-	logger      Logger        // engine's log sink, so middleware logging honors SetLogger
-	src         nameSources   // per-request by-name binding sources; primed in injectedParameters
+	responseBuf *bytes.Buffer // pooled buffer for handler result serialization, released after Write
+
+	// 1-byte fields (grouped at end to minimize padding)
+	method  httpMethod
+	handled bool // the handler actually ran
 }
 
 // contextPool recycles Context objects across requests.
@@ -90,6 +99,7 @@ func newContext(w *pooledResponseWriter,
 	c.handled = false
 	c.logger = logger
 	c.src = nameSources{}
+	c.responseBuf = nil
 	return c
 }
 
@@ -108,6 +118,7 @@ func (c *Context) recycle() {
 	c.ret = reflect.Value{}
 	c.logger = nil
 	c.src = nameSources{}
+	c.responseBuf = nil
 	contextPool.Put(c)
 }
 
@@ -194,36 +205,26 @@ func (c *Context) Result() any {
 	return c.result
 }
 
-// String writes a plain-text body with the given status.
-func (c *Context) String(status int, body string) {
+// AbortWithStatusString denies the request with a plain-text body and stops the chain.
+func (c *Context) AbortWithStatusString(status int, body string) {
 	c.writer.Header().Set(contentType, textPlainCharset)
 	c.writer.WriteHeader(status)
 	_, _ = c.writer.Write([]byte(body))
-}
-
-// JSON writes a JSON body with the given status. A marshaling failure is a
-// server-side fault, so it aborts with a generic 500 rather than echoing detail.
-func (c *Context) JSON(status int, value any) {
-	data, err := json.Marshal(value)
-	if err != nil {
-		abort(http.StatusInternalServerError, responseSerializationFailed)
-	}
-	c.writer.Header().Set(contentType, applicationJsonCharset)
-	c.writer.WriteHeader(status)
-	_, _ = c.writer.Write(data)
-}
-
-// AbortWithStatus denies the request with a status and no-body, flushing the
-// status immediately since no further write will follow.
-func (c *Context) AbortWithStatus(status int) {
-	c.writer.WriteHeader(status)
-	c.writer.writeHeader()
 	c.Abort()
 }
 
 // AbortWithStatusJSON denies the request with a JSON body and stops the chain.
-func (c *Context) AbortWithStatusJSON(status int, value any) {
-	c.JSON(status, value)
+// A marshaling failure is a server-side fault, so it aborts with a generic 500
+// rather than echoing detail.
+func (c *Context) AbortWithStatusJSON(status int, body any) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		abort(http.StatusInternalServerError, responseSerializationFailed)
+		return
+	}
+	c.writer.Header().Set(contentType, applicationJsonCharset)
+	c.writer.WriteHeader(status)
+	_, _ = c.writer.Write(data)
 	c.Abort()
 }
 
@@ -251,13 +252,13 @@ func MustValue[T any](c *Context, key string) T {
 }
 
 // Use appends global middleware to the default engine.
-func Use(middleware ...HandlerFunc) { defaultEngine.Use(middleware...) }
+func Use(middleware ...HandlerFunc) { defaultEngine.use(middleware...) }
 
-// Use appends middleware that run for every route on this engine. They are
+// use appends middleware that run for every route on this engine. They are
 // combined with each route group's middleware at route-generation time, the
 // engine's running outermost. Register all middleware before Run; calling Use
 // afterward panics, because every route chain is already frozen.
-func (e *engine) Use(middleware ...HandlerFunc) *engine {
+func (e *engine) use(middleware ...HandlerFunc) *engine {
 	e.assertAssembling("Use")
 	e.middlewares = append(e.middlewares, middleware...)
 	return e
@@ -321,12 +322,17 @@ func (c *Context) invokeHandler() {
 		releaseParams(paramsBuf, in)
 	}
 	if len(out) > 0 {
-		c.bytes, err = convertToByteArray(out[0])
+		buf := responseBufferPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		err = convertToBuffer(buf, out[0])
 		if err != nil {
+			responseBufferPool.Put(buf)
 			// Serialization failures are server side: only the fixed text leaks.
 			abort(http.StatusInternalServerError, responseSerializationFailed)
 			return
 		}
+		c.bytes = buf.Bytes()
+		c.responseBuf = buf
 		// Retain the raw return; Result boxes it only if a middleware asks.
 		c.ret = out[0]
 	}

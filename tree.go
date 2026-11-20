@@ -49,7 +49,7 @@ func newNode(segment string) *routeNode {
 // caller rejects that.
 func hasSameRoute(node *routeNode, segments []segmentMeta, index int) (bool, string) {
 	if node == nil {
-		return false, null
+		return false, empty
 	}
 
 	if index == len(segments) {
@@ -64,7 +64,7 @@ func hasSameRoute(node *routeNode, segments []segmentMeta, index int) (bool, str
 				return true, path
 			}
 		}
-		return false, null
+		return false, empty
 	}
 
 	next := node.staticNode[meta.segment]
@@ -79,7 +79,7 @@ func (e *engine) insertNode(segmentMetas []segmentMeta, path string, method http
 
 	// Get the root node of the corresponding method
 	root := e.roots[method]
-	// Check if the root node is null
+	// Check if the root node is nil
 	if root == nil {
 		root = newNode(slash)
 		e.roots[method] = root
@@ -197,11 +197,11 @@ func (e *engine) matchNode(method httpMethod, path string, params map[string]str
 // This runs on the 404/405 path only, so the extra tree walks are affordable.
 func (e *engine) allowFor(path string) []string {
 	reachable := make([]bool, methodCount)
+	scratch := make(map[string]string, 4)
 
 	for m := range methodCount {
-		// A fresh map per probe: searchNode cleans up after a failed branch, but
-		// nothing here should depend on that.
-		if e.matchNode(m, path, make(map[string]string)) != nil {
+		clear(scratch)
+		if e.matchNode(m, path, scratch) != nil {
 			reachable[m] = true
 		}
 	}

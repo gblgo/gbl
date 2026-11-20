@@ -25,8 +25,6 @@ type RouteGroup interface {
 	Delete(string, any) RouteGroup
 	// Options registers an OPTIONS handler under the group's prefix.
 	Options(string, any) RouteGroup
-	// Match registers the handler for exactly the named methods under the prefix.
-	Match([]string, string, any) RouteGroup
 }
 
 // routeGroup is the concrete RouteGroup: it remembers the engine it came from,
@@ -40,11 +38,11 @@ type routeGroup struct {
 // Group returns a route group on the default engine; every path registered
 // through it is prefixed with group.
 func Group(group string) RouteGroup {
-	return defaultEngine.Group(group)
+	return defaultEngine.group(group)
 }
 
-// Group is the instance-level counterpart of package-level Group.
-func (e *engine) Group(group string) RouteGroup {
+// group is the instance-level counterpart of package-level Group.
+func (e *engine) group(group string) RouteGroup {
 	return &routeGroup{engine: e, group: group}
 }
 
@@ -96,17 +94,5 @@ func (rg *routeGroup) Delete(path string, fn any) RouteGroup {
 func (rg *routeGroup) Options(path string, fn any) RouteGroup {
 	rg.engine.assertAssembling("Group.Options")
 	rg.engine.registerWith(methodOptions, rg.group+path, fn, rg.middlewares)
-	return rg
-}
-
-func (rg *routeGroup) Match(methods []string, path string, fn any) RouteGroup {
-	rg.engine.assertAssembling("Group.Match")
-	for _, name := range methods {
-		method, known := methodOf(name)
-		if !known {
-			rg.engine.failStartup(unknownHTTPMethodPrefix + name)
-		}
-		rg.engine.registerWith(method, rg.group+path, fn, rg.middlewares)
-	}
 	return rg
 }

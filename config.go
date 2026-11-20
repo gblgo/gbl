@@ -50,18 +50,18 @@ func defaultConfig() *Config {
 //	})
 //
 // Call it before Run. Passing nil is a no-op.
-func Configure(fn func(*Config)) { defaultEngine.Configure(fn) }
+func Configure(fn func(*Config)) { defaultEngine.configure(fn) }
 
-// Configure overlays this engine's configuration. After fn returns, useTLS is
+// configure overlays this engine's configuration. After fn returns, useTLS is
 // re-derived from the certificate and key paths, so setting or clearing either
 // path takes effect without a separate switch. Once the engine runs its
 // configuration snapshot is in effect on the live server and re-Configure
 // panics: it could no longer change what is already serving.
-func (e *engine) Configure(fn func(*Config)) *engine {
+func (e *engine) configure(fn func(*Config)) *engine {
 	e.assertAssembling("Configure")
 	if fn != nil {
 		fn(e.cfg)
-		e.cfg.useTLS = e.cfg.CertFile != null && e.cfg.KeyFile != null
+		e.cfg.useTLS = e.cfg.CertFile != empty && e.cfg.KeyFile != empty
 	}
 	return e
 }

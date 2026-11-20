@@ -89,24 +89,3 @@ func Options(path string, fn any) {
 	defaultEngine.assertAssembling("Options")
 	defaultEngine.register(methodOptions, path, fn)
 }
-
-// Match registers fn for exactly the named methods.
-//
-// Names are the standard HTTP verbs, for example
-// Match([]string{http.MethodGet, http.MethodPost}, path, handler), and are
-// accepted in any case. An unsupported verb aborts startup.
-func Match(methods []string, path string, fn any) {
-	defaultEngine.Match(methods, path, fn)
-}
-
-// Match is the instance-level counterpart of package-level Match.
-func (e *engine) Match(methods []string, path string, fn any) {
-	e.assertAssembling("Match")
-	for _, name := range methods {
-		method, known := methodOf(name)
-		if !known {
-			e.failStartup(unknownHTTPMethodPrefix + name)
-		}
-		e.register(method, path, fn)
-	}
-}

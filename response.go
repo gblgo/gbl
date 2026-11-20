@@ -5,52 +5,77 @@
 package gbl
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"reflect"
 	"strconv"
+	"sync"
 )
 
 // This file holds response serialization: rendering a handler's return value
 // into the bytes the pipeline writes. The pooled writer itself lives in
 // responseWriter.go; the dispatch that stages this result lives in handler.go.
 
-// convertToByteArray renders a handler return value as the response body:
-// byte slices pass through, strings are converted and scalars formatted,
-// composites are JSON-marshaled, and nil pointers/interfaces become an empty
-// body.
-func convertToByteArray(val reflect.Value) ([]byte, error) {
+// responseBufferPool recycles the buffer used to serialize handler return values,
+// so a request reuses one backing array instead of allocating fresh bytes every time.
+var responseBufferPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
+// convertToBuffer renders a handler return value into buf: byte slices pass
+// through, strings are converted and scalars formatted, composites are
+// JSON-marshaled, and nil pointers/interfaces become an empty body.
+func convertToBuffer(buf *bytes.Buffer, val reflect.Value) error {
 	if !val.IsValid() {
-		return nil, nil
+		return nil
 	}
 
 	switch val.Kind() {
 	case reflect.Interface, reflect.Pointer:
 		if val.IsNil() {
-			return []byte(null), nil
+			buf.WriteString(empty)
+			return nil
 		}
-		return convertToByteArray(val.Elem())
+		return convertToBuffer(buf, val.Elem())
 
 	case reflect.String:
-		return []byte(val.String()), nil
+		buf.WriteString(val.String())
+		return nil
 	case reflect.Bool:
-		return strconv.AppendBool(nil, val.Bool()), nil
+		buf.Write(strconv.AppendBool(nil, val.Bool()))
+		return nil
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return strconv.AppendInt(nil, val.Int(), 10), nil
+		buf.Write(strconv.AppendInt(nil, val.Int(), 10))
+		return nil
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return strconv.AppendUint(nil, val.Uint(), 10), nil
+		buf.Write(strconv.AppendUint(nil, val.Uint(), 10))
+		return nil
 	case reflect.Float32, reflect.Float64:
-		return strconv.AppendFloat(nil, val.Float(), 'f', -1, val.Type().Bits()), nil
+		buf.Write(strconv.AppendFloat(nil, val.Float(), 'f', -1, val.Type().Bits()))
+		return nil
 	case reflect.Complex64, reflect.Complex128:
-		return []byte(strconv.FormatComplex(val.Complex(), 'f', -1, val.Type().Bits())), nil
+		buf.WriteString(strconv.FormatComplex(val.Complex(), 'f', -1, val.Type().Bits()))
+		return nil
 	case reflect.Slice:
 		if val.Type().Elem().Kind() == reflect.Uint8 {
-			return val.Bytes(), nil
+			buf.Write(val.Bytes())
+			return nil
 		}
-		return json.Marshal(val.Interface())
+		data, err := json.Marshal(val.Interface())
+		if err != nil {
+			return err
+		}
+		buf.Write(data)
+		return nil
 	case reflect.Array, reflect.Map, reflect.Struct:
-		return json.Marshal(val.Interface())
+		data, err := json.Marshal(val.Interface())
+		if err != nil {
+			return err
+		}
+		buf.Write(data)
+		return nil
 	default:
-		return nil, fmt.Errorf("unsupported response type: %s", val.Type())
+		return fmt.Errorf("unsupported response type: %s", val.Type())
 	}
 }
