@@ -24,9 +24,6 @@ type Validatable interface {
 // and pays no per-request reflection or interface boxing.
 func validateBusiness(values []reflect.Value, indexes []int) error {
 	for _, i := range indexes {
-		if i < 0 || i >= len(values) {
-			continue
-		}
 		target, ok := asValidatable(values[i])
 		if !ok {
 			continue
