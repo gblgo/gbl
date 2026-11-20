@@ -242,16 +242,6 @@ gbl.Delete("/items/:id", func(id string, hard bool) string {
 // handler 收到：id="7", hard=true
 ```
 
-### `Match` —— 一个 handler 挂多个动词
-
-```go
-// 动词名是标准 HTTP 动词，大小写均可（"GET" 或 http.MethodGet）；不支持的动词会中止启动。
-gbl.Match([]string{http.MethodGet, http.MethodPost, http.MethodPut}, "/multi", multiHandler)
-gbl.Match([]string{"GET", "DELETE"}, "/multi2", multi2Handler)
-```
-
-`Match(methods []string, path string, fn any)` 为 `fn` 精确注册列出的这些方法。
-
 ---
 
 ## 4. 分组（`Group` / `RouteGroup`）
@@ -289,7 +279,6 @@ type RouteGroup interface {
     Patch(string, any) RouteGroup
     Delete(string, any) RouteGroup
     Options(string, any) RouteGroup
-    Match([]string, string, any) RouteGroup
 }
 ```
 

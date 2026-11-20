@@ -283,18 +283,6 @@ gbl.Delete("/items/:id", func(id string, hard bool) string {
 // Handler receives: id="7", hard=true
 ```
 
-### `Match` — one handler, several verbs
-
-```go
-// Verb names are standard HTTP verbs, accepted in any case ("GET" or
-// http.MethodGet); an unsupported verb aborts startup.
-gbl.Match([]string{http.MethodGet, http.MethodPost, http.MethodPut}, "/multi", multiHandler)
-gbl.Match([]string{"GET", "DELETE"}, "/multi2", multi2Handler)
-```
-
-`Match(methods []string, path string, fn any)` registers `fn` for exactly the
-named methods.
-
 ---
 
 ## 4. Groups (`Group` / `RouteGroup`)
@@ -335,7 +323,6 @@ type RouteGroup interface {
     Patch(string, any) RouteGroup
     Delete(string, any) RouteGroup
     Options(string, any) RouteGroup
-    Match([]string, string, any) RouteGroup
 }
 ```
 
