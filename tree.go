@@ -174,7 +174,16 @@ func splitPathInto(dst []string, path string) []string {
 // matchNode finds the handler registered for method and path, filling params
 // with any bound path-variable values along the way. It returns nil when the
 // method has no tree yet or nothing under it matches.
+//
+// Optimization: static routes (no path parameters) are stored in a map for O(1)
+// lookup. Only dynamic routes (with path parameters like :id) use the radix tree.
 func (e *engine) matchNode(method httpMethod, path string, params map[string]string) *routeHandler {
+	// Fast path: try static route map first (O(1))
+	if handler, ok := e.staticRoutes[method][path]; ok {
+		return handler
+	}
+
+	// Slow path: fall back to radix tree for dynamic routes (O(path length))
 	root := e.roots[method]
 	if root == nil {
 		return nil

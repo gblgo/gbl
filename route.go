@@ -223,8 +223,25 @@ func (e *engine) generateRoute() {
 		chain = append(chain, routeEndpoint)
 		handler.handlers = chain
 
-		// Insert routing tree
-		e.insertNode(segmentMetas, path, method, handler)
+		// Determine if this is a static route (no path parameters)
+		isStatic := true
+		for _, seg := range segmentMetas {
+			if seg.isVar {
+				isStatic = false
+				break
+			}
+		}
+
+		if isStatic {
+			// Static route: store in map for O(1) lookup
+			if e.staticRoutes[method] == nil {
+				e.staticRoutes[method] = make(map[string]*routeHandler)
+			}
+			e.staticRoutes[method][path] = handler
+		} else {
+			// Dynamic route: insert into radix tree
+			e.insertNode(segmentMetas, path, method, handler)
+		}
 	}
 	e.astFileMap = nil
 	e.routeMetaSlice = nil
