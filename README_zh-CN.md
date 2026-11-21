@@ -30,6 +30,7 @@
 13. [跨域（`SetCorsConfig` / `CorsConfig`）](#13-跨域setcorsconfig--corsconfig)
 14. [配置（`Config` / `Configure`）](#14-配置config--configure)
 15. [启动失败（fail-fast）](#15-启动失败fail-fast)
+16. [响应体压缩（`Compress`）](#16-响应体压缩compress)
 
 > **一个引擎，多个入口。** gbl 只暴露*一个*包级引擎。`Get/Post/Use/Group/Run/...`
 > 全部作用于它，所以你注册的规则和你启动的服务必然是同一实例，不存在"注册进第二个引擎"的坑。
@@ -1006,9 +1007,70 @@ gbl.Configure(func(c *gbl.Config) {
 
 ---
 
+## 16. 响应体压缩（`Compress`）
+
+`Compress(level int) HandlerFunc` 返回一个中间件，在有益时对响应体做 gzip 压缩。压缩发生在 `c.Next()` 返回之后，此时 handler 已产出结果。
+
+**三个条件必须同时成立：**
+
+1. 客户端发送了 `Accept-Encoding: gzip`
+2. 响应的 `Content-Type` 是可压缩的（文本、JSON、XML、CSS、JS、SVG 等）
+3. 响应体至少 **1 KB**——更小的响应压缩收益甚微，CPU 开销不值
+
+三个条件都成立时，中间件将暂存的响应体替换为压缩数据，并设置 `Content-Encoding: gzip` 和 `Vary: Accept-Encoding`。
+
+**压缩级别**（与 `compress/gzip` 一致，重新导出，无需直接 import 标准库）：
+
+| 常量 | 值 | 含义 |
+|------|----|------|
+| `NoCompression` | 0 | 不压缩 |
+| `BestSpeed` | 1 | 最快 |
+| `DefaultCompression` | -1 | 均衡（推荐默认） |
+| `BestCompression` | 9 | 最小输出，最高 CPU |
+| `HuffmanOnly` | -2 | 仅 Huffman 编码 |
+
+**全局使用：**
+
+```go
+package main
+
+import "github.com/gblgo/gbl"
+
+func main() {
+    gbl.Use(gbl.Compress(gbl.DefaultCompression))
+    gbl.Get("/api/data", handler)
+    gbl.Run(":8080")
+}
+```
+
+**分组级使用：**
+
+```go
+api := gbl.Group("/api")
+api.GroupUse(gbl.Compress(gbl.BestSpeed))
+api.Get("/data", handler)
+```
+
+**中间件顺序：** Compress 在 `Next()` 之后执行，观察到的是最终响应。应放在 auth/CORS 中间件**之后**（错误响应跳过压缩），放在日志中间件**之前**（访问日志如需报告压缩后大小可读到）。典型顺序：
+
+```go
+gbl.Use(
+    logger,            // 最外层：看到所有
+    corsMiddleware,    // 处理预检
+    authMiddleware,    // 拒绝未认证
+    gbl.Compress(gbl.DefaultCompression), // 压缩成功响应
+)
+```
+
+**二进制格式永不压缩：** 图片、视频、音频、PDF 等二进制内容类型会自动跳过，因为它们已经压缩过或 gzip 无收益。
+
+---
+
 ## 性能说明
 
-热路径已用预计算的装配计划、对象池（响应写入器 / 路径参数 / `Context`）和无分配的路由匹配优化过。与成熟框架的剩余差距来自反射调用任意 handler 签名的固有代价——这是这一核心特性带来的取舍，不是轻易能抹平的。
+热路径已用预计算的装配计划、对象池（响应写入器 / 路径参数 / `Context` / `Context.keys`）和无分配的路由匹配优化过。
+静态路由（无路径参数）使用 O(1) map 查找代替基数树。
+与成熟框架的剩余差距来自反射调用任意 handler 签名的固有代价——这是这一核心特性带来的取舍，不是轻易能抹平的。
 
 ---
 
