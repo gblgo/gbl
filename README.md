@@ -42,6 +42,7 @@ function, type, interface and method, each with a runnable example.
 13. [CORS (`SetCorsConfig` / `CorsConfig`)](#13-cors-setcorsconfig--corsconfig)
 14. [Configuration (`Config` / `Configure`)](#14-configuration-config--configure)
 15. [Startup failures (fail-fast)](#15-startup-failures-fail-fast)
+16. [Response compression (`Compress`)](#16-response-compression-compress)
 
 > **One engine, many entry points.** gbl exposes a *single* package-level engine.
 > `Get/Post/Use/Group/Run/...` all act on it, so what you register and what you
@@ -1234,10 +1235,70 @@ installed. The kernel writes no fallback files.
 
 ---
 
+## 16. Response compression (`Compress`)
+
+`Compress(level int) HandlerFunc` returns a middleware that gzip-compresses the response body when beneficial. Compression happens after `c.Next()` returns, so the handler has already produced its result.
+
+**Three conditions must all hold:**
+
+1. The client sent `Accept-Encoding: gzip`
+2. The response `Content-Type` is compressible (text, JSON, XML, CSS, JS, SVG, etc.)
+3. The response body is at least **1 KB** — smaller bodies gain little and the CPU cost is not worth it
+
+When all conditions hold, the middleware replaces the staged body with compressed data and sets `Content-Encoding: gzip` and `Vary: Accept-Encoding`.
+
+**Compression levels** (mirroring `compress/gzip`, re-exported so you need not import it directly):
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `NoCompression` | 0 | No compression |
+| `BestSpeed` | 1 | Fastest |
+| `DefaultCompression` | -1 | Balanced (recommended default) |
+| `BestCompression` | 9 | Smallest output, highest CPU |
+| `HuffmanOnly` | -2 | Huffman encoding only |
+
+**Global usage:**
+
+```go
+package main
+
+import "github.com/gblgo/gbl"
+
+func main() {
+    gbl.Use(gbl.Compress(gbl.DefaultCompression))
+    gbl.Get("/api/data", handler)
+    gbl.Run(":8080")
+}
+```
+
+**Group-scoped usage:**
+
+```go
+api := gbl.Group("/api")
+api.GroupUse(gbl.Compress(gbl.BestSpeed))
+api.Get("/data", handler)
+```
+
+**Middleware ordering:** Compress runs post-`Next()`, so it observes the final response. Place it **after** auth/CORS middleware (so errors skip compression) and **before** logging (so access logs see the compressed size if you want to report it). A typical order:
+
+```go
+gbl.Use(
+    logger,            // outermost: sees everything
+    corsMiddleware,    // handles preflight
+    authMiddleware,    // denies unauthenticated
+    gbl.Compress(gbl.DefaultCompression), // compresses successful responses
+)
+```
+
+**Binary formats are never compressed:** images, video, audio, PDF and other binary content types are skipped automatically, since they are already compressed or gain nothing from gzip.
+
+---
+
 ## Performance note
 
 The hot path is already optimized with a precomputed bind plan, pooled objects
-(response writer / path params / `Context`) and allocation-free route matching.
+(response writer / path params / `Context` / `Context.keys`) and allocation-free route matching.
+Static routes (no path parameters) use O(1) map lookup instead of the radix tree.
 The remaining gap versus mature frameworks comes from the inherent cost of
 reflectively invoking arbitrary handler signatures — a trade-off of this
 framework's core feature, not something easily erased.

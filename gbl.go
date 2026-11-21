@@ -29,7 +29,7 @@ import (
 // port, by driving generateRoute and ServeHTTP directly.
 type engine struct {
 	// 24-byte fields (slices)
-	roots          []*routeNode         // one routing tree per supported method
+	roots          []*routeNode         // one routing tree per supported method (dynamic routes with path params)
 	routeMetaSlice []*routeMeta         // registrations queued before generateRoute
 	middlewares    []HandlerFunc        // global chain, merged with each group's at generation
 
@@ -38,11 +38,12 @@ type engine struct {
 	logger         Logger         // sink for internal logs; never nil
 
 	// 8-byte fields (pointers, maps)
-	cfg        *Config              // runtime configuration; defaults overlaid by Configure
-	cors       *CorsConfig          // nil disables the CORS layer
-	astFileMap map[string]*ast.File // parsed source files for parameter names
-	fest       *token.FileSet       // file set backing astFileMap
-	server     *http.Server         // live server, set by Run; nil before start
+	staticRoutes [methodCount]map[string]*routeHandler // O(1) lookup for static routes (no path params)
+	cfg          *Config                               // runtime configuration; defaults overlaid by Configure
+	cors         *CorsConfig                           // nil disables the CORS layer
+	astFileMap   map[string]*ast.File                  // parsed source files for parameter names
+	fest         *token.FileSet                        // file set backing astFileMap
+	server       *http.Server                          // live server, set by Run; nil before start
 
 	// sync primitives
 	shutdownOnce sync.Once  // collapse signal and manual shutdown
