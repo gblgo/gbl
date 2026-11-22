@@ -200,16 +200,33 @@ func (e *engine) generateRoute() {
 
 		if t.NumIn() > 0 {
 			handler.plan = buildBindPlan(t)
+
+			// Two independent sources for the parameter names, tried in order:
+			//   1. the handler's own source file on disk — fresh, and the path used
+			//      in development (`go run`, or a build run next to the source);
+			//   2. the binary's own DWARF debug info — the sourceless production
+			//      path. The compiler keeps parameter names in DWARF even under
+			//      -trimpath, so a bare binary still carries them.
+			// Disk wins when both exist so a dev edit is never shadowed by the
+			// DWARF baked into an older binary.
 			names, resolved := e.resolveParamNames(handler.v)
+			if !resolved {
+				names, resolved = e.lookupParamNamesDWARF(handler.v)
+			}
 			handler.paramNames = normalizeParamNames(names, t.NumIn())
 
-			// A name-dependent handler whose names could not be recovered would
+			// A name-dependent handler whose names came from neither source would
 			// otherwise bind path/query/JSON values to nothing and answer with wrong
 			// data at request time. Fail loudly at startup instead, pointing at the
-			// two fixes that keep the process honest: build without -trimpath, or
-			// bind through a struct whose field names come from reflection.
+			// real causes: the binary was built with `-ldflags "-w"`/`"-s"` (which
+			// strip the DWARF this fallback reads), or it ships without source. The
+			// fix is to keep DWARF (drop -w/-s) or bind through a struct, whose field
+			// names come from reflection and survive any build flag. A self-describing
+			// binding (a lone struct) is not name-dependent, so it falls through to
+			// positional placeholders silently — the normal sourceless path for struct
+			// handlers, where a per-handler warning would be noise.
 			if handler.plan.needsNames && !resolved {
-				e.failStartup(fmt.Errorf("gbl: handler for %s %s binds parameters by name, but the parameter names are unavailable at runtime (source not readable, e.g. built with -trimpath or shipped as a bare binary). Rebuild without -trimpath, or bind through a struct / *struct parameter whose field names come from reflection",
+				e.failStartup(fmt.Errorf("gbl: handler for %s %s binds parameters by name, but the parameter names are unavailable at runtime: no source on disk and no DWARF debug info in the binary. The binary was likely built with `-ldflags \"-w\"` or `\"-s\"`, which strip DWARF; rebuild without them so gbl can read the names from the binary, or bind through a struct / *struct parameter whose field names come from reflection",
 					methodName, meta.path))
 			}
 		}
@@ -244,6 +261,7 @@ func (e *engine) generateRoute() {
 		}
 	}
 	e.astFileMap = nil
+	e.dwarfIndex = nil
 	e.routeMetaSlice = nil
 	e.generated = true
 }
@@ -267,9 +285,14 @@ func (e *engine) generateRoute() {
 // value.
 //
 // The second return reports whether real names were recovered. The caller acts
-// on it: a handler whose binding needs names aborts startup (failStartup), while
-// a self-describing binding (a lone struct, whose fields come from reflection)
+// on it: a handler whose binding needs names first falls back to the binary's
+// DWARF, and only aborts startup (failStartup) if that is missing too, while a
+// self-describing binding (a lone struct, whose fields come from reflection)
 // falls back to positional placeholders and continues.
+//
+// A miss here is silent by design: in a sourceless production image EVERY
+// handler misses on disk and resolves from DWARF instead, so a per-handler
+// warning would be pure noise on the normal path.
 func (e *engine) resolveParamNames(v reflect.Value) ([]string, bool) {
 	pc := v.Pointer()
 	funPc := runtime.FuncForPC(pc)
@@ -277,16 +300,14 @@ func (e *engine) resolveParamNames(v reflect.Value) ([]string, bool) {
 		return nil, false
 	}
 
-	symbol := funPc.Name()
 	file, line := funPc.FileLine(pc)
 
 	af := e.astFileMap[file]
 	if af == nil {
 		parsed, err := parser.ParseFile(e.fest, file, nil, parser.ParseComments)
 		if err != nil {
-			// A failed file is deliberately not cached: every handler in it should
-			// still report its own warning, and a failed open costs microseconds.
-			e.warnUnboundParams(symbol, "source unavailable: "+err.Error())
+			// A failed file is deliberately not cached so every handler in it
+			// retries on its own; a failed open costs microseconds.
 			return nil, false
 		}
 		e.astFileMap[file] = parsed
@@ -295,7 +316,6 @@ func (e *engine) resolveParamNames(v reflect.Value) ([]string, bool) {
 
 	funcType := findFuncTypeAt(e.fest, af, line)
 	if funcType == nil || funcType.Params == nil {
-		e.warnUnboundParams(symbol, "no function enclosing line "+strconv.Itoa(line)+" of "+file)
 		return nil, false
 	}
 
@@ -307,6 +327,50 @@ func (e *engine) resolveParamNames(v reflect.Value) ([]string, bool) {
 	}
 
 	return paramNames, true
+}
+
+// lookupParamNamesDWARF recovers a handler's parameter names from the binary's
+// own DWARF debug info, when the source on disk is unavailable.
+//
+// It is the production half of name binding: a sourceless image (multi-stage
+// build, -trimpath, bare binary) has no .go file to parse, but the compiler still
+// emits parameter names into DWARF by default. The index is keyed by the SAME
+// source position the runtime reports — "<file>:<line>" — so lookup needs no
+// symbol name and resolves closures and func literals exactly as the disk path
+// does. Position keys are also immune to Go 1.27's merging and renaming of
+// identical function literals, which makes symbol-keyed lookups unsafe.
+//
+// The index is built lazily on the first handler that misses on disk and cached
+// on the engine, so a development process (source present) never pays for it. The
+// second return reports whether DWARF yielded real names; it is false when the
+// binary carries no DWARF (built with `-ldflags "-w"`/`"-s"`), letting the caller
+// fail startup with guidance.
+func (e *engine) lookupParamNamesDWARF(v reflect.Value) ([]string, bool) {
+	if e.dwarfIndex == nil {
+		index := buildDWARFIndex()
+		if index == nil {
+			// No readable DWARF: cache an empty map so later handlers do not re-parse
+			// a binary that will never yield names.
+			index = map[string][]string{}
+		}
+		e.dwarfIndex = index
+	}
+	if len(e.dwarfIndex) == 0 {
+		return nil, false
+	}
+
+	pc := v.Pointer()
+	funPc := runtime.FuncForPC(pc)
+	if funPc == nil {
+		return nil, false
+	}
+
+	file, line := funPc.FileLine(pc)
+	names, ok := e.dwarfIndex[file+colon+strconv.Itoa(line)]
+	if !ok || len(names) == 0 {
+		return nil, false
+	}
+	return names, true
 }
 
 // findFuncTypeAt returns the signature of the innermost function declaration or
@@ -367,11 +431,4 @@ func normalizeParamNames(names []string, count int) []string {
 // unnamedParamName is the placeholder for a parameter the source did not name.
 func unnamedParamName(index int) string {
 	return "arg" + strconv.Itoa(index)
-}
-
-// warnUnboundParams reports a handler whose parameter names could not be
-// resolved. It routes through the engine Logger at warn level, so the notice
-// honors SetLogger and lands wherever the application's warnings are sent.
-func (e *engine) warnUnboundParams(symbol, reason string) {
-	e.logger.Warn("unbound handler parameters", "handler", symbol, "reason", reason)
 }

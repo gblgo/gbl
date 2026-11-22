@@ -135,12 +135,11 @@ func Error(msg string, keysAndValues ...any) { defaultEngine.logger.Error(msg, k
 // passing nil leaves the current logger untouched. Once the engine runs the
 // logger is frozen like every other assembling input, and calling this again
 // panics.
-func (e *engine) setLogger(l Logger) *engine {
+func (e *engine) setLogger(l Logger) {
 	e.assertAssembling("SetLogger")
 	if l != nil {
 		e.logger = l
 	}
-	return e
 }
 
 // failStartup records a startup, configuration or registration failure through

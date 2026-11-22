@@ -43,6 +43,7 @@ type engine struct {
 	cors         *CorsConfig                           // nil disables the CORS layer
 	astFileMap   map[string]*ast.File                  // parsed source files for parameter names
 	fest         *token.FileSet                        // file set backing astFileMap
+	dwarfIndex   map[string][]string                   // lazily built "<file>:<line>"->param names from the binary's DWARF; the sourceless fallback
 	server       *http.Server                          // live server, set by Run; nil before start
 
 	// sync primitives

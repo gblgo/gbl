@@ -57,11 +57,10 @@ func Configure(fn func(*Config)) { defaultEngine.configure(fn) }
 // path takes effect without a separate switch. Once the engine runs its
 // configuration snapshot is in effect on the live server and re-Configure
 // panics: it could no longer change what is already serving.
-func (e *engine) configure(fn func(*Config)) *engine {
+func (e *engine) configure(fn func(*Config)) {
 	e.assertAssembling("Configure")
 	if fn != nil {
 		fn(e.cfg)
 		e.cfg.useTLS = e.cfg.CertFile != empty && e.cfg.KeyFile != empty
 	}
-	return e
 }

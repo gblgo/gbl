@@ -266,10 +266,9 @@ func Use(middleware ...HandlerFunc) { defaultEngine.use(middleware...) }
 // combined with each route group's middleware at route-generation time, the
 // engine's running outermost. Register all middleware before Run; calling Use
 // afterward panics, because every route chain is already frozen.
-func (e *engine) use(middleware ...HandlerFunc) *engine {
+func (e *engine) use(middleware ...HandlerFunc) {
 	e.assertAssembling("Use")
 	e.middlewares = append(e.middlewares, middleware...)
-	return e
 }
 
 // invokeHandler is the terminal chain link: it parses the request (when the
