@@ -53,7 +53,7 @@ func SetCorsConfig(cc *CorsConfig) {
 }
 
 // useCors installs the CORS configuration on this engine.
-func (e *engine) useCors(cc *CorsConfig) *engine {
+func (e *engine) useCors(cc *CorsConfig) {
 	e.assertAssembling("SetCorsConfig")
 	if cc != nil {
 		if err := cc.validate(); err != nil {
@@ -61,7 +61,6 @@ func (e *engine) useCors(cc *CorsConfig) *engine {
 		}
 	}
 	e.cors = cc
-	return e
 }
 
 // isPreflightRequest reports whether r is a CORS preflight request.

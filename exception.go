@@ -33,10 +33,9 @@ func RegisterPanicProcessor(p PanicProcessor) {
 }
 
 // setPanicProcessor installs the panic renderer on this engine.
-func (e *engine) setPanicProcessor(p PanicProcessor) *engine {
+func (e *engine) setPanicProcessor(p PanicProcessor) {
 	e.assertAssembling("RegisterPanicProcessor")
 	e.panicProcessor = p
-	return e
 }
 
 // responseAbort is the panic value used to end a request early with a specific

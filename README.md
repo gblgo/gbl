@@ -216,6 +216,35 @@ gbl.Post("/echo", func(r *http.Request) string {
 })
 ```
 
+### Building for production: parameter names and DWARF
+
+Binding by name needs the handler's **parameter names**, which `reflect` does not
+expose. gbl recovers them from two places, tried in order: the handler's own source
+file on disk first — the development path (`go run`, or a build run next to the
+source tree) — then the binary's own **DWARF** debug info, the sourceless
+production path.
+
+The compiler emits DWARF by default, and `-trimpath` only rewrites the recorded
+source paths without stripping DWARF, so a **plain production build just works**:
+
+```bash
+# No wrapper, no install step, no code generation, no extra build command.
+go build -trimpath -o app ./cmd/api
+```
+
+Ship that binary into a container and run it away from its source, and gbl reads
+the parameter names back out of the binary itself, so `func(id string)` keeps
+binding by name. Your project, repo and final image contain **zero generated
+files** and need **zero extra tooling**.
+
+**The one caveat: `-ldflags "-w"` / `"-s"`.** These linker flags strip debug info —
+`-w` disables DWARF and `-s` omits the symbol table and debug info. A binary built
+with them carries no parameter names for gbl to read, so a handler that binds
+scalars by name aborts at startup rather than silently binding nothing; the error
+explains exactly this. The fix is to bind through a `struct` / `*struct` parameter
+instead: a struct's field names come from reflection, not DWARF, and survive any
+build flag. If you do not strip debug info, there is nothing to do.
+
 ---
 
 ## 3. Routing: package-level verbs
@@ -1227,8 +1256,10 @@ control, build an absolute path inside `Configure`.
 Every startup and registration failure is **fail-fast**: gbl first records the
 reason through the engine `Logger`, then panics — so a deployment that dies
 before serving still leaves the cause in your log sink, not just a bare stack
-trace. A busy port, a route conflict and a dangerous CORS policy all take this
-path.
+trace. A busy port, a route conflict, a dangerous CORS policy and a name-binding
+handler whose parameter names are unavailable at runtime (a binary built with
+`-ldflags "-w"` or `"-s"`, which strip the DWARF gbl reads them from) all take
+this path.
 
 Logs go to the console by default, or to your sink when a custom `Logger` is
 installed. The kernel writes no fallback files.
