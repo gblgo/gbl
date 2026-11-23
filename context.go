@@ -137,7 +137,12 @@ func (c *Context) recycle() {
 	c.ret = reflect.Value{}
 	c.logger = nil
 	c.src = nameSources{}
-	c.responseBuf = nil
+	// A panic between staging the result and the pipeline's write would
+	// otherwise drop the pooled buffer instead of recycling it.
+	if c.responseBuf != nil {
+		responseBufferPool.Put(c.responseBuf)
+		c.responseBuf = nil
+	}
 	contextPool.Put(c)
 }
 
@@ -309,14 +314,16 @@ func (c *Context) invokeHandler() {
 	}
 
 	var in []reflect.Value
-	var paramsBuf *[]reflect.Value
 	if rh.t.NumIn() > 0 {
+		var paramsBuf *[]reflect.Value
 		paramsBuf, in = acquireParams(rh.t.NumIn())
+		// Released on every exit path — error aborts included, and a panicking
+		// handler, which the manual releases after Call could not cover.
+		defer releaseParams(paramsBuf, in)
 		if err = injectedParameters(c, form, files, body, isJSON, in); err != nil {
 			// Binding errors are assembled from reflection internals (parameter
 			// names, Go type strings, strconv detail), so only a generic 400 is
 			// returned and the detail stays in the server log.
-			releaseParams(paramsBuf, in)
 			c.logger.Error("request binding failed", "error", err)
 			abort(http.StatusBadRequest, http.StatusText(http.StatusBadRequest))
 			return
@@ -325,16 +332,12 @@ func (c *Context) invokeHandler() {
 		// handler runs. The message is authored by the application developer, so
 		// it is echoed as the 400 body: whoever wrote it owns what it discloses.
 		if vErr := validateBusiness(in, rh.plan.validatableIndexes); vErr != nil {
-			releaseParams(paramsBuf, in)
 			abort(http.StatusBadRequest, vErr.Error())
 			return
 		}
 	}
 
 	out := rh.v.Call(in)
-	if paramsBuf != nil {
-		releaseParams(paramsBuf, in)
-	}
 	if len(out) > 0 {
 		buf := responseBufferPool.Get().(*bytes.Buffer)
 		buf.Reset()
