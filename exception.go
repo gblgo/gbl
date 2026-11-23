@@ -154,8 +154,15 @@ func (e *engine) catchRuntimePanic(rw responseWriter) {
 	// displayable aborts and genuine crashes alike.
 	if e.panicProcessor != nil {
 		payload, httpStatus := e.panicProcessor(err)
+		// The hook is user code, so its status is not trusted: net/http panics
+		// on an out-of-range WriteHeader code, and a second panic inside the
+		// recovery path would kill the connection with no answer at all.
+		code := int(httpStatus)
+		if code < 100 || code > 999 {
+			code = http.StatusInternalServerError
+		}
 		bytes := errorWriteback(rw, payload)
-		rw.WriteHeader(int(httpStatus))
+		rw.WriteHeader(code)
 		rw.Header().Set(contentType, detectContentType(payload))
 		rw.writeHeader()
 		_, _ = rw.Write(bytes)

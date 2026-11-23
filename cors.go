@@ -7,6 +7,7 @@ package gbl
 import (
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -89,6 +90,8 @@ func (cc *CorsConfig) validate() error {
 
 // SetCorsConfig installs the CORS configuration on the default engine; Run
 // then wraps the handler chain with it. A nil configuration disables CORS.
+// The engine keeps a private deep copy, so later edits to the caller's struct
+// can neither race the serving goroutines nor switch policy mid-flight.
 // A configuration rejected by this security policy (see validate) aborts
 // startup here, before Run. Like every assembling API it panics once the
 // engine is serving: the handler chain has already been built.
@@ -103,6 +106,12 @@ func (e *engine) useCors(cc *CorsConfig) {
 		if err := cc.validate(); err != nil {
 			e.failStartup(err)
 		}
+		owned := *cc
+		owned.AllowedOrigins = slices.Clone(cc.AllowedOrigins)
+		owned.AllowedMethods = slices.Clone(cc.AllowedMethods)
+		owned.AllowedHeaders = slices.Clone(cc.AllowedHeaders)
+		owned.ExposedHeaders = slices.Clone(cc.ExposedHeaders)
+		cc = &owned
 	}
 	e.cors = cc
 }
