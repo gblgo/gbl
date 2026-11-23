@@ -22,7 +22,7 @@
 5. [中间件（`Use` / `HandlerFunc`）](#5-中间件use--handlerfunc)
 6. [服务启停（`Run` / `Shutdown`）](#6-服务启停run--shutdown)
 7. [`Context` 详解](#7-context-详解)
-8. [请求级取值（`Get` / `Value` / `MustValue`）](#8-请求级取值get--value--mustvalue)
+8. [请求级取值（`Get` / `Value`）](#8-请求级取值get--value)
 9. [中止与 panic（`PanicProcessor` / `HttpStatus`）](#9-中止与-panicpanicprocessor--httpstatus)
 10. [校验（`Validatable`）](#10-校验validatable)
 11. [日志（`Logger` / `BannerLogger` / `SetLogger` / `Info` / `Warn` / `Error`）](#11-日志logger--bannerlogger--setlogger--info--warn--error)
@@ -622,7 +622,7 @@ c.Request // *http.Request —— 原始入站请求
 |---|---|
 | `Next()` | 执行链上剩余部分（到末端即 handler） |
 | `PathParam(name) string` | 按名字取匹配到的路径参数（供中间件用；业务 handler 请按名绑定） |
-| `Set(key, value)` / `Get(key) (any, bool)` | 请求级取值（类型化便利：`Value` / `MustValue`，见 §8） |
+| `Set(key, value)` / `Get[T](key) (T, bool)` / `Value[T](key) T` | 请求级取值（见 §8） |
 | `Result() any` | handler 返回值的 `any` 形态（`Next()` 之后有效）；首次读取时才做装箱 |
 | `IsWritten() bool` | body 是否已提交 |
 | `StatusCode() int` | 将要/已经发送的状态码（默认 200） |
@@ -651,8 +651,8 @@ gbl.Use(func(c *gbl.Context) {
 // handler 不碰 token，只用当前用户。uid 来自 token，而非 path/query/body，
 // 自动绑定给不了——Context 是中间件传给 handler 的唯一通道。
 gbl.Get("/orders", func(c *gbl.Context) []Order {
-    v, _ := c.Get("uid") // any
-    return loadOrders(v.(int64))
+    uid, _ := c.Get[int64]("uid")
+    return loadOrders(uid)
 })
 
 // 场景：接口监控——统一记录每个请求的状态码、响应大小与耗时。
@@ -669,9 +669,9 @@ gbl.Use(func(c *gbl.Context) {
 
 ---
 
-## 8. 请求级取值（`Get` / `Value` / `MustValue`）
+## 8. 请求级取值（`Get` / `Value`）
 
-中间件用 `c.Set` 存值，handler（或后续环）用 `c.Get` 读取。`Get` 返回原始 `any`，自己断言成存进去的类型：
+中间件用 `c.Set` 存值，handler（或后续环）用泛型 `c.Get[T]` 读取：断言由框架代劳，键不存在或类型不符都返回（零值, false），由调用者决定怎么处理：
 
 ```go
 gbl.Use(func(c *gbl.Context) {
@@ -680,19 +680,19 @@ gbl.Use(func(c *gbl.Context) {
 })
 
 gbl.Get("/me", func(c *gbl.Context) string {
-    v, ok := c.Get("uid")
+    uid, ok := c.Get[int64]("uid")
     if !ok {
         return "anonymous"
     }
-    return fmt.Sprintf("user %d", v.(int64))
+    return fmt.Sprintf("user %d", uid)
 })
 ```
 
-也可以免去手动断言，用类型化助手 `Value`（带 ok）和 `MustValue`（缺失给零值）。做成包级函数，是因为 Go 的方法不能带类型参数：
+缺失本来就可以当零值用时，用 `c.Value[T]` 省掉 ok；不想指定类型、原样取回存的值，用 `Get[any]`：
 
 ```go
-uid, ok := gbl.Value[int64](c, "uid")           // ok == true, uid == 7
-name := gbl.MustValue[string](c, "displayName") // 缺失/类型不符为 ""
+name := c.Value[string]("displayName") // 缺失/类型不符为 ""
+v, ok := c.Get[any]("uid")             // int64(7), true —— 原样返回
 ```
 
 ---

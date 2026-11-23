@@ -34,7 +34,7 @@ function, type, interface and method, each with a runnable example.
 5. [Middleware (`Use` / `HandlerFunc`)](#5-middleware-use--handlerfunc)
 6. [Serving (`Run` / `Shutdown`)](#6-serving-run--shutdown)
 7. [`Context` reference](#7-context-reference)
-8. [Request-scoped values (`Get` / `Value` / `MustValue`)](#8-request-scoped-values-get--value--mustvalue)
+8. [Request-scoped values (`Get` / `Value`)](#8-request-scoped-values-get--value)
 9. [Aborts & panic (`PanicProcessor` / `HttpStatus`)](#9-aborts--panic-panicprocessor--httpstatus)
 10. [Validation (`Validatable`)](#10-validation-validatable)
 11. [Logging (`Logger` / `BannerLogger` / `SetLogger` / `Info` / `Warn` / `Error`)](#11-logging-logger--bannerlogger--setlogger--info--warn--error)
@@ -776,7 +776,7 @@ c.Request // *http.Request — the inbound request
 |---|---|
 | `Next()` | run the remaining chain (and the handler at its end) |
 | `PathParam(name) string` | a matched path parameter by name (for middleware; handlers bind path params by name) |
-| `Set(key, value)` / `Get(key) (any, bool)` | request-scoped values (typed helpers: `Value` / `MustValue`, §8) |
+| `Set(key, value)` / `Get[T](key) (T, bool)` / `Value[T](key) T` | request-scoped values (§8) |
 | `Result() any` | the handler's return value as `any` (valid after `Next()`); the boxing happens once, on first read |
 | `IsWritten() bool` | whether a body has already been committed |
 | `StatusCode() int` | the status that will be / was sent (200 default) |
@@ -807,8 +807,8 @@ gbl.Use(func(c *gbl.Context) {
 // from the token, not from path/query/body, so auto-binding cannot supply it —
 // Context is the only channel from the middleware to the handler.
 gbl.Get("/orders", func(c *gbl.Context) []Order {
-    v, _ := c.Get("uid") // any
-    return loadOrders(v.(int64))
+    uid, _ := c.Get[int64]("uid")
+    return loadOrders(uid)
 })
 
 // Scenario: per-endpoint monitoring — record every request's status, size and
@@ -826,10 +826,12 @@ gbl.Use(func(c *gbl.Context) {
 
 ---
 
-## 8. Request-scoped values (`Get` / `Value` / `MustValue`)
+## 8. Request-scoped values (`Get` / `Value`)
 
 Middleware stores values with `c.Set`; the handler (or a later link) reads them
-with `c.Get`, which returns the raw `any` — assert it to the type you stored:
+back with the generic `c.Get[T]`, which asserts for you and reports whether the
+key was present with that type — an absent key or a type mismatch yields the
+zero value and false:
 
 ```go
 gbl.Use(func(c *gbl.Context) {
@@ -838,21 +840,20 @@ gbl.Use(func(c *gbl.Context) {
 })
 
 gbl.Get("/me", func(c *gbl.Context) string {
-    v, ok := c.Get("uid")
+    uid, ok := c.Get[int64]("uid")
     if !ok {
         return "anonymous"
     }
-    return fmt.Sprintf("user %d", v.(int64))
+    return fmt.Sprintf("user %d", uid)
 })
 ```
 
-You can also skip the manual assertion with the typed helpers `Value` (returns an
-ok flag) and `MustValue` (zero value on miss). They are package-level functions
-because Go methods cannot carry type parameters:
+When a miss can simply stand for the zero value, drop the flag with `c.Value[T]`.
+To read the stored value without naming a type, ask for `any`:
 
 ```go
-uid, ok := gbl.Value[int64](c, "uid")           // ok == true, uid == 7
-name := gbl.MustValue[string](c, "displayName") // "" when absent / wrong type
+name := c.Value[string]("displayName") // "" when absent / wrong type
+v, ok := c.Get[any]("uid")             // int64(7), true — the boxed value as-is
 ```
 
 ---

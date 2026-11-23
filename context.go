@@ -208,12 +208,28 @@ func (c *Context) Set(key string, value any) {
 	c.keys[key] = value
 }
 
-// Get returns a value set earlier, reporting whether the key was present. The
-// value is an any; assert it to the type you stored. For a typed result without
-// a manual assertion, see the package helpers Value and MustValue.
-func (c *Context) Get(key string) (any, bool) {
-	value, ok := c.keys[key]
-	return value, ok
+// Get returns a value set earlier, typed by the caller: the type argument
+// asserts the stored value, and a miss (absent key or different type) yields
+// T's zero value and false, so the caller decides how to handle it. Get[any]
+// reads the value without asserting. For the value alone, see Value.
+func (c *Context) Get[T any](key string) (T, bool) {
+	var zero T
+	if c == nil {
+		return zero, false
+	}
+	stored, ok := c.keys[key]
+	if !ok {
+		return zero, false
+	}
+	typed, ok := stored.(T)
+	return typed, ok
+}
+
+// Value is Get ignoring the miss: it returns only the typed value, the zero
+// value of T when the key is absent or holds a different type.
+func (c *Context) Value[T any](key string) T {
+	value, _ := c.Get[T](key)
+	return value
 }
 
 // Result returns the matched handler's boxed return value, or nil when the
@@ -248,29 +264,6 @@ func (c *Context) AbortWithStatusJSON(status int, body any) {
 	c.writer.WriteHeader(status)
 	_, _ = c.writer.Write(data)
 	c.Abort()
-}
-
-// Value reads a middleware-set value with the requested type. It returns the
-// zero value and false when the key is absent or holds a different type, so the
-// caller decides how to handle a miss.
-func Value[T any](c *Context, key string) (T, bool) {
-	var zero T
-	if c == nil {
-		return zero, false
-	}
-	stored, ok := c.keys[key]
-	if !ok {
-		return zero, false
-	}
-	typed, ok := stored.(T)
-	return typed, ok
-}
-
-// MustValue is Value ignoring the miss, returning only the typed value (zero on
-// absence or type mismatch).
-func MustValue[T any](c *Context, key string) T {
-	value, _ := Value[T](c, key)
-	return value
 }
 
 // Use appends global middleware to the default engine.
