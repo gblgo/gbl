@@ -110,14 +110,18 @@ func frameworkVersion(info *debug.BuildInfo) string {
 	return versionDevel
 }
 
-// countRoutes totals every handler installed across all method trees. It runs
-// after generateRoute, so the number matches exactly what serveHTTP can match,
-// counting per concrete route rather than per registration (a Match across
-// several verbs installs one line per verb, each genuinely routable).
+// countRoutes totals every handler serveHTTP can reach: the terminal nodes of
+// all method trees plus every entry of the static-route maps. It runs after
+// generateRoute, so the number counts per concrete route rather than per
+// registration (a Match across several verbs installs one line per verb, each
+// genuinely routable).
 func (e *engine) countRoutes() int {
 	var total int
 	for _, root := range e.roots {
 		total += countRouteNodes(root)
+	}
+	for _, static := range e.staticRoutes {
+		total += len(static)
 	}
 	return total
 }
