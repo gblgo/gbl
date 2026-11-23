@@ -78,7 +78,9 @@ func (cc *CorsConfig) validate() error {
 	if cc.AllowCredentials {
 		for _, origin := range cc.AllowedOrigins {
 			if strings.EqualFold(strings.TrimSpace(origin), asterisk) {
-				return errors.New("gbl: invalid CORS config: AllowCredentials cannot be true while AllowedOrigins contains \"*\"; list the explicit origins allowed to send credentials instead")
+				return errors.New("gbl: invalid CORS config: AllowCredentials cannot be " +
+					"true while AllowedOrigins contains \"*\"; list the explicit origins " +
+					"allowed to send credentials instead")
 			}
 		}
 	}

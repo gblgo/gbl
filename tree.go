@@ -82,7 +82,8 @@ func hasSameRoute(node *routeNode, segments []segmentMeta, index int) (bool, str
 // variable nodes as needed and attaching handler at the terminal node. Duplicate
 // concrete routes and structurally equivalent variable routes abort startup with
 // a panic, since both would leave matching ambiguous.
-func (e *engine) insertNode(segmentMetas []segmentMeta, path string, method httpMethod, handler *routeHandler) {
+func (e *engine) insertNode(segmentMetas []segmentMeta, path string,
+	method httpMethod, handler *routeHandler) {
 
 	// Get the root node of the corresponding method
 	root := e.roots[method]
@@ -243,7 +244,8 @@ func (e *engine) allowFor(path string) []string {
 // variable branch it records the segment under that node's parameter name and,
 // if the branch later proves dead, deletes it again so a failed search leaves
 // no stray params behind.
-func searchNode(root *routeNode, segments []string, index int, params map[string]string) *routeHandler {
+func searchNode(root *routeNode, segments []string, index int,
+	params map[string]string) *routeHandler {
 
 	if root == nil {
 		return nil

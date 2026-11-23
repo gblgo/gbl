@@ -145,11 +145,13 @@ func (e *engine) dealPath(path string) ([]segmentMeta, string) {
 			meta.paramName = part[1:]
 		}
 
-		if strings.Contains(part, leftCurlyBrace) && (len(part) == 1 || strings.LastIndex(part, leftCurlyBrace) != 0) {
+		if strings.Contains(part, leftCurlyBrace) &&
+			(len(part) == 1 || strings.LastIndex(part, leftCurlyBrace) != 0) {
 			e.failStartup("when registering a route, the path cannot be '/{' or '/{***{***{' or '/{{', etc")
 		}
 
-		if strings.Contains(part, rightCurlyBrace) && (len(part) == 1 || strings.Index(part, rightCurlyBrace)+1 != len(part)) {
+		if strings.Contains(part, rightCurlyBrace) &&
+			(len(part) == 1 || strings.Index(part, rightCurlyBrace)+1 != len(part)) {
 			e.failStartup("when registering a route, the path cannot be '/}' or '/}***}***}' or '/}}', etc")
 		}
 
@@ -188,7 +190,8 @@ func (e *engine) generateRoute() {
 		v := reflect.ValueOf(meta.fn)
 
 		if !v.IsValid() || v.Kind() != reflect.Func || v.IsNil() {
-			e.failStartup(fmt.Errorf("invalid route handler: %s %s, the method is illegal", methodName, meta.path))
+			e.failStartup(fmt.Errorf("invalid route handler: %s %s, the method is illegal",
+				methodName, meta.path))
 		}
 
 		t := v.Type()
@@ -253,7 +256,12 @@ func (e *engine) generateRoute() {
 			// positional placeholders silently — the normal sourceless path for struct
 			// handlers, where a per-handler warning would be noise.
 			if handler.plan.needsNames && !resolved {
-				e.failStartup(fmt.Errorf("gbl: handler for %s %s binds parameters by name, but the parameter names are unavailable at runtime: no source on disk and no DWARF debug info in the binary. The binary was likely built with `-ldflags \"-w\"` or `\"-s\"`, which strip DWARF; rebuild without them so gbl can read the names from the binary, or bind through a struct / *struct parameter whose field names come from reflection",
+				e.failStartup(fmt.Errorf("gbl: handler for %s %s binds parameters by name, "+
+					"but the parameter names are unavailable at runtime: no source on disk "+
+					"and no DWARF debug info in the binary. The binary was likely built with "+
+					"`-ldflags \"-w\"` or `\"-s\"`, which strip DWARF; rebuild without them so "+
+					"gbl can read the names from the binary, or bind through a struct / "+
+					"*struct parameter whose field names come from reflection",
 					methodName, meta.path))
 			}
 		}

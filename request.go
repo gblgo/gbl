@@ -149,7 +149,8 @@ func queryValues(r *http.Request) url.Values {
 // form values, uploaded files, the JSON body buffer and whether the body is JSON.
 // The body buffer is pooled; the caller must release it with releaseBodyBuffer
 // once binding is done, since the decoded parameters are independent copies.
-func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpMethod) (url.Values, filesMap, *bytes.Buffer, bool, error) {
+func parseRequestParameters(w http.ResponseWriter, r *http.Request,
+	method httpMethod) (url.Values, filesMap, *bytes.Buffer, bool, error) {
 	// GBL deliberately applies a strict parameter-source policy by HTTP method.
 	// GET, HEAD, DELETE and OPTIONS may read only URL path parameters (matched by
 	// the router) and URL query parameters. Their request bodies are never parsed

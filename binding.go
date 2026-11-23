@@ -435,7 +435,8 @@ func injectedParameters(
 			return fmt.Errorf("parameter %q was not initialized", paramNameAt(names, i))
 		}
 		if !v.Type().AssignableTo(plan.types[i]) {
-			return fmt.Errorf("parameter %q type mismatch: got %s, want %s", paramNameAt(names, i), v.Type(), plan.types[i])
+			return fmt.Errorf("parameter %q type mismatch: got %s, want %s",
+				paramNameAt(names, i), v.Type(), plan.types[i])
 		}
 	}
 	return nil
@@ -582,7 +583,8 @@ func bindStruct(t reflect.Type, src *nameSources) (reflect.Value, error) {
 // list, so the request path skips reflection-based field introspection entirely.
 // The per-field precedence matches bindStruct: a path value wins over
 // form/query, and everything else falls through to bindFormParameter.
-func bindStructFields(t reflect.Type, fields []structField, src *nameSources) (reflect.Value, error) {
+func bindStructFields(t reflect.Type, fields []structField,
+	src *nameSources) (reflect.Value, error) {
 	result := reflect.New(t).Elem()
 
 	for _, field := range fields {
