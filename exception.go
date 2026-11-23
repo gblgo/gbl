@@ -61,6 +61,13 @@ var typeRecognitionError = []byte("Reflection Type Identification Exception")
 // errorWriteback renders a panic payload as response bytes, choosing the form by
 // its reflected kind.
 func errorWriteback(w http.ResponseWriter, err any) []byte {
+	// A nil payload renders as an empty body: a PanicProcessor may deliberately
+	// answer with no content, and reflect.ValueOf(nil) would otherwise fall into
+	// the unrecognized-kind default and emit the fixed error text.
+	if err == nil {
+		return []byte(empty)
+	}
+
 	// A value implementing error is written back as its message. Reflection
 	// instead walks the concrete type, and the usual errors.New and fmt.Errorf
 	// values consist entirely of unexported fields, so the client would receive
@@ -74,10 +81,20 @@ func errorWriteback(w http.ResponseWriter, err any) []byte {
 	var bytes []byte
 	switch val.Kind() {
 	case reflect.Struct, reflect.Map:
+		// A marshal failure leaves no renderable body; fall back to the fixed
+		// text rather than writing a JSON content type with empty bytes.
+		data, marshalErr := json.Marshal(val.Interface())
+		if marshalErr != nil {
+			return typeRecognitionError
+		}
 		w.Header().Set(contentType, applicationJsonCharset)
-		bytes, _ = json.Marshal(val.Interface())
+		bytes = data
 	case reflect.Array, reflect.Slice:
-		bytes, _ = json.Marshal(val.Interface())
+		data, marshalErr := json.Marshal(val.Interface())
+		if marshalErr != nil {
+			return typeRecognitionError
+		}
+		bytes = data
 	case reflect.String:
 		bytes = []byte(val.String())
 	case reflect.Pointer, reflect.Interface:

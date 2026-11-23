@@ -200,7 +200,10 @@ func (e *engine) matchNode(method httpMethod, path string, params map[string]str
 
 	// Slow path: fall back to radix tree for dynamic routes (O(path length))
 	root := e.roots[method]
-	if root == nil && len(statics) == 0 {
+	if root == nil && (len(statics) == 0 || isNormalized(path)) {
+		// No tree to walk. A normalized path also cannot hit the rejoined
+		// static reprobe below, so splitting it would be wasted work — the
+		// common shape when allowFor probes static-only methods for a 404.
 		return nil
 	}
 

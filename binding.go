@@ -509,6 +509,14 @@ func lookupString(values map[string]string, name string) (string, bool) {
 // types pull from the uploaded files, slices/arrays consume repeated values,
 // and scalars take the first value. name is matched against the request exactly.
 func bindFormParameter(t reflect.Type, name string, src *nameSources) (reflect.Value, error) {
+	// The file-header shapes are checked first: multipart.FileHeader is itself a
+	// struct, and letting the struct branch below catch it would bind the
+	// header's own exported fields from form keys instead of the uploaded file.
+	if isFileHeaderType(t) {
+		headers, _ := src.filesGet(name)
+		return bindFileHeaders(t, headers)
+	}
+
 	if t.Kind() == reflect.Pointer {
 		// A missing non-struct pointer stays nil; a missing *struct is still
 		// allocated (zero-valued) so its fields can be bound individually.
@@ -528,11 +536,6 @@ func bindFormParameter(t reflect.Type, name string, src *nameSources) (reflect.V
 
 	if t.Kind() == reflect.Struct {
 		return bindStruct(t, src)
-	}
-
-	if isFileHeaderType(t) {
-		headers, _ := src.filesGet(name)
-		return bindFileHeaders(t, headers)
 	}
 
 	values, _ := src.formGet(name)

@@ -1033,11 +1033,11 @@ gbl.Configure(func(c *gbl.Config) {
 
 **三个条件必须同时成立：**
 
-1. 客户端发送了 `Accept-Encoding: gzip`
+1. 客户端发送了 `Accept-Encoding: gzip`——`gzip;q=0` 这类明确拒绝会被尊重
 2. 响应的 `Content-Type` 是可压缩的（文本、JSON、XML、CSS、JS、SVG 等）
 3. 响应体至少 **1 KB**——更小的响应压缩收益甚微，CPU 开销不值
 
-三个条件都成立时，中间件将暂存的响应体替换为压缩数据，并设置 `Content-Encoding: gzip` 和 `Vary: Accept-Encoding`。
+三个条件都成立时，中间件将暂存的响应体替换为压缩数据，并设置 `Content-Encoding: gzip`。经过该中间件的每个响应都会带上 `Vary: Accept-Encoding`，无论最终压没压缩：缓存该用哪份表示取决于客户端的编码声明，缓存层必须按它区分。
 
 **压缩级别**（与 `compress/gzip` 一致，重新导出，无需直接 import 标准库）：
 
