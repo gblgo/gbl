@@ -13,7 +13,26 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"unicode"
 )
+
+// isGoIdentifier reports whether s is a valid Go identifier: a letter or
+// underscore first, then letters, digits or underscores. Path parameter names
+// bind handler arguments by name, so anything else could never match.
+func isGoIdentifier(s string) bool {
+	if s == empty {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r == '_' || unicode.IsLetter(r):
+		case i > 0 && unicode.IsDigit(r):
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 // httpMethod is the internal enum of supported HTTP verbs, indexed against
 // methodNames and the per-method route trees. Its values are unexported, and it
@@ -165,6 +184,14 @@ func (e *engine) dealPath(path string) ([]segmentMeta, string) {
 		if strings.Contains(part, leftCurlyBrace) {
 			meta.isVar = true
 			meta.paramName = part[1 : len(part)-1]
+		}
+
+		// The name has to be usable as a Go parameter name, or it could never
+		// match any handler argument: a stray character (":id}") would register
+		// silently and bind the zero value on every request.
+		if meta.isVar && !isGoIdentifier(meta.paramName) {
+			e.failStartup("when registering a route, the parameter name in '/" + part +
+				"' must be a valid Go identifier, like ':id' or '{id}'")
 		}
 
 		segmentMetas = append(segmentMetas, meta)
