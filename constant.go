@@ -45,6 +45,10 @@ const (
 	vary = "Vary"
 	// headerComma is the canonical joiner for multi-value header lists.
 	headerComma = ", "
+	// comma separates list items inside a single header value.
+	comma = ","
+	// asterisk is the wildcard token in CORS lists and Accept-Encoding.
+	asterisk = "*"
 	// textPlainCharset is the default body type for plain text and error
 	// replies.
 	textPlainCharset = "text/plain; charset=utf-8"

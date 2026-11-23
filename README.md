@@ -1273,11 +1273,11 @@ installed. The kernel writes no fallback files.
 
 **Three conditions must all hold:**
 
-1. The client sent `Accept-Encoding: gzip`
+1. The client sent `Accept-Encoding: gzip` — an explicit refusal such as `gzip;q=0` is honored
 2. The response `Content-Type` is compressible (text, JSON, XML, CSS, JS, SVG, etc.)
 3. The response body is at least **1 KB** — smaller bodies gain little and the CPU cost is not worth it
 
-When all conditions hold, the middleware replaces the staged body with compressed data and sets `Content-Encoding: gzip` and `Vary: Accept-Encoding`.
+When all conditions hold, the middleware replaces the staged body with compressed data and sets `Content-Encoding: gzip`. Every response passing through the middleware also gains `Vary: Accept-Encoding`, compressed or not: which cached representation fits depends on the client's encoding, so caches must key on it.
 
 **Compression levels** (mirroring `compress/gzip`, re-exported so you need not import it directly):
 

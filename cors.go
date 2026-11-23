@@ -13,14 +13,9 @@ import (
 	"time"
 )
 
-// Constants used only by this file: wire fragments shared with the generic
-// matching code, the CORS response headers the spec names literally, and the
-// fixed preflight rejection reasons.
+// Constants used only by this file: the CORS response headers the spec names
+// literally, and the fixed preflight rejection reasons.
 const (
-	// separator for header value lists
-	comma = ","
-	// CORS wildcard for origins, methods and headers
-	asterisk = "*"
 	// the only value credentials headers understand
 	headerTrue = "true"
 	// request header naming the cross-origin caller
