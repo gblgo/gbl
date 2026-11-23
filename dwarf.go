@@ -18,22 +18,24 @@ import (
 // function ("<file>:<line>").
 //
 // This is the production half of name binding. The Go compiler discards parameter
-// names from the runtime type metadata that reflect exposes, but it still emits
-// them into the binary's DWARF section by default — and -trimpath does not strip
-// it. So a sourceless production binary (a multi-stage image, a bare executable)
-// still carries every function's parameter names, plus the declaration file and
-// line that let us match a handler to its DWARF entry by the SAME position key
-// the disk parser uses. Position keys also resolve closures and func literals,
-// and are immune to Go 1.27's merging and renaming of identical literals.
+// names from the runtime type metadata that reflect exposes. It still emits them
+// into the binary's DWARF section by default, and -trimpath does not strip that
+// section. So even a sourceless production binary — a multi-stage image, a bare
+// executable — carries every function's parameter names. The section also records
+// each declaration's file and line, so a handler is matched to its DWARF entry by
+// the SAME position key the disk parser uses. Position keys also resolve closures
+// and func literals, and are immune to the merging and renaming of identical
+// literals introduced in Go 1.27.
 //
-// It returns nil when the binary has no readable DWARF — most commonly because it
-// was built with `-ldflags "-w"` or `"-s"`, which strip debug information. The
-// caller treats nil as "no names recoverable" and fails startup for a handler
-// that binds by name, pointing the user at struct binding instead.
+// It returns nil when the binary has no readable DWARF. This happens most
+// commonly when the binary was built with `-ldflags "-w"` or `"-s"`, which strip
+// debug information. The caller treats nil as "no names recoverable" and fails
+// startup for a handler that binds by name, pointing the user at struct binding
+// instead.
 //
 // DWARF lists a function's formal parameters in source order: the inputs first,
 // then pseudo-parameters for the results (`~r0`, ...) and, for methods, the
-// receiver (`~p0`). The caller slices the list to the handler's NumIn, which keeps
+// receiver (`~p0`). The caller slices the list to the handler's NumIn. That keeps
 // exactly the input names and drops the trailing result pseudo-parameters.
 func buildDWARFIndex() map[string][]string {
 	exe, err := os.Executable()
@@ -76,7 +78,7 @@ func buildDWARFIndex() map[string][]string {
 			flush()
 			// DeclFile on a subprogram is a 1-based index into its unit's line-table
 			// file list, so the list must be refreshed per compile unit.
-			if lr, lerr := data.LineReader(entry); lerr == nil && lr != nil {
+			if lr, lErr := data.LineReader(entry); lErr == nil && lr != nil {
 				files = lr.Files()
 			}
 		case dwarf.TagSubprogram:
@@ -121,22 +123,31 @@ func buildDWARFIndex() map[string][]string {
 
 // openSelfDWARF reads the DWARF section from the executable at path, trying each
 // platform's format. The debug sections are loaded into memory by the call, so
-// closing the file afterward is safe. It returns nil for an unknown format or a
-// binary with no DWARF (e.g. built with -w / -s).
+// closing the file afterward is safe. It returns nil for an unknown format, for a
+// binary with no DWARF (e.g. built with -w / -s), or when the DWARF data cannot
+// be read — none of these leave a usable result behind.
 func openSelfDWARF(path string) *dwarf.Data {
-	if f, err := pe.Open(path); err == nil {
-		defer f.Close()
-		data, _ := f.DWARF()
-		return data
+	// The three container types share this shape; wrapping the openers lets the
+	// branches collapse into one loop.
+	type dwarfFile interface {
+		DWARF() (*dwarf.Data, error)
+		Close() error
 	}
-	if f, err := elf.Open(path); err == nil {
-		defer f.Close()
-		data, _ := f.DWARF()
-		return data
+	openers := []func(string) (dwarfFile, error){
+		func(p string) (dwarfFile, error) { return pe.Open(p) },
+		func(p string) (dwarfFile, error) { return elf.Open(p) },
+		func(p string) (dwarfFile, error) { return macho.Open(p) },
 	}
-	if f, err := macho.Open(path); err == nil {
-		defer f.Close()
-		data, _ := f.DWARF()
+	for _, open := range openers {
+		f, err := open(path)
+		if err != nil {
+			continue // not this container format
+		}
+		data, dErr := f.DWARF()
+		_ = f.Close()
+		if dErr != nil {
+			return nil // right format, no readable DWARF: nothing left to try
+		}
 		return data
 	}
 	return nil
