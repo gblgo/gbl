@@ -265,13 +265,23 @@ the parameter names back out of the binary itself, so `func(id string)` keeps
 binding by name. Your project, repo and final image contain **zero generated
 files** and need **zero extra tooling**.
 
-**The one caveat: `-ldflags "-w"` / `"-s"`.** These linker flags strip debug info —
+**The one build caveat: `-ldflags "-w"` / `"-s"`.** These linker flags strip debug info —
 `-w` disables DWARF and `-s` omits the symbol table and debug info. A binary built
 with them carries no parameter names for gbl to read, so a handler that binds
 scalars by name aborts at startup rather than silently binding nothing; the error
-explains exactly this. The fix is to bind through a `struct` / `*struct` parameter
-instead: a struct's field names come from reflection, not DWARF, and survive any
-build flag. If you do not strip debug info, there is nothing to do.
+explains exactly this.
+
+Before reaching for them, be clear about what they still deliver. Panic stack
+traces and `pprof` profiles are symbolized from a call table these flags do not
+touch, and "hiding internals" is a myth — function names and type strings stay in
+the binary either way. What remains is roughly 30% size, nothing more: a
+long-running service rarely bargains over a few megabytes, while the loss lands
+immediately on `func getUser(id string)`. A gbl build script has no reason to
+carry these flags.
+
+If a deployment truly must strip anyway, bind through a `struct` / `*struct`
+parameter instead: a struct's field names come from reflection, not DWARF, and
+survive any build flag. If you do not strip debug info, there is nothing to do.
 
 ---
 
