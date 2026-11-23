@@ -94,6 +94,34 @@ framework changes how you write business logic.
 | `*multipart.FileHeader` / `[]*multipart.FileHeader` (and value forms) | uploaded file(s) matched by field name |
 | any other type | a **business value** bound by name (see below) |
 
+### Which functions can be handlers
+
+Below are the handler registration shapes. gbl supports the first five — use
+them freely; gbl does not support the last two, and registering one is stopped
+right there:
+
+| Registration shape | Example | Status |
+|---|---|---|
+| Named function | `gbl.Get("/user", getUser)` | supported |
+| Named function from another package | `gbl.Get("/user", userapi.GetUser)` | supported |
+| Package-level `func` variable | `var getUser = func(id string) string { ... }` | supported |
+| Inline `func` literal | `gbl.Get("/user", func(id string) string { ... })` | supported |
+| Closure capturing outer variables | `gbl.Get("/user", func(id string) string { return svc.Load(id) })` | supported |
+| Method value — a struct's method passed as the function itself | `gbl.Get("/user", hs.Lookup)` | **not supported** |
+| Generic instantiation | `gbl.Get("/echo", echo[int])` | **not supported** |
+
+Both unsupported shapes have a one-line fix. Wrap a method value in a closure:
+
+```go
+gbl.Get("/user", func(id string) string { return hs.Lookup(id) })
+```
+
+Calling it with parentheses is no escape either — `hs.Lookup(id)` passes the
+method's **return value**, not a function, and is rejected the same way. For a
+generic instantiation, register a plain function that calls it, or bind through
+a `struct` / `*struct` parameter. gbl stops these at registration so no handler
+can ever work in development and break in production.
+
 ### Business values bind by name
 
 For every business parameter, **a matching path parameter always wins first**. When
@@ -237,13 +265,23 @@ the parameter names back out of the binary itself, so `func(id string)` keeps
 binding by name. Your project, repo and final image contain **zero generated
 files** and need **zero extra tooling**.
 
-**The one caveat: `-ldflags "-w"` / `"-s"`.** These linker flags strip debug info —
+**The one build caveat: `-ldflags "-w"` / `"-s"`.** These linker flags strip debug info —
 `-w` disables DWARF and `-s` omits the symbol table and debug info. A binary built
 with them carries no parameter names for gbl to read, so a handler that binds
 scalars by name aborts at startup rather than silently binding nothing; the error
-explains exactly this. The fix is to bind through a `struct` / `*struct` parameter
-instead: a struct's field names come from reflection, not DWARF, and survive any
-build flag. If you do not strip debug info, there is nothing to do.
+explains exactly this.
+
+Before reaching for them, be clear about what they still deliver. Panic stack
+traces and `pprof` profiles are symbolized from a call table these flags do not
+touch, and "hiding internals" is a myth — function names and type strings stay in
+the binary either way. What remains is roughly 30% size, nothing more: a
+long-running service rarely bargains over a few megabytes, while the loss lands
+immediately on `func getUser(id string)`. A gbl build script has no reason to
+carry these flags.
+
+If a deployment truly must strip anyway, bind through a `struct` / `*struct`
+parameter instead: a struct's field names come from reflection, not DWARF, and
+survive any build flag. If you do not strip debug info, there is nothing to do.
 
 ---
 
@@ -693,7 +731,8 @@ engine.Next() → handlers[0]
 ```
 
 6. **Write the response.** If a middleware or the handler already wrote a body
-   (`c.JSON`, `c.String`, or an injected `http.ResponseWriter`), that stands.
+   (through an injected `http.ResponseWriter`, or with an
+   `AbortWithStatusString` / `AbortWithStatusJSON` denial), that stands.
    Otherwise the engine writes the staged `c.bytes` with the content type chosen
    at registration, flushing the recorded status (default 200) first.
 7. **Cleanup.** Multipart temp files are removed; the `Context`, path-param map
@@ -752,7 +791,8 @@ if err := gbl.Shutdown(ctx); err != nil {
 `*Context` is threaded through the middleware chain and, when a handler declares
 it, injected as a parameter. It carries the request, the matched path
 parameters and a key/value bag for passing data between links and to the
-handler; the response is written through `c.JSON` / `c.String` / `c.Status`.
+handler; the response is rendered from the handler's return value (§2), or
+written directly through an injected `http.ResponseWriter`.
 
 > **A `Context` is pooled and valid only within the current request.** As soon
 > as the request ends, it is cleared and reused for the next one. So do not store
@@ -1203,7 +1243,6 @@ resolve those sources and call the same `Configure` entry point.
 
 ```go
 type Config struct {
-    Name              string        // application name
     Port              string        // listen port, without the leading colon
     CertFile          string        // TLS certificate file path
     KeyFile           string        // TLS private key file path
@@ -1226,7 +1265,6 @@ no-op.
 
 ```go
 gbl.Configure(func(c *gbl.Config) {
-    c.Name = "myapp"
     c.Port = "8080"
     c.ReadTimeout = 5 * time.Second
 })
@@ -1234,7 +1272,6 @@ gbl.Configure(func(c *gbl.Config) {
 
 | Field | Default | Meaning |
 |---|---|---|
-| `Name` | `gbl` | application name |
 | `Port` | `9801` | listen port |
 | `CertFile` / `KeyFile` | empty | both set ⇒ HTTPS enabled |
 | `ReadTimeout` / `ReadHeaderTimeout` / `WriteTimeout` / `IdleTimeout` | 10s / 5s / 10s / 60s | server timeouts |
@@ -1257,10 +1294,11 @@ control, build an absolute path inside `Configure`.
 Every startup and registration failure is **fail-fast**: gbl first records the
 reason through the engine `Logger`, then panics — so a deployment that dies
 before serving still leaves the cause in your log sink, not just a bare stack
-trace. A busy port, a route conflict, a dangerous CORS policy and a name-binding
-handler whose parameter names are unavailable at runtime (a binary built with
-`-ldflags "-w"` or `"-s"`, which strip the DWARF gbl reads them from) all take
-this path.
+trace. A busy port, a route conflict, a dangerous CORS policy, an unsupported
+handler shape (a bound method value or a generic instantiation — see §2) and a
+name-binding handler whose parameter names are unavailable at runtime (a binary
+built with `-ldflags "-w"` or `"-s"`, which strip the DWARF gbl reads them from)
+all take this path.
 
 Logs go to the console by default, or to your sink when a custom `Logger` is
 installed. The kernel writes no fallback files.
@@ -1299,7 +1337,7 @@ import "github.com/gblgo/gbl"
 func main() {
     gbl.Use(gbl.Compress(gbl.DefaultCompression))
     gbl.Get("/api/data", handler)
-    gbl.Run(":8080")
+    gbl.Run()
 }
 ```
 
