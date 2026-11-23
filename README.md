@@ -94,6 +94,34 @@ framework changes how you write business logic.
 | `*multipart.FileHeader` / `[]*multipart.FileHeader` (and value forms) | uploaded file(s) matched by field name |
 | any other type | a **business value** bound by name (see below) |
 
+### Which functions can be handlers
+
+Below are the handler registration shapes. gbl supports the first five — use
+them freely; gbl does not support the last two, and registering one is stopped
+right there:
+
+| Registration shape | Example | Status |
+|---|---|---|
+| Named function | `gbl.Get("/user", getUser)` | supported |
+| Named function from another package | `gbl.Get("/user", userapi.GetUser)` | supported |
+| Package-level `func` variable | `var getUser = func(id string) string { ... }` | supported |
+| Inline `func` literal | `gbl.Get("/user", func(id string) string { ... })` | supported |
+| Closure capturing outer variables | `gbl.Get("/user", func(id string) string { return svc.Load(id) })` | supported |
+| Method value — a struct's method passed as the function itself | `gbl.Get("/user", hs.Lookup)` | **not supported** |
+| Generic instantiation | `gbl.Get("/echo", echo[int])` | **not supported** |
+
+Both unsupported shapes have a one-line fix. Wrap a method value in a closure:
+
+```go
+gbl.Get("/user", func(id string) string { return hs.Lookup(id) })
+```
+
+Calling it with parentheses is no escape either — `hs.Lookup(id)` passes the
+method's **return value**, not a function, and is rejected the same way. For a
+generic instantiation, register a plain function that calls it, or bind through
+a `struct` / `*struct` parameter. gbl stops these at registration so no handler
+can ever work in development and break in production.
+
 ### Business values bind by name
 
 For every business parameter, **a matching path parameter always wins first**. When
@@ -1257,10 +1285,11 @@ control, build an absolute path inside `Configure`.
 Every startup and registration failure is **fail-fast**: gbl first records the
 reason through the engine `Logger`, then panics — so a deployment that dies
 before serving still leaves the cause in your log sink, not just a bare stack
-trace. A busy port, a route conflict, a dangerous CORS policy and a name-binding
-handler whose parameter names are unavailable at runtime (a binary built with
-`-ldflags "-w"` or `"-s"`, which strip the DWARF gbl reads them from) all take
-this path.
+trace. A busy port, a route conflict, a dangerous CORS policy, an unsupported
+handler shape (a bound method value or a generic instantiation — see §2) and a
+name-binding handler whose parameter names are unavailable at runtime (a binary
+built with `-ldflags "-w"` or `"-s"`, which strip the DWARF gbl reads them from)
+all take this path.
 
 Logs go to the console by default, or to your sink when a custom `Logger` is
 installed. The kernel writes no fallback files.

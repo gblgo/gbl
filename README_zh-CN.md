@@ -79,6 +79,28 @@ handler 就是任意 `func`。gbl 读取它的签名，按**类型 + 名字**装
 | `*multipart.FileHeader` / `[]*multipart.FileHeader`（含值类型） | 按字段名匹配到的上传文件 |
 | 其他任意类型 | 按名字装配的**业务值**（见下） |
 
+### 哪些函数能当 handler
+
+以下是 handler 的注册写法。前五种 gbl 支持，直接用；后两种 gbl 不支持，注册时会被拦下：
+
+| 注册写法 | 示例 | 结果 |
+|---|---|---|
+| 命名函数 | `gbl.Get("/user", getUser)` | 支持 |
+| 其他包里的命名函数 | `gbl.Get("/user", userapi.GetUser)` | 支持 |
+| 包级 `func` 变量 | `var getUser = func(id string) string { ... }` | 支持 |
+| 注册处内联的 `func` 字面量 | `gbl.Get("/user", func(id string) string { ... })` | 支持 |
+| 捕获外部变量的闭包 | `gbl.Get("/user", func(id string) string { return svc.Load(id) })` | 支持 |
+| 方法值——把结构体的方法本身当函数传 | `gbl.Get("/user", hs.Lookup)` | **不支持** |
+| 泛型实例化 | `gbl.Get("/echo", echo[int])` | **不支持** |
+
+两种不支持的写法都有固定改法。方法值包一层闭包就能用：
+
+```go
+gbl.Get("/user", func(id string) string { return hs.Lookup(id) })
+```
+
+带括号调用 `hs.Lookup(id)` 也躲不过去：传进去的是方法的**返回值**而不是函数，同样会被拦下。泛型实例化则写一个普通函数转调它，或改用 `struct` / `*struct` 参数装配。gbl 拦得这么早，是为了不让"开发期能跑、上线才炸"的 handler 混进部署。
+
 ### 业务值按名字装配
 
 对每个业务参数，**先查同名路径参数，命中就直接用**。没命中时，取值来源由 `Content-Type` **二选一**（不是级联回退）：
@@ -1003,7 +1025,6 @@ gbl.Configure(func(c *gbl.Config) {
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
-| `Name` | `gbl` | 应用名 |
 | `Port` | `9801` | 监听端口 |
 | `CertFile` / `KeyFile` | 空 | 两者都给 ⇒ 启用 HTTPS |
 | `ReadTimeout` / `ReadHeaderTimeout` / `WriteTimeout` / `IdleTimeout` | 10s / 5s / 10s / 60s | 服务端超时 |
