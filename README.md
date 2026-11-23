@@ -43,6 +43,7 @@ function, type, interface and method, each with a runnable example.
 14. [Configuration (`Config` / `Configure`)](#14-configuration-config--configure)
 15. [Startup failures (fail-fast)](#15-startup-failures-fail-fast)
 16. [Response compression (`Compress`)](#16-response-compression-compress)
+17. [Building & deploying](#17-building--deploying)
 
 > **One engine, many entry points.** gbl exposes a *single* package-level engine.
 > `Get/Post/Use/Group/Run/...` all act on it, so what you register and what you
@@ -243,45 +244,6 @@ gbl.Post("/echo", func(r *http.Request) string {
     return r.Header.Get("X-Trace-Id")
 })
 ```
-
-### Building for production: parameter names and DWARF
-
-Binding by name needs the handler's **parameter names**, which `reflect` does not
-expose. gbl recovers them from two places, tried in order: the handler's own source
-file on disk first — the development path (`go run`, or a build run next to the
-source tree) — then the binary's own **DWARF** debug info, the sourceless
-production path.
-
-The compiler emits DWARF by default, and `-trimpath` only rewrites the recorded
-source paths without stripping DWARF, so a **plain production build just works**:
-
-```bash
-# No wrapper, no install step, no code generation, no extra build command.
-go build -trimpath -o app ./cmd/api
-```
-
-Ship that binary into a container and run it away from its source, and gbl reads
-the parameter names back out of the binary itself, so `func(id string)` keeps
-binding by name. Your project, repo and final image contain **zero generated
-files** and need **zero extra tooling**.
-
-**The one build caveat: `-ldflags "-w"` / `"-s"`.** These linker flags strip debug info —
-`-w` disables DWARF and `-s` omits the symbol table and debug info. A binary built
-with them carries no parameter names for gbl to read, so a handler that binds
-scalars by name aborts at startup rather than silently binding nothing; the error
-explains exactly this.
-
-Before reaching for them, be clear about what they still deliver. Panic stack
-traces and `pprof` profiles are symbolized from a call table these flags do not
-touch, and "hiding internals" is a myth — function names and type strings stay in
-the binary either way. What remains is roughly 30% size, nothing more: a
-long-running service rarely bargains over a few megabytes, while the loss lands
-immediately on `func getUser(id string)`. A gbl build script has no reason to
-carry these flags.
-
-If a deployment truly must strip anyway, bind through a `struct` / `*struct`
-parameter instead: a struct's field names come from reflection, not DWARF, and
-survive any build flag. If you do not strip debug info, there is nothing to do.
 
 ---
 
@@ -1361,6 +1323,49 @@ gbl.Use(
 ```
 
 **Binary formats are never compressed:** images, video, audio, PDF and other binary content types are skipped automatically, since they are already compressed or gain nothing from gzip.
+
+---
+
+## 17. Building & deploying
+
+### Building for production: parameter names and DWARF
+
+Binding by name needs the handler's **parameter names**, which `reflect` does not
+expose. gbl recovers them from two places, tried in order: the handler's own source
+file on disk first — the development path (`go run`, or a build run next to the
+source tree) — then the binary's own **DWARF** debug info, the sourceless
+production path.
+
+The compiler emits DWARF by default, and `-trimpath` only rewrites the recorded
+source paths without stripping DWARF, so a **plain production build just works**:
+
+```bash
+# No wrapper, no install step, no code generation, no extra build command.
+go build -trimpath -o app ./cmd/api
+```
+
+Ship that binary into a container and run it away from its source, and gbl reads
+the parameter names back out of the binary itself, so `func(id string)` keeps
+binding by name. Your project, repo and final image contain **zero generated
+files** and need **zero extra tooling**.
+
+**The one build caveat: `-ldflags "-w"` / `"-s"`.** These linker flags strip debug info —
+`-w` disables DWARF and `-s` omits the symbol table and debug info. A binary built
+with them carries no parameter names for gbl to read, so a handler that binds
+scalars by name aborts at startup rather than silently binding nothing; the error
+explains exactly this.
+
+Before reaching for them, be clear about what they still deliver. Panic stack
+traces and `pprof` profiles are symbolized from a call table these flags do not
+touch, and "hiding internals" is a myth — function names and type strings stay in
+the binary either way. What remains is roughly 30% size, nothing more: a
+long-running service rarely bargains over a few megabytes, while the loss lands
+immediately on `func getUser(id string)`. A gbl build script has no reason to
+carry these flags.
+
+If a deployment truly must strip anyway, bind through a `struct` / `*struct`
+parameter instead: a struct's field names come from reflection, not DWARF, and
+survive any build flag. If you do not strip debug info, there is nothing to do.
 
 ---
 
