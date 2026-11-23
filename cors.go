@@ -52,12 +52,18 @@ const (
 // All fields are exported: build one with a struct literal and install it
 // with SetCorsConfig (nil disables CORS).
 type CorsConfig struct {
-	AllowedOrigins   []string      // origins accepted via Access-Control-Allow-Origin, or "*"
-	AllowedMethods   []string      // methods permitted for cross-origin requests
-	AllowedHeaders   []string      // request headers accepted in a preflight
-	ExposedHeaders   []string      // response headers readable by the cross-origin client
-	AllowCredentials bool          // whether cookies/auth may accompany cross-origin calls
-	MaxAge           time.Duration // how long a client may cache the preflight result
+	// origins accepted via Access-Control-Allow-Origin, or "*"
+	AllowedOrigins []string
+	// methods permitted for cross-origin requests
+	AllowedMethods []string
+	// request headers accepted in a preflight
+	AllowedHeaders []string
+	// response headers readable by the cross-origin client
+	ExposedHeaders []string
+	// whether cookies/auth may accompany cross-origin calls
+	AllowCredentials bool
+	// how long a client may cache the preflight result
+	MaxAge time.Duration
 }
 
 // validate enforces the CORS security policy at wiring time, so an unsafe
@@ -108,14 +114,14 @@ func isPreflightRequest(r *http.Request) bool {
 // is present; it decides CORS headers and preflight handling, then delegates the
 // actual request to the wrapped engine.
 type corsHandler struct {
-	engine *engine
-	config *CorsConfig
-	allowMethods  string
-	allowHeaders  string
-	exposeHeaders string
-	maxAge        string
-	wildcard bool
-	expose   bool
+	engine            *engine
+	config            *CorsConfig
+	allowMethods      string
+	allowHeaders      string
+	exposeHeaders     string
+	maxAge            string
+	wildcard          bool
+	expose            bool
 	allowedOriginsMap map[string]struct{}
 	allowedMethodsMap map[string]struct{}
 	allowedHeadersMap map[string]struct{}

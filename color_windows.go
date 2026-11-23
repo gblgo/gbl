@@ -17,8 +17,11 @@ import (
 const enableVirtualTerminalProcessing = 0x0004
 
 var (
-	kernel32           = syscall.NewLazyDLL("kernel32.dll")
+	// Windows kernel library hosting the console-mode APIs
+	kernel32 = syscall.NewLazyDLL("kernel32.dll")
+	// queries the mode bits of a console handle
 	procGetConsoleMode = kernel32.NewProc("GetConsoleMode")
+	// applies mode bits, enabling virtual terminal processing
 	procSetConsoleMode = kernel32.NewProc("SetConsoleMode")
 )
 

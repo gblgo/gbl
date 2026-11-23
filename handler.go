@@ -20,9 +20,12 @@ import (
 // plain fields and the map only strings, so both reset cheaply and carry no
 // request state between uses.
 var (
+	// responseWriterPool recycles the per-request writer wrapper.
 	responseWriterPool = sync.Pool{
 		New: func() any { return &pooledResponseWriter{} },
 	}
+	// pathParamsPool recycles the map of captured path parameters, sized for
+	// typical routes.
 	pathParamsPool = sync.Pool{
 		New: func() any { return make(map[string]string, 4) },
 	}

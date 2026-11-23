@@ -14,13 +14,20 @@ import (
 // walking segments from the root; the node where the last segment lands either
 // terminates in a handler (exist) or is only a waypoint on a longer route.
 type routeNode struct {
-	segment    string                // raw segment text this node was created for
-	path       string                // full route path, set only on a terminal node
-	paramName  string                // binding name when segment is a variable, e.g. "id" for ":id"
-	exist      bool                  // true when a handler is registered at this node
-	handler    *routeHandler         // handler reached at this node, valid when exist
-	staticNode map[string]*routeNode // literal children, keyed by exact segment text
-	varNode    []*routeNode          // wildcard children, matched against any segment
+	// raw segment text this node was created for
+	segment string
+	// full route path, set only on a terminal node
+	path string
+	// binding name when segment is a variable, e.g. "id" for ":id"
+	paramName string
+	// true when a handler is registered at this node
+	exist bool
+	// handler reached at this node, valid when exist
+	handler *routeHandler
+	// literal children, keyed by exact segment text
+	staticNode map[string]*routeNode
+	// wildcard children, matched against any segment
+	varNode []*routeNode
 }
 
 // segmentMeta is one parsed segment of a registration path: its text, whether

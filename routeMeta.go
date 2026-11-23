@@ -10,7 +10,8 @@ type routeMeta struct {
 	method httpMethod
 	path   string
 	fn     any
-	mw     []HandlerFunc // middleware contributed by the route's group, if any
+	// middleware contributed by the route's group, if any
+	mw []HandlerFunc
 }
 
 // register queues a route on the engine with no group middleware. Nothing is

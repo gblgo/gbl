@@ -31,7 +31,8 @@ type RouteGroup interface {
 // the path prefix to prepend, and the middleware to attach to its routes.
 type routeGroup struct {
 	// 24-byte fields (slice)
-	middlewares []HandlerFunc // middleware that runs only for this group's routes
+	// middleware that runs only for this group's routes
+	middlewares []HandlerFunc
 
 	// 16-byte fields (string)
 	group string

@@ -98,7 +98,10 @@ type routeHandler struct {
 	// 24-byte fields (reflect.Value, slices)
 	v          reflect.Value
 	paramNames []string
-	handlers   []HandlerFunc // this route's frozen request chain: the engine's global middleware, then the route group's, then the terminal routeEndpoint. It is assembled once at startup and reused verbatim by every request.
+	// this route's frozen request chain: the engine's global middleware,
+	// then the route group's, then the terminal routeEndpoint. It is
+	// assembled once at startup and reused verbatim by every request.
+	handlers []HandlerFunc
 
 	// bindPlan (152 bytes)
 	plan bindPlan

@@ -29,29 +29,44 @@ import (
 // port, by driving generateRoute and ServeHTTP directly.
 type engine struct {
 	// 24-byte fields (slices)
-	roots          []*routeNode         // one routing tree per supported method (dynamic routes with path params)
-	routeMetaSlice []*routeMeta         // registrations queued before generateRoute
-	middlewares    []HandlerFunc        // global chain, merged with each group's at generation
+	// one routing tree per supported method (dynamic routes with path params)
+	roots []*routeNode
+	// registrations queued before generateRoute
+	routeMetaSlice []*routeMeta
+	// global chain, merged with each group's at generation
+	middlewares []HandlerFunc
 
 	// 16-byte fields (interfaces)
-	panicProcessor PanicProcessor // user hook that renders panic values
-	logger         Logger         // sink for internal logs; never nil
+	// user hook that renders panic values
+	panicProcessor PanicProcessor
+	// sink for internal logs; never nil
+	logger Logger
 
 	// 8-byte fields (pointers, maps)
-	staticRoutes [methodCount]map[string]*routeHandler // O(1) lookup for static routes (no path params)
-	cfg          *Config                               // runtime configuration; defaults overlaid by Configure
-	cors         *CorsConfig                           // nil disables the CORS layer
-	astFileMap   map[string]*ast.File                  // parsed source files for parameter names
-	fest         *token.FileSet                        // file set backing astFileMap
-	dwarfIndex   map[string][]string                   // lazily built "<file>:<line>"->param names from the binary's DWARF; the sourceless fallback
-	server       *http.Server                          // live server, set by Run; nil before start
+	// O(1) lookup for static routes (no path params)
+	staticRoutes [methodCount]map[string]*routeHandler
+	// runtime configuration; defaults overlaid by Configure
+	cfg *Config
+	// nil disables the CORS layer
+	cors *CorsConfig
+	// parsed source files for parameter names
+	astFileMap map[string]*ast.File
+	// file set backing astFileMap
+	fest *token.FileSet
+	// lazily built "<file>:<line>"->param names from the binary's DWARF; the sourceless fallback
+	dwarfIndex map[string][]string
+	// live server, set by Run; nil before start
+	server *http.Server
 
 	// sync primitives
-	shutdownOnce sync.Once  // collapse signal and manual shutdown
-	startMu      sync.Mutex // guards listener/server assignment
+	// collapse signal and manual shutdown
+	shutdownOnce sync.Once
+	// guards listener/server assignment
+	startMu sync.Mutex
 
 	// 1-byte fields
-	generated bool // routes frozen into trees; also gates the read-only-after-Run contract
+	// routes frozen into trees; also gates the read-only-after-Run contract
+	generated bool
 }
 
 // defaultEngine is the one and only engine, backing the entire package-level

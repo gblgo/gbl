@@ -67,8 +67,13 @@ func newStdLogger() stdLogger {
 	return stdLogger{l: log.New(consoleWriter(os.Stderr), "", log.LstdFlags)}
 }
 
-func (s stdLogger) Info(msg string, kv ...any)  { s.emit("INFO", msg, kv) }
-func (s stdLogger) Warn(msg string, kv ...any)  { s.emit("WARN", msg, kv) }
+// Info logs a routine event at INFO level with optional key-value pairs.
+func (s stdLogger) Info(msg string, kv ...any) { s.emit("INFO", msg, kv) }
+
+// Warn logs a noteworthy but recoverable event at WARN level.
+func (s stdLogger) Warn(msg string, kv ...any) { s.emit("WARN", msg, kv) }
+
+// Error logs a failure at ERROR level.
 func (s stdLogger) Error(msg string, kv ...any) { s.emit("ERROR", msg, kv) }
 
 // Banner writes the startup block straight to the sink's underlying writer,
