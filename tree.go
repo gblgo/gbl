@@ -185,25 +185,51 @@ func splitPathInto(dst []string, path string) []string {
 //
 // Optimization: static routes (no path parameters) are stored in a map for O(1)
 // lookup. Only dynamic routes (with path parameters like :id) use the radix tree.
+//
+// A request path carrying empty segments ("/user//x", "/user/") is not in
+// normal form, while every stored route is: registration dropped the same empty
+// segments. The tree already ignores them through splitPathInto, so the static
+// map probes the '/'-joined segments too, and both tables answer such a path
+// identically.
 func (e *engine) matchNode(method httpMethod, path string, params map[string]string) *routeHandler {
 	// Fast path: try static route map first (O(1))
-	if handler, ok := e.staticRoutes[method][path]; ok {
+	statics := e.staticRoutes[method]
+	if handler, ok := statics[path]; ok {
 		return handler
 	}
 
 	// Slow path: fall back to radix tree for dynamic routes (O(path length))
 	root := e.roots[method]
-	if root == nil {
+	if root == nil && len(statics) == 0 {
 		return nil
 	}
 
 	bufPool := segmentPool.Get().(*[]string)
 	segments := splitPathInto((*bufPool)[:0], path)
-	handler := searchNode(root, segments, 0, params)
+
+	var handler *routeHandler
+	if root != nil {
+		handler = searchNode(root, segments, 0, params)
+	}
+	if handler == nil && len(statics) > 0 && !isNormalized(path) {
+		normalized := slash + strings.Join(segments, slash)
+		handler = statics[normalized]
+	}
+
 	*bufPool = segments
 	segmentPool.Put(bufPool)
 
 	return handler
+}
+
+// isNormalized reports whether the path already stores itself: no trailing
+// separator and no doubled one inside. Exact requests, which are the overwhelming
+// majority, therefore never reach the join the normalized probe needs.
+func isNormalized(path string) bool {
+	if len(path) < 2 || path[len(path)-1] == '/' {
+		return false
+	}
+	return !strings.Contains(path, "//")
 }
 
 // allowFor lists the methods that can actually reach path.
