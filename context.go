@@ -21,9 +21,13 @@ import (
 // call one of the Abort methods.
 type HandlerFunc func(c *Context)
 
-// abortIndex is far beyond any real chain length, so setting the cursor to it
-// makes every in-flight Next loop terminate immediately.
-const abortIndex = math.MaxInt / 2
+const (
+	// far beyond any real chain length, so setting the cursor here ends
+	// every in-flight Next loop at once
+	abortIndex = math.MaxInt / 2
+	// fixed 500 body written when encoding the handler result fails
+	responseSerializationFailed = "response serialization failed"
+)
 
 // routeEndpoint is the terminal link appended to every route's chain. It is a
 // shared, stateless function because the concrete handler is read from the

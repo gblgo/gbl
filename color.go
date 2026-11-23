@@ -11,14 +11,26 @@ import (
 	"sync"
 )
 
-// ANSI SGR sequences used to tint the level label on a terminal. They are only
-// ever emitted when the console writer is a real TTY, so redirected output and
-// log files never see them.
+// Constants used only by this file: the ANSI SGR sequences that tint the level
+// label on a terminal and the bound for the label scan.
 const (
-	ansiReset  = "\x1b[0m"
-	ansiRed    = "\x1b[31m"
-	ansiGreen  = "\x1b[32m"
+	// The SGR sequences are only ever emitted when the console writer is a
+	// real TTY, so redirected output and log files never see them.
+	// restores default terminal attributes after a tint
+	ansiReset = "\x1b[0m"
+	// tint of ERROR labels
+	ansiRed = "\x1b[31m"
+	// tint of INFO labels
+	ansiGreen = "\x1b[32m"
+	// tint of WARN labels
 	ansiYellow = "\x1b[33m"
+
+	// maxLevelScanTokens bounds the level-label scan. logLine always puts the
+	// label first, and the standard logger's optional header precedes it with
+	// at most date, time and file:line tokens. Stopping early also keeps an
+	// incidental all-caps word in a message body from ever reaching the tint
+	// lookup.
+	maxLevelScanTokens = 4
 )
 
 // levelColor maps a log level label to its terminal tint: ordinary info in
@@ -28,12 +40,6 @@ var levelColor = map[string]string{
 	"WARN":  ansiYellow,
 	"ERROR": ansiRed,
 }
-
-// maxLevelScanTokens bounds the level-label scan. logLine always puts the
-// label first, and the standard logger's optional header precedes it with at
-// most date, time and file:line tokens. Stopping early also keeps an incidental
-// all-caps word in a message body from ever reaching the tint lookup.
-const maxLevelScanTokens = 4
 
 // findLevel locates the level label: the first whitespace-delimited token that
 // names a known level. It returns the label's byte range and its tint, and

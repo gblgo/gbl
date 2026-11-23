@@ -62,10 +62,10 @@ func buildDWARFIndex() map[string][]string {
 		seen  bool
 	)
 	flush := func() {
-		if seen && key != "" {
+		if seen && key != empty {
 			index[key] = names
 		}
-		key, names, seen = "", nil, false
+		key, names, seen = empty, nil, false
 	}
 
 	for {

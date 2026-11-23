@@ -12,6 +12,42 @@ import (
 	"time"
 )
 
+// Constants used only by this file: wire fragments shared with the generic
+// matching code, the CORS response headers the spec names literally, and the
+// fixed preflight rejection reasons.
+const (
+	// separator for header value lists
+	comma = ","
+	// CORS wildcard for origins, methods and headers
+	asterisk = "*"
+	// the only value credentials headers understand
+	headerTrue = "true"
+	// request header naming the cross-origin caller
+	headerOrigin = "Origin"
+	// preflight: method the real call will use
+	accessControlRequestMethod = "Access-Control-Request-Method"
+	// response: origin the browser may read from
+	accessControlAllowOrigin = "Access-Control-Allow-Origin"
+	// response: cookies and auth may accompany the call
+	accessControlAllowCredentials = "Access-Control-Allow-Credentials"
+	// response: extra headers the client may read
+	accessControlExposeHeaders = "Access-Control-Expose-Headers"
+	// preflight: headers the real call will send
+	accessControlRequestHeaders = "Access-Control-Request-Headers"
+	// response: methods permitted cross-origin
+	accessControlAllowMethods = "Access-Control-Allow-Methods"
+	// response: headers accepted cross-origin
+	accessControlAllowHeaders = "Access-Control-Allow-Headers"
+	// response: preflight cache lifetime, in seconds
+	accessControlMaxAge = "Access-Control-Max-Age"
+	// rejection reason: origin outside AllowedOrigins
+	corsOriginNotAllowed = "CORS origin not allowed"
+	// rejection reason: method outside AllowedMethods
+	corsMethodNotAllowed = "CORS method not allowed"
+	// rejection reason: header outside AllowedHeaders
+	corsHeaderNotAllowed = "CORS header not allowed"
+)
+
 // CorsConfig describes the cross-origin policy applied by the CORS layer.
 // All fields are exported: build one with a struct literal and install it
 // with SetCorsConfig (nil disables CORS).

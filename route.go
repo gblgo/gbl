@@ -20,15 +20,39 @@ import (
 // never appears in a public signature — callers always speak in plain strings.
 type httpMethod uint8
 
+// Constants used only by this file: the wire spelling of each method, shared
+// between the names table and methodOf's switch so a new verb is written once,
+// and the path parameter braces.
+const (
+	// wire spelling of GET, shared by the names table and methodOf
+	nameMethodGet = "GET"
+	// wire spelling of HEAD
+	nameMethodHead = "HEAD"
+	// wire spelling of POST
+	nameMethodPost = "POST"
+	// wire spelling of PUT
+	nameMethodPut = "PUT"
+	// wire spelling of PATCH
+	nameMethodPatch = "PATCH"
+	// wire spelling of DELETE
+	nameMethodDelete = "DELETE"
+	// wire spelling of OPTIONS
+	nameMethodOptions = "OPTIONS"
+	// opens a named path parameter, as in /user/{id}
+	leftCurlyBrace = "{"
+	// closes a named path parameter
+	rightCurlyBrace = "}"
+)
+
 // methodNames holds the wire spelling of every supported method, indexed by httpMethod.
 var methodNames = [methodCount]string{
-	methodGet:     "GET",
-	methodHead:    "HEAD",
-	methodPost:    "POST",
-	methodPut:     "PUT",
-	methodPatch:   "PATCH",
-	methodDelete:  "DELETE",
-	methodOptions: "OPTIONS",
+	methodGet:     nameMethodGet,
+	methodHead:    nameMethodHead,
+	methodPost:    nameMethodPost,
+	methodPut:     nameMethodPut,
+	methodPatch:   nameMethodPatch,
+	methodDelete:  nameMethodDelete,
+	methodOptions: nameMethodOptions,
 }
 
 // methodOf resolves an HTTP method name, reporting false when GBL does not
@@ -38,19 +62,19 @@ var methodNames = [methodCount]string{
 // lowercase "get" is still treated as "GET".
 func methodOf(name string) (httpMethod, bool) {
 	switch strings.ToUpper(name) {
-	case "GET":
+	case nameMethodGet:
 		return methodGet, true
-	case "HEAD":
+	case nameMethodHead:
 		return methodHead, true
-	case "POST":
+	case nameMethodPost:
 		return methodPost, true
-	case "PUT":
+	case nameMethodPut:
 		return methodPut, true
-	case "PATCH":
+	case nameMethodPatch:
 		return methodPatch, true
-	case "DELETE":
+	case nameMethodDelete:
 		return methodDelete, true
-	case "OPTIONS":
+	case nameMethodOptions:
 		return methodOptions, true
 	default:
 		return 0, false
