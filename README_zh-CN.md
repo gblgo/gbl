@@ -585,7 +585,7 @@ engine.Next() → handlers[0]
    └─ 响应阶段代码（Next 返回后）
 ```
 
-6. **写回响应。** 若中间件或 handler 已写过 body（`c.JSON`、`c.String` 或注入的 `http.ResponseWriter`），就以它为准。否则引擎用注册时选定的 Content-Type 写出暂存的 `c.bytes`，先 flush 已记录的状态码（默认 200）。
+6. **写回响应。** 若中间件或 handler 已写过 body（经注入的 `http.ResponseWriter`，或 `AbortWithStatusString` / `AbortWithStatusJSON` 拒绝），就以它为准。否则引擎用注册时选定的 Content-Type 写出暂存的 `c.bytes`，先 flush 已记录的状态码（默认 200）。
 7. **收尾。** 清理 multipart 临时文件；`Context`、路径参数 map、响应写入器复位并归还对象池。
 8. **任何 panic** 都会被恢复并渲染：框架自身生成的中止原样到达客户端；注册了 `PanicProcessor` 则由它接管渲染；其余一律记日志并回通用 500。
 
@@ -628,7 +628,7 @@ if err := gbl.Shutdown(ctx); err != nil {
 
 ## 7. `Context` 详解
 
-`*Context` 贯穿整条中间件链，当 handler 声明它时会被作为参数注入。它携带请求、匹配到的路径参数，以及一个用于在链路与 handler 之间传递数据的 key/value 袋子；响应经 `c.JSON` / `c.String` / `c.Status` 写出。
+`*Context` 贯穿整条中间件链，当 handler 声明它时会被作为参数注入。它携带请求、匹配到的路径参数，以及一个用于在链路与 handler 之间传递数据的 key/value 袋子；响应由 handler 的返回值渲染（见 §2），或经注入的 `http.ResponseWriter` 直接写出。
 
 > **`Context` 是池化复用的对象，只在本次请求内有效。** 请求一结束，它就会被清空并交给下一个请求复用。因此别把 `*Context` 存进全局变量或缓存，也别在请求结束后才运行的 goroutine / 回调里捕获它——那样读到的是别的请求的数据或零值，并发访问还会造成数据竞争。需要异步或跨请求使用的数据，请在请求结束前把用到的值（如 `c.PathParam`、`c.Get` 的结果）拷贝进你自己的变量或结构体。注入的 `http.ResponseWriter` 同样池化，规则一致，不得跨请求持有。
 
@@ -996,7 +996,6 @@ gbl.SetCorsConfig(nil) // 重新关闭 CORS
 
 ```go
 type Config struct {
-    Name              string        // 应用名
     Port              string        // 监听端口，不带前导冒号
     CertFile          string        // TLS 证书文件路径
     KeyFile           string        // TLS 私钥文件路径
@@ -1017,7 +1016,6 @@ func Configure(fn func(*Config))
 
 ```go
 gbl.Configure(func(c *gbl.Config) {
-    c.Name = "myapp"
     c.Port = "8080"
     c.ReadTimeout = 5 * time.Second
 })
@@ -1037,7 +1035,7 @@ gbl.Configure(func(c *gbl.Config) {
 
 ## 15. 启动失败（fail-fast）
 
-所有启动、注册类失败都是 **fail-fast**：gbl 先经引擎 `Logger` 记录原因、再 panic——还没开始服务就挂掉的部署，也会在你的日志 sink 里留下原因，而不只是一条裸栈。端口占用、路由冲突、危险的 CORS 策略，以及参数名在运行时不可得的按名字装配 handler（用 `-ldflags "-w"` 或 `"-s"` 构建、剥除了 gbl 读取参数名所依赖的 DWARF 的二进制）都走这条路。
+所有启动、注册类失败都是 **fail-fast**：gbl 先经引擎 `Logger` 记录原因、再 panic——还没开始服务就挂掉的部署，也会在你的日志 sink 里留下原因，而不只是一条裸栈。端口占用、路由冲突、危险的 CORS 策略、不支持的 handler 形状（方法值、泛型实例化，见 §2），以及参数名在运行时不可得的按名字装配 handler（用 `-ldflags "-w"` 或 `"-s"` 构建、剥除了 gbl 读取参数名所依赖的 DWARF 的二进制）都走这条路。
 
 日志默认只在控制台；装了自定义 `Logger` 就落在你的 sink 里。内核不写任何兜底文件。
 
@@ -1075,7 +1073,7 @@ import "github.com/gblgo/gbl"
 func main() {
     gbl.Use(gbl.Compress(gbl.DefaultCompression))
     gbl.Get("/api/data", handler)
-    gbl.Run(":8080")
+    gbl.Run()
 }
 ```
 

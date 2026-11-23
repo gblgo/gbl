@@ -721,7 +721,8 @@ engine.Next() → handlers[0]
 ```
 
 6. **Write the response.** If a middleware or the handler already wrote a body
-   (`c.JSON`, `c.String`, or an injected `http.ResponseWriter`), that stands.
+   (through an injected `http.ResponseWriter`, or with an
+   `AbortWithStatusString` / `AbortWithStatusJSON` denial), that stands.
    Otherwise the engine writes the staged `c.bytes` with the content type chosen
    at registration, flushing the recorded status (default 200) first.
 7. **Cleanup.** Multipart temp files are removed; the `Context`, path-param map
@@ -780,7 +781,8 @@ if err := gbl.Shutdown(ctx); err != nil {
 `*Context` is threaded through the middleware chain and, when a handler declares
 it, injected as a parameter. It carries the request, the matched path
 parameters and a key/value bag for passing data between links and to the
-handler; the response is written through `c.JSON` / `c.String` / `c.Status`.
+handler; the response is rendered from the handler's return value (§2), or
+written directly through an injected `http.ResponseWriter`.
 
 > **A `Context` is pooled and valid only within the current request.** As soon
 > as the request ends, it is cleared and reused for the next one. So do not store
@@ -1231,7 +1233,6 @@ resolve those sources and call the same `Configure` entry point.
 
 ```go
 type Config struct {
-    Name              string        // application name
     Port              string        // listen port, without the leading colon
     CertFile          string        // TLS certificate file path
     KeyFile           string        // TLS private key file path
@@ -1254,7 +1255,6 @@ no-op.
 
 ```go
 gbl.Configure(func(c *gbl.Config) {
-    c.Name = "myapp"
     c.Port = "8080"
     c.ReadTimeout = 5 * time.Second
 })
@@ -1262,7 +1262,6 @@ gbl.Configure(func(c *gbl.Config) {
 
 | Field | Default | Meaning |
 |---|---|---|
-| `Name` | `gbl` | application name |
 | `Port` | `9801` | listen port |
 | `CertFile` / `KeyFile` | empty | both set ⇒ HTTPS enabled |
 | `ReadTimeout` / `ReadHeaderTimeout` / `WriteTimeout` / `IdleTimeout` | 10s / 5s / 10s / 60s | server timeouts |
@@ -1328,7 +1327,7 @@ import "github.com/gblgo/gbl"
 func main() {
     gbl.Use(gbl.Compress(gbl.DefaultCompression))
     gbl.Get("/api/data", handler)
-    gbl.Run(":8080")
+    gbl.Run()
 }
 ```
 
