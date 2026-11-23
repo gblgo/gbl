@@ -76,7 +76,7 @@ func buildDWARFIndex() map[string][]string {
 			flush()
 			// DeclFile on a subprogram is a 1-based index into its unit's line-table
 			// file list, so the list must be refreshed per compile unit.
-			if lr, lerr := data.LineReader(entry); lerr == nil && lr != nil {
+			if lr, lErr := data.LineReader(entry); lErr == nil && lr != nil {
 				files = lr.Files()
 			}
 		case dwarf.TagSubprogram:
@@ -121,22 +121,31 @@ func buildDWARFIndex() map[string][]string {
 
 // openSelfDWARF reads the DWARF section from the executable at path, trying each
 // platform's format. The debug sections are loaded into memory by the call, so
-// closing the file afterward is safe. It returns nil for an unknown format or a
-// binary with no DWARF (e.g. built with -w / -s).
+// closing the file afterward is safe. It returns nil for an unknown format, for a
+// binary with no DWARF (e.g. built with -w / -s), or when the DWARF data cannot
+// be read — none of these leave a usable result behind.
 func openSelfDWARF(path string) *dwarf.Data {
-	if f, err := pe.Open(path); err == nil {
-		defer f.Close()
-		data, _ := f.DWARF()
-		return data
+	// The three container types share this shape; wrapping the openers lets the
+	// branches collapse into one loop.
+	type dwarfFile interface {
+		DWARF() (*dwarf.Data, error)
+		Close() error
 	}
-	if f, err := elf.Open(path); err == nil {
-		defer f.Close()
-		data, _ := f.DWARF()
-		return data
+	openers := []func(string) (dwarfFile, error){
+		func(p string) (dwarfFile, error) { return pe.Open(p) },
+		func(p string) (dwarfFile, error) { return elf.Open(p) },
+		func(p string) (dwarfFile, error) { return macho.Open(p) },
 	}
-	if f, err := macho.Open(path); err == nil {
-		defer f.Close()
-		data, _ := f.DWARF()
+	for _, open := range openers {
+		f, err := open(path)
+		if err != nil {
+			continue // not this container format
+		}
+		data, dErr := f.DWARF()
+		_ = f.Close()
+		if dErr != nil {
+			return nil // right format, no readable DWARF: nothing left to try
+		}
 		return data
 	}
 	return nil
