@@ -86,10 +86,10 @@ func (s stdLogger) Banner(block string) {
 }
 
 // emit renders "LEVEL msg key=value ..." and writes it through the private
-// logger at a caller depth that resolves file/line information (when the
-// flags ask for it) to the business call site. All levels share the one
-// logger because log itself is level-free; the label preserves the
-// distinction for readers.
+// logger. The fixed call depth names the package-level Info/Warn/Error wrapper;
+// the logger's flags are pinned to date/time, so no file/line is ever printed.
+// All levels share the one logger because log itself is level-free; the label
+// preserves the distinction for readers.
 func (s stdLogger) emit(level, msg string, kv []any) {
 	_ = s.l.Output(3, logLine(level, msg, kv))
 }
