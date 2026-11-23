@@ -25,18 +25,33 @@ import (
 type ByteSize int
 
 var (
+	// surfaced when an incoming body exceeds the configured cap
 	requestBodyTooLargeError = errors.New("request body too large")
-	maxBodySize              atomic.Int64
-	maxFileMemory            atomic.Int64
-	maxUploadFileSize        atomic.Int64
+	// live total request body cap, read per request
+	maxBodySize atomic.Int64
+	// live multipart in-memory threshold, read per part
+	maxFileMemory atomic.Int64
+	// live per-file upload cap, read per file
+	maxUploadFileSize atomic.Int64
 )
 
-// Default limits applied at startup and re-applied defensively if a stored
-// value has been corrupted into a non-positive number.
+// Constants used only by this file: the default limits applied at startup and
+// re-applied defensively if a stored value has been corrupted into a
+// non-positive number, and the request body media types this file parses. JSON
+// is matched case-insensitively after trimming parameters; forms arrive under
+// the W3C spelling.
 const (
-	defaultMaxBodySize       = 5 << 20 // Maximum total request body size: 5 MiB.
-	defaultMaxFileMemory     = 2 << 20 // Multipart in-memory threshold, not total upload limit.
-	defaultMaxUploadFileSize = 1 << 20 // Hard cap on each individual uploaded file: 1 MiB.
+	// Maximum total request body size: 5 MiB.
+	defaultMaxBodySize = 5 << 20
+	// Multipart in-memory threshold, not total upload limit.
+	defaultMaxFileMemory = 2 << 20
+	// Hard cap on each individual uploaded file: 1 MiB.
+	defaultMaxUploadFileSize = 1 << 20
+
+	// body type carrying form fields plus uploaded files
+	multipartFormData = "multipart/form-data"
+	// body type carrying plain HTML form submissions
+	xWwwFormUrlencoded = "application/x-www-form-urlencoded"
 )
 
 func init() {
@@ -134,7 +149,8 @@ func queryValues(r *http.Request) url.Values {
 // form values, uploaded files, the JSON body buffer and whether the body is JSON.
 // The body buffer is pooled; the caller must release it with releaseBodyBuffer
 // once binding is done, since the decoded parameters are independent copies.
-func parseRequestParameters(w http.ResponseWriter, r *http.Request, method httpMethod) (url.Values, filesMap, *bytes.Buffer, bool, error) {
+func parseRequestParameters(w http.ResponseWriter, r *http.Request,
+	method httpMethod) (url.Values, filesMap, *bytes.Buffer, bool, error) {
 	// GBL deliberately applies a strict parameter-source policy by HTTP method.
 	// GET, HEAD, DELETE and OPTIONS may read only URL path parameters (matched by
 	// the router) and URL query parameters. Their request bodies are never parsed

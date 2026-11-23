@@ -21,9 +21,13 @@ import (
 // call one of the Abort methods.
 type HandlerFunc func(c *Context)
 
-// abortIndex is far beyond any real chain length, so setting the cursor to it
-// makes every in-flight Next loop terminate immediately.
-const abortIndex = math.MaxInt / 2
+const (
+	// far beyond any real chain length, so setting the cursor here ends
+	// every in-flight Next loop at once
+	abortIndex = math.MaxInt / 2
+	// fixed 500 body written when encoding the handler result fails
+	responseSerializationFailed = "response serialization failed"
+)
 
 // routeEndpoint is the terminal link appended to every route's chain. It is a
 // shared, stateless function because the concrete handler is read from the
@@ -42,31 +46,41 @@ var routeEndpoint HandlerFunc = func(c *Context) { c.invokeHandler() }
 // come first, smaller scalars (bool, uint8) are grouped at the end to minimize padding.
 type Context struct {
 	// 24-byte fields (slice header, reflect.Value, struct with 3 maps)
-	handlers []HandlerFunc // this route's merged chain, including the terminal endpoint
-	bytes    []byte        // serialized handler result
-	ret      reflect.Value // handler's first return, boxed lazily by Result
-	src      nameSources   // per-request by-name binding sources; primed in injectedParameters
+	// this route's merged chain, including the terminal endpoint
+	handlers []HandlerFunc
+	// serialized handler result
+	bytes []byte
+	// handler's first return, boxed lazily by Result
+	ret reflect.Value
+	// per-request by-name binding sources; primed in injectedParameters
+	src nameSources
 
 	// 16-byte fields (interface = type + data pointer, string = pointer + len)
 	// writer is the framework's pooled response sink. It stays unexported:
 	// handlers own the response by declaring an http.ResponseWriter parameter,
 	// and it must never be stored beyond the request.
-	writer      responseWriter
-	contentType string // result content type chosen at registration
-	result      any    // memoized boxed ret, filled only once Result is called
-	logger      Logger // engine's log sink, so middleware logging honors SetLogger
+	writer responseWriter
+	// result content type chosen at registration
+	contentType string
+	// memoized boxed ret, filled only once Result is called
+	result any
+	// engine's log sink, so middleware logging honors SetLogger
+	logger Logger
 
 	// 8-byte fields (pointers, int, map)
-	Request     *http.Request
-	index       int           // cursor into handlers; abortIndex means "stopped"
-	params      map[string]string
-	rh          *routeHandler
-	keys        map[string]any
-	responseBuf *bytes.Buffer // pooled buffer for handler result serialization, released after Write
+	Request *http.Request
+	// cursor into handlers; abortIndex means "stopped"
+	index  int
+	params map[string]string
+	rh     *routeHandler
+	keys   map[string]any
+	// pooled buffer for handler result serialization, released after Write
+	responseBuf *bytes.Buffer
 
 	// 1-byte fields (grouped at end to minimize padding)
-	method  httpMethod
-	handled bool // the handler actually ran
+	method httpMethod
+	// the handler actually ran
+	handled bool
 }
 
 // contextPool recycles Context objects across requests.

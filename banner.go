@@ -12,18 +12,29 @@ import (
 	"strings"
 )
 
-// bannerArt is the startup logo, a small fixed mark that lives beside the code
-// that renders it. The raw string's backticks preserve the alignment
-// byte-for-byte, so the box-drawing art stays intact without any escaping.
-var bannerArt = `  ┏━╸  ┏┓   ╻
+// Constants used only by this file: the startup logo, the line that confirms
+// the server is live, and the build-info keys that resolve the version.
+const (
+	// bannerArt is the startup logo, a small fixed mark rendered once at Run.
+	// The raw string's backticks preserve the alignment byte-for-byte, so the
+	// box-drawing art stays intact without any escaping.
+	bannerArt = `  ┏━╸  ┏┓   ╻
   ┃╺┓  ┣┻┓  ┃
   ┗━┛  ┗━┛  ┗━╸`
 
-// startupSuccessMessage is the one-line confirmation emitted right after the
-// banner block. Unlike the art it is an ordinary Info record, so it carries the
-// Logger's timestamp and level (and console tint) as an explicit "we are live"
-// event.
-const startupSuccessMessage = "started successfully, ready to accept requests"
+	// startupSuccessMessage is the one-line confirmation emitted right after
+	// the banner block. Unlike the art it is an ordinary Info record, so it
+	// carries the Logger's timestamp and level (and console tint) as an
+	// explicit "we are live" event.
+	startupSuccessMessage = "started successfully, ready to accept requests"
+
+	// module path of the framework itself, matching go.mod: the key for
+	// reading the version out of embedded build info, also when the library
+	// is only a dependency of the consumer binary
+	modulePath = "github.com/gblgo/gbl"
+	// version stand-in when build info carries no tag: a local or replaced checkout
+	versionDevel = "(devel)"
+)
 
 // printBanner emits the startup banner through the engine's Logger so a
 // redirected or structured sink captures startup like any other event. The whole
@@ -66,18 +77,12 @@ func (e *engine) renderBanner(cfg *Config, addr net.Addr) string {
 	return strings.TrimRight(bannerArt, "\n") + "\n\n" + strings.Join(lines, "\n") + "\n"
 }
 
-// modulePath is the module path of gbl itself, matching go.mod. A library is
-// compiled into the consumer's binary as a dependency, not as the main module.
-// This path is the key for picking the version of gbl out of the embedded
-// build info.
-const modulePath = "github.com/gblgo/gbl"
-
 // bannerVersion reports the framework version embedded in the running binary.
 // It reads build info, so no version constant has to be maintained in source.
 func bannerVersion() string {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
-		return "(devel)"
+		return versionDevel
 	}
 	return frameworkVersion(info)
 }
@@ -92,7 +97,7 @@ func frameworkVersion(info *debug.BuildInfo) string {
 		if info.Main.Version != empty {
 			return info.Main.Version
 		}
-		return "(devel)"
+		return versionDevel
 	}
 	for _, dep := range info.Deps {
 		if dep.Path == modulePath {
@@ -102,7 +107,7 @@ func frameworkVersion(info *debug.BuildInfo) string {
 			break
 		}
 	}
-	return "(devel)"
+	return versionDevel
 }
 
 // countRoutes totals every handler installed across all method trees. It runs

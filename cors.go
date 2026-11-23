@@ -12,16 +12,58 @@ import (
 	"time"
 )
 
+// Constants used only by this file: wire fragments shared with the generic
+// matching code, the CORS response headers the spec names literally, and the
+// fixed preflight rejection reasons.
+const (
+	// separator for header value lists
+	comma = ","
+	// CORS wildcard for origins, methods and headers
+	asterisk = "*"
+	// the only value credentials headers understand
+	headerTrue = "true"
+	// request header naming the cross-origin caller
+	headerOrigin = "Origin"
+	// preflight: method the real call will use
+	accessControlRequestMethod = "Access-Control-Request-Method"
+	// response: origin the browser may read from
+	accessControlAllowOrigin = "Access-Control-Allow-Origin"
+	// response: cookies and auth may accompany the call
+	accessControlAllowCredentials = "Access-Control-Allow-Credentials"
+	// response: extra headers the client may read
+	accessControlExposeHeaders = "Access-Control-Expose-Headers"
+	// preflight: headers the real call will send
+	accessControlRequestHeaders = "Access-Control-Request-Headers"
+	// response: methods permitted cross-origin
+	accessControlAllowMethods = "Access-Control-Allow-Methods"
+	// response: headers accepted cross-origin
+	accessControlAllowHeaders = "Access-Control-Allow-Headers"
+	// response: preflight cache lifetime, in seconds
+	accessControlMaxAge = "Access-Control-Max-Age"
+	// rejection reason: origin outside AllowedOrigins
+	corsOriginNotAllowed = "CORS origin not allowed"
+	// rejection reason: method outside AllowedMethods
+	corsMethodNotAllowed = "CORS method not allowed"
+	// rejection reason: header outside AllowedHeaders
+	corsHeaderNotAllowed = "CORS header not allowed"
+)
+
 // CorsConfig describes the cross-origin policy applied by the CORS layer.
 // All fields are exported: build one with a struct literal and install it
 // with SetCorsConfig (nil disables CORS).
 type CorsConfig struct {
-	AllowedOrigins   []string      // origins accepted via Access-Control-Allow-Origin, or "*"
-	AllowedMethods   []string      // methods permitted for cross-origin requests
-	AllowedHeaders   []string      // request headers accepted in a preflight
-	ExposedHeaders   []string      // response headers readable by the cross-origin client
-	AllowCredentials bool          // whether cookies/auth may accompany cross-origin calls
-	MaxAge           time.Duration // how long a client may cache the preflight result
+	// origins accepted via Access-Control-Allow-Origin, or "*"
+	AllowedOrigins []string
+	// methods permitted for cross-origin requests
+	AllowedMethods []string
+	// request headers accepted in a preflight
+	AllowedHeaders []string
+	// response headers readable by the cross-origin client
+	ExposedHeaders []string
+	// whether cookies/auth may accompany cross-origin calls
+	AllowCredentials bool
+	// how long a client may cache the preflight result
+	MaxAge time.Duration
 }
 
 // validate enforces the CORS security policy at wiring time, so an unsafe
@@ -36,7 +78,9 @@ func (cc *CorsConfig) validate() error {
 	if cc.AllowCredentials {
 		for _, origin := range cc.AllowedOrigins {
 			if strings.EqualFold(strings.TrimSpace(origin), asterisk) {
-				return errors.New("gbl: invalid CORS config: AllowCredentials cannot be true while AllowedOrigins contains \"*\"; list the explicit origins allowed to send credentials instead")
+				return errors.New("gbl: invalid CORS config: AllowCredentials cannot be " +
+					"true while AllowedOrigins contains \"*\"; list the explicit origins " +
+					"allowed to send credentials instead")
 			}
 		}
 	}
@@ -72,14 +116,14 @@ func isPreflightRequest(r *http.Request) bool {
 // is present; it decides CORS headers and preflight handling, then delegates the
 // actual request to the wrapped engine.
 type corsHandler struct {
-	engine *engine
-	config *CorsConfig
-	allowMethods  string
-	allowHeaders  string
-	exposeHeaders string
-	maxAge        string
-	wildcard bool
-	expose   bool
+	engine            *engine
+	config            *CorsConfig
+	allowMethods      string
+	allowHeaders      string
+	exposeHeaders     string
+	maxAge            string
+	wildcard          bool
+	expose            bool
 	allowedOriginsMap map[string]struct{}
 	allowedMethodsMap map[string]struct{}
 	allowedHeadersMap map[string]struct{}

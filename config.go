@@ -15,15 +15,24 @@ import "time"
 // useTLS is derived, not set directly: it turns on when both CertFile and
 // KeyFile are present.
 type Config struct {
-	Name              string        // application name
-	Port              string        // listen port, without the leading colon
-	CertFile          string        // TLS certificate file path
-	KeyFile           string        // TLS private key file path
-	ReadTimeout       time.Duration // max duration to read an entire request
-	ReadHeaderTimeout time.Duration // max duration to read request headers
-	WriteTimeout      time.Duration // max duration to write an entire response
-	IdleTimeout       time.Duration // max idle wait before a keep-alive connection closes
-	useTLS            bool          // derived: true when both CertFile and KeyFile are set
+	// application name
+	Name string
+	// listen port, without the leading colon
+	Port string
+	// TLS certificate file path
+	CertFile string
+	// TLS private key file path
+	KeyFile string
+	// max duration to read an entire request
+	ReadTimeout time.Duration
+	// max duration to read request headers
+	ReadHeaderTimeout time.Duration
+	// max duration to write an entire response
+	WriteTimeout time.Duration
+	// max idle wait before a keep-alive connection closes
+	IdleTimeout time.Duration
+	// derived: true when both CertFile and KeyFile are set
+	useTLS bool
 }
 
 // defaultConfig returns the baseline every engine starts from: name "gbl" on

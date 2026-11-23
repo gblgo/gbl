@@ -79,25 +79,54 @@ type (
 
 // Parameter binding classes; the zero value classBind is the common case.
 const (
-	classBind    paramClass = iota // resolved from path/query/body by name
-	classRequest                   // *http.Request, injected directly
-	classWriter                    // http.ResponseWriter (or a satisfying interface)
-	classFiles                     // one of the multipart.FileHeader shapes
-	classContext                   // *Context, injected directly
+	// resolved from path/query/body by name
+	classBind paramClass = iota
+	// *http.Request, injected directly
+	classRequest
+	// http.ResponseWriter (or a satisfying interface)
+	classWriter
+	// one of the multipart.FileHeader shapes
+	classFiles
+	// *Context, injected directly
+	classContext
+)
+
+// Media-type fragments and error formats used only by this file. The enums
+// above stay in their own block so exhaustive-switch tooling keeps working.
+const (
+	// media-type family carrying JSON payloads for body binding
+	applicationPrefix = "application/"
+	// structured-suffix marker identifying JSON subtypes
+	plusSignJson = "+json"
+	// error wrapper naming the parameter being injected
+	injectParameterErrFormat = "inject parameter %q: %w"
+	// error wrapper naming the key decoded from the JSON body
+	jsonParameterErrFormat = "JSON parameter %q: %w"
 )
 
 var (
+	// two keys both claimed the one body
 	multipleRequireError = errors.New("multiple handler parameters require a JSON object")
-	responseMismatch     = errors.New("response writer type mismatch")
-	requestType          = reflect.TypeFor[*http.Request]()
-	contextType          = reflect.TypeFor[*Context]()
-	writerType           = reflect.TypeFor[http.ResponseWriter]()
-	pooledWriterType     = reflect.TypeFor[*pooledResponseWriter]()
-	fileHeaderType       = reflect.TypeFor[multipart.FileHeader]()
-	fileHeaderPtr        = reflect.TypeFor[*multipart.FileHeader]()
-	fileHeaderPs         = reflect.TypeFor[[]*multipart.FileHeader]()
-	fileHeaderSlice      = reflect.TypeFor[[]multipart.FileHeader]()
-	validatableType      = reflect.TypeFor[Validatable]()
+	// a handler asked to write through an unexpected writer type
+	responseMismatch = errors.New("response writer type mismatch")
+	// parameter type recognized as the raw request
+	requestType = reflect.TypeFor[*http.Request]()
+	// parameter type recognized as the injected context
+	contextType = reflect.TypeFor[*Context]()
+	// interface a handler declares to own the response
+	writerType = reflect.TypeFor[http.ResponseWriter]()
+	// concrete writer handed to owning handlers, checked for assignability
+	pooledWriterType = reflect.TypeFor[*pooledResponseWriter]()
+	// uploaded file, by value
+	fileHeaderType = reflect.TypeFor[multipart.FileHeader]()
+	// uploaded file, by pointer
+	fileHeaderPtr = reflect.TypeFor[*multipart.FileHeader]()
+	// uploaded files, slice of pointers
+	fileHeaderPs = reflect.TypeFor[[]*multipart.FileHeader]()
+	// uploaded files, slice of values
+	fileHeaderSlice = reflect.TypeFor[[]multipart.FileHeader]()
+	// interface checked before a bound value is injected
+	validatableType = reflect.TypeFor[Validatable]()
 )
 
 // paramsPool recycles the reflection argument slice built per request. A pointer
@@ -406,7 +435,8 @@ func injectedParameters(
 			return fmt.Errorf("parameter %q was not initialized", paramNameAt(names, i))
 		}
 		if !v.Type().AssignableTo(plan.types[i]) {
-			return fmt.Errorf("parameter %q type mismatch: got %s, want %s", paramNameAt(names, i), v.Type(), plan.types[i])
+			return fmt.Errorf("parameter %q type mismatch: got %s, want %s",
+				paramNameAt(names, i), v.Type(), plan.types[i])
 		}
 	}
 	return nil
@@ -553,7 +583,8 @@ func bindStruct(t reflect.Type, src *nameSources) (reflect.Value, error) {
 // list, so the request path skips reflection-based field introspection entirely.
 // The per-field precedence matches bindStruct: a path value wins over
 // form/query, and everything else falls through to bindFormParameter.
-func bindStructFields(t reflect.Type, fields []structField, src *nameSources) (reflect.Value, error) {
+func bindStructFields(t reflect.Type, fields []structField,
+	src *nameSources) (reflect.Value, error) {
 	result := reflect.New(t).Elem()
 
 	for _, field := range fields {

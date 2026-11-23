@@ -14,11 +14,16 @@ import "net/http"
 // The type stays unexported so none of those internals surface in the public api.
 type responseWriter interface {
 	http.ResponseWriter
-	written() bool // reports whether any body byte has been written
-	headed() bool  // reports whether a status has been recorded
-	writeHeader()  // flushes the recorded status exactly once
-	status() int   // effective status, defaulting to 200
-	size() int     // body bytes written so far
+	// reports whether any body byte has been written
+	written() bool
+	// reports whether a status has been recorded
+	headed() bool
+	// flushes the recorded status exactly once
+	writeHeader()
+	// effective status, defaulting to 200
+	status() int
+	// body bytes written so far
+	size() int
 }
 
 // pooledResponseWriter is the pooled wrapper the engine hands down. It buffers the
@@ -27,16 +32,22 @@ type responseWriter interface {
 // whatever status was set beforehand.
 type pooledResponseWriter struct {
 	// 16-byte fields (interface)
-	w http.ResponseWriter // wrapped sink, reset per request; never retained across requests
+	// wrapped sink, reset per request; never retained across requests
+	w http.ResponseWriter
 
 	// 8-byte fields (int)
-	statusCode   int // recorded status code
-	bytesWritten int // total body bytes passed to the underlying writer
+	// recorded status code
+	statusCode int
+	// total body bytes passed to the underlying writer
+	bytesWritten int
 
 	// 1-byte fields (bool)
-	writtenStatus bool // a body byte has been written
-	headedStatus  bool // WriteHeader has recorded a status
-	flushedStatus bool // the status has reached the underlying writer
+	// a body byte has been written
+	writtenStatus bool
+	// WriteHeader has recorded a status
+	headedStatus bool
+	// the status has reached the underlying writer
+	flushedStatus bool
 }
 
 // WriteHeader records the status. It reaches the wire only when the header is

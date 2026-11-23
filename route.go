@@ -20,15 +20,39 @@ import (
 // never appears in a public signature — callers always speak in plain strings.
 type httpMethod uint8
 
+// Constants used only by this file: the wire spelling of each method, shared
+// between the names table and methodOf's switch so a new verb is written once,
+// and the path parameter braces.
+const (
+	// wire spelling of GET, shared by the names table and methodOf
+	nameMethodGet = "GET"
+	// wire spelling of HEAD
+	nameMethodHead = "HEAD"
+	// wire spelling of POST
+	nameMethodPost = "POST"
+	// wire spelling of PUT
+	nameMethodPut = "PUT"
+	// wire spelling of PATCH
+	nameMethodPatch = "PATCH"
+	// wire spelling of DELETE
+	nameMethodDelete = "DELETE"
+	// wire spelling of OPTIONS
+	nameMethodOptions = "OPTIONS"
+	// opens a named path parameter, as in /user/{id}
+	leftCurlyBrace = "{"
+	// closes a named path parameter
+	rightCurlyBrace = "}"
+)
+
 // methodNames holds the wire spelling of every supported method, indexed by httpMethod.
 var methodNames = [methodCount]string{
-	methodGet:     "GET",
-	methodHead:    "HEAD",
-	methodPost:    "POST",
-	methodPut:     "PUT",
-	methodPatch:   "PATCH",
-	methodDelete:  "DELETE",
-	methodOptions: "OPTIONS",
+	methodGet:     nameMethodGet,
+	methodHead:    nameMethodHead,
+	methodPost:    nameMethodPost,
+	methodPut:     nameMethodPut,
+	methodPatch:   nameMethodPatch,
+	methodDelete:  nameMethodDelete,
+	methodOptions: nameMethodOptions,
 }
 
 // methodOf resolves an HTTP method name, reporting false when GBL does not
@@ -38,19 +62,19 @@ var methodNames = [methodCount]string{
 // lowercase "get" is still treated as "GET".
 func methodOf(name string) (httpMethod, bool) {
 	switch strings.ToUpper(name) {
-	case "GET":
+	case nameMethodGet:
 		return methodGet, true
-	case "HEAD":
+	case nameMethodHead:
 		return methodHead, true
-	case "POST":
+	case nameMethodPost:
 		return methodPost, true
-	case "PUT":
+	case nameMethodPut:
 		return methodPut, true
-	case "PATCH":
+	case nameMethodPatch:
 		return methodPatch, true
-	case "DELETE":
+	case nameMethodDelete:
 		return methodDelete, true
-	case "OPTIONS":
+	case nameMethodOptions:
 		return methodOptions, true
 	default:
 		return 0, false
@@ -74,7 +98,10 @@ type routeHandler struct {
 	// 24-byte fields (reflect.Value, slices)
 	v          reflect.Value
 	paramNames []string
-	handlers   []HandlerFunc // this route's frozen request chain: the engine's global middleware, then the route group's, then the terminal routeEndpoint. It is assembled once at startup and reused verbatim by every request.
+	// this route's frozen request chain: the engine's global middleware,
+	// then the route group's, then the terminal routeEndpoint. It is
+	// assembled once at startup and reused verbatim by every request.
+	handlers []HandlerFunc
 
 	// bindPlan (152 bytes)
 	plan bindPlan
@@ -118,11 +145,13 @@ func (e *engine) dealPath(path string) ([]segmentMeta, string) {
 			meta.paramName = part[1:]
 		}
 
-		if strings.Contains(part, leftCurlyBrace) && (len(part) == 1 || strings.LastIndex(part, leftCurlyBrace) != 0) {
+		if strings.Contains(part, leftCurlyBrace) &&
+			(len(part) == 1 || strings.LastIndex(part, leftCurlyBrace) != 0) {
 			e.failStartup("when registering a route, the path cannot be '/{' or '/{***{***{' or '/{{', etc")
 		}
 
-		if strings.Contains(part, rightCurlyBrace) && (len(part) == 1 || strings.Index(part, rightCurlyBrace)+1 != len(part)) {
+		if strings.Contains(part, rightCurlyBrace) &&
+			(len(part) == 1 || strings.Index(part, rightCurlyBrace)+1 != len(part)) {
 			e.failStartup("when registering a route, the path cannot be '/}' or '/}***}***}' or '/}}', etc")
 		}
 
@@ -161,7 +190,8 @@ func (e *engine) generateRoute() {
 		v := reflect.ValueOf(meta.fn)
 
 		if !v.IsValid() || v.Kind() != reflect.Func || v.IsNil() {
-			e.failStartup(fmt.Errorf("invalid route handler: %s %s, the method is illegal", methodName, meta.path))
+			e.failStartup(fmt.Errorf("invalid route handler: %s %s, the method is illegal",
+				methodName, meta.path))
 		}
 
 		t := v.Type()
@@ -226,7 +256,12 @@ func (e *engine) generateRoute() {
 			// positional placeholders silently — the normal sourceless path for struct
 			// handlers, where a per-handler warning would be noise.
 			if handler.plan.needsNames && !resolved {
-				e.failStartup(fmt.Errorf("gbl: handler for %s %s binds parameters by name, but the parameter names are unavailable at runtime: no source on disk and no DWARF debug info in the binary. The binary was likely built with `-ldflags \"-w\"` or `\"-s\"`, which strip DWARF; rebuild without them so gbl can read the names from the binary, or bind through a struct / *struct parameter whose field names come from reflection",
+				e.failStartup(fmt.Errorf("gbl: handler for %s %s binds parameters by name, "+
+					"but the parameter names are unavailable at runtime: no source on disk "+
+					"and no DWARF debug info in the binary. The binary was likely built with "+
+					"`-ldflags \"-w\"` or `\"-s\"`, which strip DWARF; rebuild without them so "+
+					"gbl can read the names from the binary, or bind through a struct / "+
+					"*struct parameter whose field names come from reflection",
 					methodName, meta.path))
 			}
 		}

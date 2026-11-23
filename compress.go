@@ -10,19 +10,35 @@ import (
 	"strings"
 )
 
-// Compression levels for the Compress middleware. These mirror gzip's constants
-// but are re-exported so callers do not need to import compress/gzip directly.
+// Compression levels for the Compress middleware. These mirror the constants
+// of compress/gzip but are re-exported so callers do not need to import that
+// package directly.
 const (
-	NoCompression       = gzip.NoCompression
-	BestSpeed           = gzip.BestSpeed
-	BestCompression     = gzip.BestCompression
-	DefaultCompression  = gzip.DefaultCompression
-	HuffmanOnly         = gzip.HuffmanOnly
+	// NoCompression store-only: framing bytes, no deflate work
+	NoCompression = gzip.NoCompression
+	// BestSpeed level 1: fastest, smallest ratio
+	BestSpeed = gzip.BestSpeed
+	// BestCompression level 9: slowest, best ratio
+	BestCompression = gzip.BestCompression
+	// DefaultCompression the balanced default of gzip (level 6)
+	DefaultCompression = gzip.DefaultCompression
+	// HuffmanOnly entropy coding only: slight reduction, near-zero cost
+	HuffmanOnly = gzip.HuffmanOnly
 )
 
 // minCompressSize is the threshold below which compression is skipped. Small
-// responses gain little from compression and the CPU cost is not worth it.
-const minCompressSize = 1024
+// responses gain little from compression and the CPU cost is not worth it. The
+// rest are the wire fragments this middleware negotiates with clients.
+const (
+	// smallest body worth deflating, in bytes
+	minCompressSize = 1024
+	// request header listing encodings the client supports
+	acceptEncoding = "Accept-Encoding"
+	// response header declaring the encoding applied
+	contentEncoding = "Content-Encoding"
+	// the one encoding token this middleware speaks
+	encodingGzip = "gzip"
+)
 
 // Compress returns a middleware that gzip-compresses the response body when
 // beneficial. It checks three conditions before compressing:
@@ -53,7 +69,7 @@ func Compress(level int) HandlerFunc {
 		}
 
 		// Check if client accepts gzip
-		if !strings.Contains(c.Request.Header.Get("Accept-Encoding"), "gzip") {
+		if !strings.Contains(c.Request.Header.Get(acceptEncoding), encodingGzip) {
 			return
 		}
 
@@ -92,8 +108,8 @@ func Compress(level int) HandlerFunc {
 
 		// Replace with compressed data
 		c.bytes = buf.Bytes()
-		c.writer.Header().Set("Content-Encoding", "gzip")
-		c.writer.Header().Set("Vary", "Accept-Encoding")
+		c.writer.Header().Set(contentEncoding, encodingGzip)
+		c.writer.Header().Set(vary, acceptEncoding)
 	}
 }
 
@@ -102,16 +118,17 @@ func Compress(level int) HandlerFunc {
 // compressible; binary formats (images, video, audio, already-compressed files)
 // are not.
 func isCompressible(contentType string) bool {
-	if contentType == "" {
+	if contentType == empty {
 		return false
 	}
 
-	// Extract the MIME type without parameters (e.g., "application/json; charset=utf-8" -> "application/json")
+	// Extract the MIME type without parameters (e.g., "application/json;
+	// charset=utf-8" becomes "application/json")
 	mime := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
 
 	// Compressible MIME types
 	switch mime {
-	case "application/json",
+	case applicationJson,
 		"application/xml",
 		"text/html",
 		"text/plain",

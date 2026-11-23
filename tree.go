@@ -14,13 +14,20 @@ import (
 // walking segments from the root; the node where the last segment lands either
 // terminates in a handler (exist) or is only a waypoint on a longer route.
 type routeNode struct {
-	segment    string                // raw segment text this node was created for
-	path       string                // full route path, set only on a terminal node
-	paramName  string                // binding name when segment is a variable, e.g. "id" for ":id"
-	exist      bool                  // true when a handler is registered at this node
-	handler    *routeHandler         // handler reached at this node, valid when exist
-	staticNode map[string]*routeNode // literal children, keyed by exact segment text
-	varNode    []*routeNode          // wildcard children, matched against any segment
+	// raw segment text this node was created for
+	segment string
+	// full route path, set only on a terminal node
+	path string
+	// binding name when segment is a variable, e.g. "id" for ":id"
+	paramName string
+	// true when a handler is registered at this node
+	exist bool
+	// handler reached at this node, valid when exist
+	handler *routeHandler
+	// literal children, keyed by exact segment text
+	staticNode map[string]*routeNode
+	// wildcard children, matched against any segment
+	varNode []*routeNode
 }
 
 // segmentMeta is one parsed segment of a registration path: its text, whether
@@ -75,7 +82,8 @@ func hasSameRoute(node *routeNode, segments []segmentMeta, index int) (bool, str
 // variable nodes as needed and attaching handler at the terminal node. Duplicate
 // concrete routes and structurally equivalent variable routes abort startup with
 // a panic, since both would leave matching ambiguous.
-func (e *engine) insertNode(segmentMetas []segmentMeta, path string, method httpMethod, handler *routeHandler) {
+func (e *engine) insertNode(segmentMetas []segmentMeta, path string,
+	method httpMethod, handler *routeHandler) {
 
 	// Get the root node of the corresponding method
 	root := e.roots[method]
@@ -236,7 +244,8 @@ func (e *engine) allowFor(path string) []string {
 // variable branch it records the segment under that node's parameter name and,
 // if the branch later proves dead, deletes it again so a failed search leaves
 // no stray params behind.
-func searchNode(root *routeNode, segments []string, index int, params map[string]string) *routeHandler {
+func searchNode(root *routeNode, segments []string, index int,
+	params map[string]string) *routeHandler {
 
 	if root == nil {
 		return nil
