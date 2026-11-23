@@ -116,7 +116,8 @@ type routeHandler struct {
 // Grammar: a path is '/'-separated segments. A segment is either a literal or a
 // variable written as ":name" or "{name}" — both forms bind identically. The
 // marker must lead the segment and appear exactly once: no nesting ("::", "{{"),
-// no marker in the middle ("a:b", "a{b"), and no empty name (":", "{}"). Any
+// no marker in the middle ("a:b", "a{b"), no empty name (":", "{}"), and a "{"
+// must be closed by a "}". Any
 // violation aborts startup; the reason is logged through the engine before the
 // panic, so a bad registration stays explainable after deploy. In the error
 // texts `***` stands for any offending characters.
@@ -146,8 +147,10 @@ func (e *engine) dealPath(path string) ([]segmentMeta, string) {
 		}
 
 		if strings.Contains(part, leftCurlyBrace) &&
-			(len(part) == 1 || strings.LastIndex(part, leftCurlyBrace) != 0) {
-			e.failStartup("when registering a route, the path cannot be '/{' or '/{***{***{' or '/{{', etc")
+			(len(part) == 1 || strings.LastIndex(part, leftCurlyBrace) != 0 ||
+				!strings.HasSuffix(part, rightCurlyBrace)) {
+			e.failStartup("when registering a route, the path cannot be '/{' or '/{***{***{' " +
+				"or '/{{' or an unclosed '/{id', etc")
 		}
 
 		if strings.Contains(part, rightCurlyBrace) &&
@@ -285,11 +288,18 @@ func (e *engine) generateRoute() {
 		}
 
 		if isStatic {
-			// Static route: store in map for O(1) lookup
-			if e.staticRoutes[method] == nil {
-				e.staticRoutes[method] = make(map[string]*routeHandler)
+			// Static route: store in map for O(1) lookup. A repeat registration
+			// would silently replace the first handler, so it aborts startup
+			// exactly like a conflicting dynamic route does.
+			statics := e.staticRoutes[method]
+			if statics == nil {
+				statics = make(map[string]*routeHandler)
+				e.staticRoutes[method] = statics
 			}
-			e.staticRoutes[method][path] = handler
+			if _, ok := statics[path]; ok {
+				e.failStartup(fmt.Errorf("static route already exists: [%s %s]", methodName, path))
+			}
+			statics[path] = handler
 		} else {
 			// Dynamic route: insert into radix tree
 			e.insertNode(segmentMetas, path, method, handler)
