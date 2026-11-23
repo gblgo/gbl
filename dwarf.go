@@ -18,22 +18,24 @@ import (
 // function ("<file>:<line>").
 //
 // This is the production half of name binding. The Go compiler discards parameter
-// names from the runtime type metadata that reflect exposes, but it still emits
-// them into the binary's DWARF section by default — and -trimpath does not strip
-// it. So a sourceless production binary (a multi-stage image, a bare executable)
-// still carries every function's parameter names, plus the declaration file and
-// line that let us match a handler to its DWARF entry by the SAME position key
-// the disk parser uses. Position keys also resolve closures and func literals,
-// and are immune to Go 1.27's merging and renaming of identical literals.
+// names from the runtime type metadata that reflect exposes. It still emits them
+// into the binary's DWARF section by default, and -trimpath does not strip that
+// section. So even a sourceless production binary — a multi-stage image, a bare
+// executable — carries every function's parameter names. The section also records
+// each declaration's file and line, so a handler is matched to its DWARF entry by
+// the SAME position key the disk parser uses. Position keys also resolve closures
+// and func literals, and are immune to the merging and renaming of identical
+// literals introduced in Go 1.27.
 //
-// It returns nil when the binary has no readable DWARF — most commonly because it
-// was built with `-ldflags "-w"` or `"-s"`, which strip debug information. The
-// caller treats nil as "no names recoverable" and fails startup for a handler
-// that binds by name, pointing the user at struct binding instead.
+// It returns nil when the binary has no readable DWARF. This happens most
+// commonly when the binary was built with `-ldflags "-w"` or `"-s"`, which strip
+// debug information. The caller treats nil as "no names recoverable" and fails
+// startup for a handler that binds by name, pointing the user at struct binding
+// instead.
 //
 // DWARF lists a function's formal parameters in source order: the inputs first,
 // then pseudo-parameters for the results (`~r0`, ...) and, for methods, the
-// receiver (`~p0`). The caller slices the list to the handler's NumIn, which keeps
+// receiver (`~p0`). The caller slices the list to the handler's NumIn. That keeps
 // exactly the input names and drops the trailing result pseudo-parameters.
 func buildDWARFIndex() map[string][]string {
 	exe, err := os.Executable()

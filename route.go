@@ -349,7 +349,7 @@ func (e *engine) lookupParamNamesDWARF(v reflect.Value) ([]string, bool) {
 	if e.dwarfIndex == nil {
 		index := buildDWARFIndex()
 		if index == nil {
-			// No readable DWARF: cache an empty map so later handlers do not re-parse
+			// No readable DWARF: cache an empty map so later handlers do not reparse
 			// a binary that will never yield names.
 			index = map[string][]string{}
 		}
