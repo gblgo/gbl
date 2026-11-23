@@ -15,8 +15,6 @@ import "time"
 // useTLS is derived, not set directly: it turns on when both CertFile and
 // KeyFile are present.
 type Config struct {
-	// application name
-	Name string
 	// listen port, without the leading colon
 	Port string
 	// TLS certificate file path
@@ -35,11 +33,10 @@ type Config struct {
 	useTLS bool
 }
 
-// defaultConfig returns the baseline every engine starts from: name "gbl" on
-// port 9801 with the standard server timeouts.
+// defaultConfig returns the baseline every engine starts from: port 9801 with
+// the standard server timeouts.
 func defaultConfig() *Config {
 	return &Config{
-		Name:              "gbl",
 		Port:              "9801",
 		ReadTimeout:       10 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,

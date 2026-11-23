@@ -327,7 +327,8 @@ func computeStructFields(t reflect.Type) []structField {
 // body, or form values, in that precedence order. Type classification already
 // happened in generateRoute, so nothing here re-inspects the signature with
 // reflection. params is the caller's scratch slice, already sized to the
-// parameter count; the caller recycles it.
+// parameter count; the caller recycles it. The jsonMedia flag already carries
+// the empty-body check, so the body is never re-scanned here.
 func injectedParameters(
 	c *Context,
 	form url.Values,
@@ -344,8 +345,7 @@ func injectedParameters(
 	src := &c.src
 
 	var jsonFields map[string]json.RawMessage
-	isJSON := jsonMedia && hasNonWhitespace(body)
-	if isJSON && len(plan.businessIndexes) > 1 {
+	if jsonMedia && len(plan.businessIndexes) > 1 {
 		if err := json.Unmarshal(body, &jsonFields); err != nil {
 			return fmt.Errorf("invalid JSON body: %w", err)
 		}
@@ -396,7 +396,7 @@ func injectedParameters(
 			continue
 		}
 
-		if isJSON {
+		if jsonMedia {
 			// A lone business parameter decodes the whole body; several split
 			// the JSON object by parameter name.
 			raw := body

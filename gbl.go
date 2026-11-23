@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -51,6 +52,8 @@ type engine struct {
 	cors *CorsConfig
 	// parsed source files for parameter names
 	astFileMap map[string]*ast.File
+	// per-file function line spans, collected once per file during name recovery
+	astSpans map[*ast.File][]funcSpan
 	// file set backing astFileMap
 	fest *token.FileSet
 	// lazily built "<file>:<line>"->param names from the binary's DWARF; the sourceless fallback
@@ -59,14 +62,14 @@ type engine struct {
 	server *http.Server
 
 	// sync primitives
-	// collapse signal and manual shutdown
-	shutdownOnce sync.Once
 	// guards listener/server assignment
 	startMu sync.Mutex
 
 	// 1-byte fields
 	// routes frozen into trees; also gates the read-only-after-Run contract
 	generated bool
+	// the server has been drained successfully; later Shutdown calls are no-ops
+	shutdownDone atomic.Bool
 }
 
 // defaultEngine is the one and only engine, backing the entire package-level
@@ -80,6 +83,7 @@ func newEngine() *engine {
 	return &engine{
 		roots:      make([]*routeNode, methodCount),
 		astFileMap: make(map[string]*ast.File),
+		astSpans:   make(map[*ast.File][]funcSpan),
 		fest:       token.NewFileSet(),
 		logger:     newStdLogger(),
 		cfg:        defaultConfig(),
@@ -96,8 +100,8 @@ func Run() { defaultEngine.run() }
 
 // Shutdown gracefully stops the server started by Run, waiting for active
 // requests until ctx expires. It is safe to call more than once and from
-// another goroutine than Run; calling it before Run returns "http: Server
-// closed".
+// another goroutine than Run; a failed attempt leaves the server running and
+// can be retried. Calling it before Run returns "http: Server closed".
 func Shutdown(ctx context.Context) error { return defaultEngine.shutdown(ctx) }
 
 // run is the instance-level counterpart of the package-level Run.
@@ -150,7 +154,12 @@ func (e *engine) run() {
 		case <-stop:
 			ctx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
 			defer cancel()
-			_ = e.shutdown(ctx)
+			if err := e.shutdown(ctx); err != nil {
+				// A failed drain leaves the server listening, which the
+				// operator would otherwise never learn about.
+				e.logger.Warn("graceful shutdown failed; the server is still listening",
+					"error", err)
+			}
 		case <-done:
 		}
 	}()
@@ -186,9 +195,16 @@ func (e *engine) shutdown(ctx context.Context) error {
 		return http.ErrServerClosed
 	}
 
-	var err error
-	e.shutdownOnce.Do(func() { err = server.Shutdown(ctx) })
-	return err
+	// Only a completed drain latches: an expired grace period or an interrupted
+	// wait keeps the server alive, so the same call can be made again.
+	if e.shutdownDone.Load() {
+		return nil
+	}
+	if err := server.Shutdown(ctx); err != nil {
+		return err
+	}
+	e.shutdownDone.Store(true)
+	return nil
 }
 
 // buildHandler assembles the http.Handler chain: the CORS layer wraps the

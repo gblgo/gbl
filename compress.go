@@ -83,31 +83,42 @@ func Compress(level int) HandlerFunc {
 			return
 		}
 
-		// Compress the response body
-		var buf bytes.Buffer
-		gw, err := gzip.NewWriterLevel(&buf, level)
+		// A stacked Compress must not deflate twice: an inner instance has
+		// already stamped the encoding, and a second pass would corrupt the
+		// body while both instances claim success.
+		if c.writer.Header().Get(contentEncoding) != empty {
+			return
+		}
+
+		// Compress the response body into a pooled buffer
+		buf := responseBufferPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		gw, err := gzip.NewWriterLevel(buf, level)
 		if err != nil {
 			// Invalid compression level, skip compression
+			responseBufferPool.Put(buf)
 			return
 		}
 
 		if _, err := gw.Write(c.bytes); err != nil {
 			_ = gw.Close() // Best-effort cleanup; write already failed
+			responseBufferPool.Put(buf)
 			return
 		}
 
 		if err := gw.Close(); err != nil {
+			responseBufferPool.Put(buf)
 			return
 		}
 
-		// Release the original pooled buffer before replacing c.bytes
+		// The compressed buffer takes over the pooled slot, so serveHTTP
+		// releases it once the response is written; the staged body is done
+		// and returns now.
 		if c.responseBuf != nil {
 			responseBufferPool.Put(c.responseBuf)
-			c.responseBuf = nil
 		}
-
-		// Replace with compressed data
 		c.bytes = buf.Bytes()
+		c.responseBuf = buf
 		c.writer.Header().Set(contentEncoding, encodingGzip)
 		c.writer.Header().Set(vary, acceptEncoding)
 	}
