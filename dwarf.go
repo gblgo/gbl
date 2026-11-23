@@ -121,19 +121,25 @@ func buildDWARFIndex() map[string][]string {
 	return index
 }
 
+// dwarfFile is the shape the three platform container formats share: pe.File,
+// elf.File and macho.File all expose exactly these two methods. Wrapping their
+// openers in it lets openSelfDWARF try each format in one loop.
+type dwarfFile interface {
+	DWARF() (*dwarf.Data, error)
+	Close() error
+}
+
+// dwarfOpener opens one platform container format and returns it as a
+// dwarfFile; openSelfDWARF tries each opener in turn.
+type dwarfOpener func(string) (dwarfFile, error)
+
 // openSelfDWARF reads the DWARF section from the executable at path, trying each
 // platform's format. The debug sections are loaded into memory by the call, so
 // closing the file afterward is safe. It returns nil for an unknown format, for a
 // binary with no DWARF (e.g. built with -w / -s), or when the DWARF data cannot
 // be read — none of these leave a usable result behind.
 func openSelfDWARF(path string) *dwarf.Data {
-	// The three container types share this shape; wrapping the openers lets the
-	// branches collapse into one loop.
-	type dwarfFile interface {
-		DWARF() (*dwarf.Data, error)
-		Close() error
-	}
-	openers := []func(string) (dwarfFile, error){
+	openers := []dwarfOpener{
 		func(p string) (dwarfFile, error) { return pe.Open(p) },
 		func(p string) (dwarfFile, error) { return elf.Open(p) },
 		func(p string) (dwarfFile, error) { return macho.Open(p) },
