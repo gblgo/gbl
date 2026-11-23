@@ -23,11 +23,9 @@ func (e *engine) register(method httpMethod, path string, fn any) {
 
 // registerWith queues a route together with the middleware of the group it was
 // registered through; the engine's global middleware are merged in later, at
-// route-generation time. The public verbs check the read-only-after-Run
-// contract themselves under their user-facing name; this assertion is the
-// internal backstop for any call site that bypasses them.
+// route-generation time. The read-only-after-Run contract is checked by every
+// public verb under its user-facing name, so nothing is asserted here.
 func (e *engine) registerWith(method httpMethod, path string, fn any, mw []HandlerFunc) {
-	e.assertAssembling("registerWith")
 	e.routeMetaSlice = append(e.routeMetaSlice,
 		&routeMeta{
 			method: method,

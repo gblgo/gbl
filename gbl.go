@@ -52,6 +52,8 @@ type engine struct {
 	cors *CorsConfig
 	// parsed source files for parameter names
 	astFileMap map[string]*ast.File
+	// per-file function line spans, collected once per file during name recovery
+	astSpans map[*ast.File][]funcSpan
 	// file set backing astFileMap
 	fest *token.FileSet
 	// lazily built "<file>:<line>"->param names from the binary's DWARF; the sourceless fallback
@@ -81,6 +83,7 @@ func newEngine() *engine {
 	return &engine{
 		roots:      make([]*routeNode, methodCount),
 		astFileMap: make(map[string]*ast.File),
+		astSpans:   make(map[*ast.File][]funcSpan),
 		fest:       token.NewFileSet(),
 		logger:     newStdLogger(),
 		cfg:        defaultConfig(),

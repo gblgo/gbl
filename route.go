@@ -306,6 +306,7 @@ func (e *engine) generateRoute() {
 		}
 	}
 	e.astFileMap = nil
+	e.astSpans = nil
 	e.dwarfIndex = nil
 	e.routeMetaSlice = nil
 	e.generated = true
@@ -359,7 +360,7 @@ func (e *engine) resolveParamNames(v reflect.Value) ([]string, bool) {
 		af = parsed
 	}
 
-	funcType := findFuncTypeAt(e.fest, af, line)
+	funcType := e.funcTypeAt(af, line)
 	if funcType == nil || funcType.Params == nil {
 		return nil, false
 	}
@@ -418,15 +419,22 @@ func (e *engine) lookupParamNamesDWARF(v reflect.Value) ([]string, bool) {
 	return names, true
 }
 
-// findFuncTypeAt returns the signature of the innermost function declaration or
-// literal whose source span encloses the given line, or nil when none does.
-// Preferring the smallest enclosing span makes a closure passed as a handler
-// resolve to its own func literal rather than to the function that created it.
-func findFuncTypeAt(fSet *token.FileSet, file *ast.File, line int) *ast.FuncType {
-	var (
-		best     *ast.FuncType
-		bestSpan = -1
-	)
+// funcSpan is the inclusive source line range of one function declaration or
+// literal, paired with its signature.
+type funcSpan struct {
+	// first line the enclosing function occupies
+	start int
+	// last line the enclosing function occupies
+	end int
+	// signature declared across this span
+	funcType *ast.FuncType
+}
+
+// collectFuncSpans walks file once and records the line span of every function
+// declaration and literal. A file hosting many handlers is then traversed a
+// single time instead of once per handler.
+func collectFuncSpans(fSet *token.FileSet, file *ast.File) []funcSpan {
+	var spans []funcSpan
 	ast.Inspect(file, func(n ast.Node) bool {
 		var funcType *ast.FuncType
 		switch fn := n.(type) {
@@ -437,17 +445,44 @@ func findFuncTypeAt(fSet *token.FileSet, file *ast.File, line int) *ast.FuncType
 		default:
 			return true
 		}
-
-		start := fSet.Position(n.Pos()).Line
-		end := fSet.Position(n.End()).Line
-		if line < start || line > end {
-			return true
-		}
-		if span := end - start; bestSpan < 0 || span < bestSpan {
-			best, bestSpan = funcType, span
-		}
+		spans = append(spans, funcSpan{
+			start:    fSet.Position(n.Pos()).Line,
+			end:      fSet.Position(n.End()).Line,
+			funcType: funcType,
+		})
 		return true
 	})
+	return spans
+}
+
+// funcTypeAt returns the spans of a parsed file, collecting them on first use,
+// and resolves the line against them.
+func (e *engine) funcTypeAt(file *ast.File, line int) *ast.FuncType {
+	spans, ok := e.astSpans[file]
+	if !ok {
+		spans = collectFuncSpans(e.fest, file)
+		e.astSpans[file] = spans
+	}
+	return findFuncTypeAt(spans, line)
+}
+
+// findFuncTypeAt returns the signature of the innermost span enclosing the
+// given line, or nil when none does. Preferring the smallest enclosing span
+// makes a closure passed as a handler resolve to its own func literal rather
+// than to the function that created it.
+func findFuncTypeAt(spans []funcSpan, line int) *ast.FuncType {
+	var (
+		best     *ast.FuncType
+		bestSpan = -1
+	)
+	for _, s := range spans {
+		if line < s.start || line > s.end {
+			continue
+		}
+		if span := s.end - s.start; bestSpan < 0 || span < bestSpan {
+			best, bestSpan = s.funcType, span
+		}
+	}
 	return best
 }
 

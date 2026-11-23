@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"mime"
 	"net/http"
@@ -146,9 +147,12 @@ func queryValues(r *http.Request) url.Values {
 }
 
 // parseRequestParameters collects handler-bindable inputs for the request:
-// form values, uploaded files, the JSON body buffer and whether the body is JSON.
-// The body buffer is pooled; the caller must release it with releaseBodyBuffer
-// once binding is done, since the decoded parameters are independent copies.
+// form values, uploaded files, the JSON body buffer and whether a JSON body
+// with actual content is present. The body buffer is pooled; the caller must
+// release it with releaseBodyBuffer once binding is done, since the decoded
+// parameters are independent copies. The returned flag already folds in the
+// non-empty check, so a whitespace-only JSON body fails here and a body that
+// passed is never scanned again downstream.
 func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 	method httpMethod) (url.Values, filesMap, *bytes.Buffer, bool, error) {
 	// GBL deliberately applies a strict parameter-source policy by HTTP method.
@@ -257,14 +261,31 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 		}
 
 	case mediaType == xWwwFormUrlencoded || mediaType == empty:
-		if err := r.ParseForm(); err != nil {
-			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
-				return nil, nil, nil, false, requestBodyTooLargeError
+		// The body is decoded directly rather than through r.ParseForm because
+		// ParseForm would parse the URL query a second time: queryValues below
+		// owns that single parse. MaxBytesReader, installed above, still caps
+		// the read and surfaces its error identically.
+		var bodyValues url.Values
+		if r.Body != nil {
+			raw, readErr := io.ReadAll(r.Body)
+			if readErr != nil {
+				if _, ok := errors.AsType[*http.MaxBytesError](readErr); ok {
+					return nil, nil, nil, false, requestBodyTooLargeError
+				}
+				return nil, nil, nil, false, readErr
 			}
-			return nil, nil, nil, false, err
+			parsed, parseErr := url.ParseQuery(string(raw))
+			if parseErr != nil {
+				return nil, nil, nil, false, parseErr
+			}
+			bodyValues = parsed
 		}
 		// Body fields win over query on shared keys; query-only keys survive.
-		form = mergeFormBodyWins(queryValues(r), r.PostForm)
+		form = mergeFormBodyWins(queryValues(r), bodyValues)
+		// Keep the fields r.ParseForm would have filled, so application code
+		// reading them directly sees the same state as before.
+		r.PostForm = bodyValues
+		r.Form = form
 
 	default:
 		// Unsupported body media types are not interpreted as parameters.
@@ -272,5 +293,5 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 		form = queryValues(r)
 	}
 
-	return form, files, bodyBuf, jsonMedia, nil
+	return form, files, bodyBuf, jsonMedia && bodyBuf != nil, nil
 }
