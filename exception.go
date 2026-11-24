@@ -60,12 +60,12 @@ var typeRecognitionError = []byte("Reflection Type Identification Exception")
 
 // errorWriteback renders a panic payload as response bytes, choosing the form by
 // its reflected kind.
-func errorWriteback(w http.ResponseWriter, err any) []byte {
+func errorWriteback(err any) ([]byte, string) {
 	// A nil payload renders as an empty body: a PanicProcessor may deliberately
 	// answer with no content, and reflect.ValueOf(nil) would otherwise fall into
 	// the unrecognized-kind default and emit the fixed error text.
 	if err == nil {
-		return []byte(empty)
+		return []byte(empty), textPlainCharset
 	}
 
 	// A value implementing error is written back as its message. Reflection
@@ -74,78 +74,39 @@ func errorWriteback(w http.ResponseWriter, err any) []byte {
 	// an empty "{}" with no information at all. Keeping the message plain also
 	// matches the 404, 405 and 501 replies the framework generates itself.
 	if e, ok := err.(error); ok {
-		return []byte(e.Error())
+		return []byte(e.Error()), textPlainCharset
 	}
 
 	val := reflect.ValueOf(err)
-	var bytes []byte
 	switch val.Kind() {
-	case reflect.Struct, reflect.Map:
-		// A marshal failure leaves no renderable body; fall back to the fixed
-		// text rather than writing a JSON content type with empty bytes.
+	case reflect.Struct, reflect.Map, reflect.Array, reflect.Slice:
 		data, marshalErr := json.Marshal(val.Interface())
 		if marshalErr != nil {
-			return typeRecognitionError
+			return typeRecognitionError, textPlainCharset
 		}
-		w.Header().Set(contentType, applicationJsonCharset)
-		bytes = data
-	case reflect.Array, reflect.Slice:
-		data, marshalErr := json.Marshal(val.Interface())
-		if marshalErr != nil {
-			return typeRecognitionError
-		}
-		bytes = data
+		return data, applicationJsonCharset
 	case reflect.String:
-		bytes = []byte(val.String())
+		return []byte(val.String()), textPlainCharset
 	case reflect.Pointer, reflect.Interface:
 		// A nil pointer/interface has no element to unwrap.
 		if val.IsNil() {
-			return []byte(empty)
+			return []byte(empty), textPlainCharset
 		}
 		// Unwrap one layer and return the result, passing the element value
 		// itself rather than the reflection wrapper around it.
-		return errorWriteback(w, val.Elem().Interface())
+		return errorWriteback(val.Elem().Interface())
 	case reflect.Bool:
-		bytes = strconv.AppendBool(nil, val.Bool())
+		return strconv.AppendBool(nil, val.Bool()), textPlainCharset
 	case reflect.Float32, reflect.Float64:
-		bytes = strconv.AppendFloat(nil, val.Float(), 'f', -1, val.Type().Bits())
-	case reflect.Int, reflect.Int8, reflect.Int16,
-		reflect.Int32, reflect.Int64:
-		bytes = strconv.AppendInt(nil, val.Int(), 10)
-	case reflect.Uint, reflect.Uint8, reflect.Uint16,
-		reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		bytes = strconv.AppendUint(nil, val.Uint(), 10)
+		return strconv.AppendFloat(nil, val.Float(), 'f', -1, val.Type().Bits()), textPlainCharset
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return strconv.AppendInt(nil, val.Int(), 10), textPlainCharset
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return strconv.AppendUint(nil, val.Uint(), 10), textPlainCharset
 	case reflect.Complex64, reflect.Complex128:
-		bytes = []byte(strconv.FormatComplex(val.Complex(), 'f', -1, val.Type().Bits()))
+		return []byte(strconv.FormatComplex(val.Complex(), 'f', -1, val.Type().Bits())), textPlainCharset
 	default:
-		bytes = typeRecognitionError
-	}
-	return bytes
-}
-
-// detectContentType picks the Content-Type for a panic payload so it agrees with
-// how errorWriteback renders it: plain text for errors and scalars, JSON for
-// structs, maps, arrays and slices.
-func detectContentType(data any) string {
-	if data == nil {
-		return textPlainCharset
-	}
-
-	// errorWriteback renders an error as its plain message rather than as JSON,
-	// so the declared content type has to agree with that body.
-	if _, isError := data.(error); isError {
-		return textPlainCharset
-	}
-
-	t := reflect.TypeOf(data)
-	for t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	switch t.Kind() {
-	case reflect.Struct, reflect.Map, reflect.Array, reflect.Slice:
-		return applicationJsonCharset
-	default:
-		return textPlainCharset
+		return typeRecognitionError, textPlainCharset
 	}
 }
 
@@ -157,6 +118,13 @@ func detectContentType(data any) string {
 func (e *engine) catchRuntimePanic(rw responseWriter) {
 	err := recover()
 	if err == nil {
+		return
+	}
+
+	if rw.hijacked() || (rw.flushed() && !rw.written()) {
+		if _, ok := err.(responseAbort); !ok {
+			e.logRecoveredPanic(err)
+		}
 		return
 	}
 
@@ -178,11 +146,11 @@ func (e *engine) catchRuntimePanic(rw responseWriter) {
 		if code < 100 || code > 999 {
 			code = http.StatusInternalServerError
 		}
-		bytes := errorWriteback(rw, payload)
+		body, mediaType := errorWriteback(payload)
+		rw.Header().Set(contentType, mediaType)
 		rw.WriteHeader(code)
-		rw.Header().Set(contentType, detectContentType(payload))
 		rw.writeHeader()
-		_, _ = rw.Write(bytes)
+		_, _ = rw.Write(body)
 		return
 	}
 

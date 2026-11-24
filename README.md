@@ -331,7 +331,7 @@ api.
     Post("/ping", func() string { return "posted" })      // /api/ping
 
 // Scoped middleware runs only for routes registered through this group.
-api.Use(func(c *gbl.Context) {
+api.GroupUse(func(c *gbl.Context) {
     if c.Request.URL.Query().Get("token") == "" {
         c.AbortWithStatusString(http.StatusUnauthorized, "missing token")
         return
@@ -616,7 +616,7 @@ gbl.Use(func(c *gbl.Context) {
 })
 
 api := gbl.Group("/api")
-api.Use(func(c *gbl.Context) {
+api.GroupUse(func(c *gbl.Context) {
     fmt.Println("group before")
     c.Next()
     fmt.Println("group after")
@@ -1112,7 +1112,7 @@ A missing upload leaves the pointer `nil` and the slice empty — no panic.
 
 ```go
 func SetMaxBodySize(size ByteSize)          // hard cap on total request body (413 over the limit)
-func SetMaxFileSize(size ByteSize)          // multipart per-file in-memory threshold; larger spill to temp files
+func SetMaxFileSize(size ByteSize)          // multipart total file-content memory threshold; excess spills to temp files
 func SetMaxUploadFileSize(size ByteSize)    // hard cap on each individual uploaded file (413 over the limit)
 ```
 
@@ -1129,7 +1129,7 @@ question. All take a positive `ByteSize` and panic on a non-positive one; the
 | Setting | What it controls | Over the limit | Default |
 |---|---|---|---|
 | `SetMaxBodySize` | the **total size of the whole request body** (multipart uploads included) | rejected with `413` | **5 MiB** |
-| `SetMaxFileSize` | the **in-memory threshold** for multipart parsing — parts up to this size stay in RAM, larger ones spill to temp files | nothing; it is *not* a cap and never rejects | **2 MiB** |
+| `SetMaxFileSize` | the **total in-memory threshold for multipart file content** — content up to this total stays in RAM, excess spills to temp files | nothing; it is *not* a cap and never rejects | **2 MiB** |
 | `SetMaxUploadFileSize` | the **maximum size of each individual uploaded file** (any field, any part) | rejected with `413` before the handler runs | **1 MiB** |
 
 Read the three together:

@@ -90,10 +90,10 @@ func SetMaxBodySize(size ByteSize) {
 	maxBodySize.Store(int64(size))
 }
 
-// SetMaxFileSize sets the multipart in-memory threshold: file parts smaller
-// than size stay in memory, larger ones spill to temporary files. It does not
-// limit the total upload size; see SetMaxBodySize for that. Panics on a
-// non-positive size, and once the default engine is serving.
+// SetMaxFileSize sets the multipart in-memory threshold for file content in
+// aggregate: file content up to size stays in memory, and excess spills to
+// temporary files. It does not limit the total upload size; see SetMaxBodySize
+// for that. Panics on a non-positive size, and once the default engine is serving.
 func SetMaxFileSize(size ByteSize) {
 	defaultEngine.assertAssembling("SetMaxFileSize")
 	if size <= 0 {
@@ -182,7 +182,10 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 	if limit <= 0 {
 		limit = defaultMaxBodySize
 	}
-	if r.Body != nil {
+	// A known body within the limit cannot exceed it, so avoid allocating a
+	// MaxBytesReader. Unknown lengths and oversized known bodies still need the
+	// wrapper to preserve the 413 path.
+	if r.Body != nil && (r.ContentLength < 0 || r.ContentLength > limit) {
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
 	}
 

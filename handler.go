@@ -31,12 +31,13 @@ var (
 	}
 )
 
-// recycle clears the wrapped ResponseWriter reference — so the pool never pins
-// a finished request's writer — and returns the wrapper for reuse. A named
-// method deferred directly (defer rw.recycle()) avoids the heap-allocated
-// closure that defer func(){...}() would cost on every request.
+// recycle clears all per-request state — including the wrapped writer and any
+// hijack marker — so the pool never pins a finished request or leaks connection
+// ownership into the next one. A named method deferred directly (defer
+// rw.recycle()) avoids the heap-allocated closure that defer func(){...}() would
+// cost on every request.
 func (rw *pooledResponseWriter) recycle() {
-	rw.w = nil
+	*rw = pooledResponseWriter{}
 	responseWriterPool.Put(rw)
 }
 
@@ -52,12 +53,13 @@ func releasePathParams(params map[string]string) {
 // Any panic raised below is recovered and rendered by the deferred
 // catchRuntimePanic.
 //
-// The response wrapper, the path-parameter map and the Context are drawn from
-// pools and returned on every exit path. The wrapper handed to middleware and
-// handlers therefore must not be retained past the request.
+// The response wrapper and Context are drawn from pools and returned on every
+// exit path. Dynamic routes also borrow a path-parameter map, while static hits
+// avoid that pool entirely. The wrapper handed to middleware and handlers
+// therefore must not be retained past the request.
 func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	rw := responseWriterPool.Get().(*pooledResponseWriter)
-	*rw = pooledResponseWriter{w: w}
+	*rw = pooledResponseWriter{w: w, hijacks: e.hijacks}
 
 	// Registered first so it runs last: the recover/deferred render below still
 	// needs rw.w, and only afterward may the wrapper be cleared and recycled.
@@ -71,15 +73,15 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		abort(http.StatusNotImplemented, http.StatusText(http.StatusNotImplemented))
 	}
 
-	pathParams := pathParamsPool.Get().(map[string]string)
-	defer releasePathParams(pathParams)
-
-	rh := e.matchNode(method, r.URL.Path, pathParams)
+	rh, pathParams := e.matchNode(method, r.URL.Path, nil)
 
 	// An unregistered HEAD borrows the GET route: the handler runs normally and
 	// net/http drops the body while keeping Content-Length.
 	if rh == nil && method == methodHead {
-		rh = e.matchNode(methodGet, r.URL.Path, pathParams)
+		rh, pathParams = e.matchNode(methodGet, r.URL.Path, pathParams)
+	}
+	if pathParams != nil {
+		defer releasePathParams(pathParams)
 	}
 
 	if rh == nil {
@@ -105,7 +107,8 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// rw.WriteHeader is a no-op once a status is recorded, so the 200 here only
 	// applies as a default when nothing set one, and rw.Write flushes the recorded
 	// status before the body.
-	if c.handled && !rw.written() {
+	if c.handled && !rw.written() && !rw.hijacked() &&
+		rw.status() != http.StatusSwitchingProtocols {
 		rw.Header().Set(contentType, c.contentType)
 		if !rw.headed() {
 			rw.WriteHeader(http.StatusOK)
