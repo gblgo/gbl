@@ -266,6 +266,43 @@ gbl.Delete("/items/:id", func(id string, hard bool) string {
 // handler 收到：id="7", hard=true
 ```
 
+### 服务端推送（`SSEWriter`）
+
+GET handler 只要声明一个 `SSEWriter` 参数,就会进入 SSE 管线。其余参数完全沿用 gbl 现有规则,路径、query、标量和结构体都能正常装配：
+
+```go
+type SSEWriter interface {
+    Send(v any) error
+    Done() <-chan struct{}
+}
+
+gbl.Get("/events/:topic", func(s gbl.SSEWriter, topic string, limit int) {
+    ticker := time.NewTicker(time.Second)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-s.Done():
+            return
+        case <-ticker.C:
+            event := map[string]any{"topic": topic, "limit": limit}
+            if err := s.Send(event); err != nil {
+                return
+            }
+        }
+    }
+})
+```
+
+`SSEWriter` 只允许出现在 GET 路由注册上。如果在 `POST`、`PUT`、`PATCH`、`DELETE`、`HEAD` 或 `OPTIONS` 上声明它,生成路由时会直接启动失败,因此请求处理不再需要 method 判断。未注册的 HEAD 仍复用 GET 路由,因此也走该路由的 SSE 管线,只是 net/http 会丢弃 body。
+
+GET SSE handler 不允许有返回值,所有事件都通过 `Send` 发送。参数装配和校验在流启动之前完成,因此装配失败仍返回正常的 `400`,不会先提交一个 SSE 200。
+
+`Send` 沿用普通 handler 返回值的转换规则：`string` 和 `[]byte` 原样发送,复合值编码为 JSON,error 发送其消息。多行内容会拆成多个 `data:` 行。
+
+框架自动设置 `Content-Type: text/event-stream` 与 `Cache-Control: no-cache`,立即发送响应头,每次事件后 Flush,每次写入前续写期限,空闲时发送 SSE 注释心跳。心跳不会作为业务消息送达浏览器。`Done` 在客户端断开、写入失败或 handler 退出时关闭;handler 必须 select 它来停止自己的事件循环。
+
+由于 SSE 走普通路由链,现有全局中间件和分组中间件仍然生效。
+
 ---
 
 ## 4. 分组（`Group` / `RouteGroup`）

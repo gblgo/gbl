@@ -313,6 +313,58 @@ gbl.Delete("/items/:id", func(id string, hard bool) string {
 // Handler receives: id="7", hard=true
 ```
 
+### Server-Sent Events (`SSEWriter`)
+
+On a GET handler, declaring an `SSEWriter` parameter opts the route into the SSE
+pipeline. Every other parameter binds by the normal gbl rules, so path, query,
+scalar and struct parameters work unchanged:
+
+```go
+type SSEWriter interface {
+    Send(v any) error
+    Done() <-chan struct{}
+}
+
+gbl.Get("/events/:topic", func(s gbl.SSEWriter, topic string, limit int) {
+    ticker := time.NewTicker(time.Second)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-s.Done():
+            return
+        case <-ticker.C:
+            event := map[string]any{"topic": topic, "limit": limit}
+            if err := s.Send(event); err != nil {
+                return
+            }
+        }
+    }
+})
+```
+
+`SSEWriter` is only valid on GET route registrations. Declaring it on `POST`,
+`PUT`, `PATCH`, `DELETE`, `HEAD` or `OPTIONS` fails route generation with a startup
+error, so request handling needs no method check. An unregistered HEAD still
+reuses the GET route and therefore follows its SSE pipeline; net/http suppresses
+the body.
+
+GET SSE handlers must not return values; use `Send` for every event. Parameter
+binding and validation finish before the stream starts, so a binding failure
+still returns the normal `400` response instead of a committed SSE 200.
+
+`Send` uses the same conversion rules as normal handler results: `string` and
+`[]byte` are sent verbatim; composite values are JSON-encoded; errors become
+their message. Multiline payloads are framed as multiple `data:` lines.
+
+The framework sets `Content-Type: text/event-stream` and `Cache-Control: no-cache`,
+sends headers immediately, flushes every event, renews the write deadline before
+each write, and sends SSE comment heartbeats while idle. Heartbeats are not
+delivered as browser messages. `Done` closes on client disconnect, write failure
+or handler exit; the handler must select it to stop its own event loop.
+
+Existing global and group middleware still apply because SSE uses the normal
+route chain.
+
 ---
 
 ## 4. Groups (`Group` / `RouteGroup`)

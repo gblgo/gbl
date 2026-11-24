@@ -68,6 +68,8 @@ type (
 		// not validate pays no per-request reflection or interface boxing.
 		validatableIndexes []int
 		needsParse         bool
+		// hasSSE is true when any parameter declares gbl.SSEWriter.
+		hasSSE bool
 		// needsNames is true when at least one business parameter must be matched
 		// against the request by its handler parameter name — any scalar, or more
 		// than one business argument (whose JSON members are split by name). A
@@ -89,6 +91,8 @@ const (
 	classFiles
 	// *Context, injected directly
 	classContext
+	// gbl.SSEWriter, injected as the request's event stream
+	classSSE
 )
 
 // Media-type fragments and error formats used only by this file. The enums
@@ -115,6 +119,8 @@ var (
 	contextType = reflect.TypeFor[*Context]()
 	// interface a handler declares to own the response
 	writerType = reflect.TypeFor[http.ResponseWriter]()
+	// interface a handler declares to stream server-sent events
+	sseWriterType = reflect.TypeFor[SSEWriter]()
 	// concrete writer handed to owning handlers, checked for assignability
 	pooledWriterType = reflect.TypeFor[*pooledResponseWriter]()
 	// uploaded file, by value
@@ -178,6 +184,9 @@ func classifyParam(t reflect.Type) paramClass {
 	if t == requestType {
 		return classRequest
 	}
+	if t == sseWriterType {
+		return classSSE
+	}
 	if t == writerType || t.Implements(writerType) {
 		return classWriter
 	}
@@ -228,6 +237,8 @@ func buildBindPlan(rt reflect.Type) bindPlan {
 				plan.writerOK = make([]bool, n)
 			}
 			plan.writerOK[i] = pooledWriterType.AssignableTo(t)
+		case classSSE:
+			plan.hasSSE = true
 		default:
 		}
 	}
@@ -374,6 +385,9 @@ func injectedParameters(
 				return fmt.Errorf(injectParameterErrFormat, name, responseMismatch)
 			}
 			params[i] = reflect.ValueOf(c.writer)
+			continue
+		case classSSE:
+			params[i] = reflect.ValueOf(c.sse)
 			continue
 		case classFiles:
 			headers, _ := src.filesGet(name)

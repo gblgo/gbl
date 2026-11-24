@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"reflect"
 	"sync"
+	"time"
 )
 
 // HandlerFunc is one link in the middleware chain. It receives the per-request
@@ -60,6 +61,8 @@ type Context struct {
 	// handlers own the response by declaring an http.ResponseWriter parameter,
 	// and it must never be stored beyond the request.
 	writer responseWriter
+	// sse is non-nil while an SSE handler is binding or running.
+	sse *sseWriter
 	// result content type chosen at registration
 	contentType string
 	// memoized boxed ret, filled only once Result is called
@@ -67,7 +70,7 @@ type Context struct {
 	// engine's log sink, so middleware logging honors SetLogger
 	logger Logger
 
-	// 8-byte fields (pointers, int, map)
+	// 8-byte fields (pointers, int, map, duration)
 	Request *http.Request
 	// cursor into handlers; abortIndex means "stopped"
 	index  int
@@ -76,6 +79,8 @@ type Context struct {
 	keys   map[string]any
 	// pooled buffer for handler result serialization, released after Write
 	responseBuf *bytes.Buffer
+	// server write-timeout default used by SSE deadline renewal
+	writeTimeout time.Duration
 
 	// 1-byte fields (grouped at end to minimize padding)
 	method httpMethod
@@ -96,9 +101,11 @@ func newContext(w *pooledResponseWriter,
 	rh *routeHandler,
 	method httpMethod,
 	logger Logger,
+	writeTimeout time.Duration,
 ) *Context {
 	c := contextPool.Get().(*Context)
 	c.writer = w
+	c.sse = nil
 	c.Request = r
 	c.handlers = rh.handlers
 	c.index = -1
@@ -114,6 +121,7 @@ func newContext(w *pooledResponseWriter,
 	c.logger = logger
 	c.src = nameSources{}
 	c.responseBuf = nil
+	c.writeTimeout = writeTimeout
 	return c
 }
 
@@ -122,6 +130,7 @@ func newContext(w *pooledResponseWriter,
 // middleware-set values.
 func (c *Context) recycle() {
 	c.writer = nil
+	c.sse = nil
 	c.Request = nil
 	c.handlers = nil
 	c.params = nil
@@ -137,6 +146,7 @@ func (c *Context) recycle() {
 	c.ret = reflect.Value{}
 	c.logger = nil
 	c.src = nameSources{}
+	c.writeTimeout = 0
 	// A panic between staging the result and the pipeline's write would
 	// otherwise drop the pooled buffer instead of recycling it.
 	if c.responseBuf != nil {
@@ -296,6 +306,12 @@ func (e *engine) use(middleware ...HandlerFunc) {
 func (c *Context) invokeHandler() {
 	rh := c.rh
 
+	if rh.plan.hasSSE {
+		sw := newSSEWriter(c.writer, c.Request, c.writeTimeout)
+		c.sse = sw
+		defer sw.cancel(nil)
+	}
+
 	var (
 		form    url.Values
 		files   filesMap
@@ -343,22 +359,39 @@ func (c *Context) invokeHandler() {
 		}
 	}
 
+	if rh.plan.hasSSE {
+		stopHeartbeat, err := c.startSSE()
+		if err != nil {
+			c.handled = true
+			return
+		}
+		defer stopHeartbeat()
+	}
+
 	out := rh.v.Call(in)
 	if len(out) > 0 {
 		buf := responseBufferPool.Get().(*bytes.Buffer)
 		buf.Reset()
-		contentType, convertErr := convertToBuffer(buf, out[0])
+		mediaType, convertErr := convertToBuffer(buf, out[0])
 		if convertErr != nil {
 			responseBufferPool.Put(buf)
 			// Serialization failures are server side: only the fixed text leaks.
 			abort(http.StatusInternalServerError, responseSerializationFailed)
 			return
 		}
-		c.contentType = contentType
+		c.contentType = mediaType
 		c.bytes = buf.Bytes()
 		c.responseBuf = buf
 		// Retain the raw return; Result boxes it only if a middleware asks.
 		c.ret = out[0]
 	}
 	c.handled = true
+}
+
+// startSSE commits the stream and starts its heartbeat after binding succeeds.
+func (c *Context) startSSE() (func(), error) {
+	if err := c.sse.start(); err != nil {
+		return nil, err
+	}
+	return c.sse.startHeartbeat(), nil
 }
