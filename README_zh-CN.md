@@ -281,7 +281,7 @@ api.
     Post("/ping", func() string { return "posted" })      // /api/ping
 
 // 分组中间件只作用于经本分组注册的规则。
-api.Use(func(c *gbl.Context) {
+api.GroupUse(func(c *gbl.Context) {
     if c.Request.URL.Query().Get("token") == "" {
         c.AbortWithStatusString(http.StatusUnauthorized, "missing token")
         return
@@ -514,7 +514,7 @@ gbl.Use(func(c *gbl.Context) {
 })
 
 api := gbl.Group("/api")
-api.Use(func(c *gbl.Context) {
+api.GroupUse(func(c *gbl.Context) {
     fmt.Println("group before")
     c.Next()
     fmt.Println("group after")
@@ -908,7 +908,7 @@ gbl.Post("/gallery", func(photos []*multipart.FileHeader) string {
 
 ```go
 func SetMaxBodySize(size ByteSize)          // 整个请求 body 的硬上限（超限返回 413）
-func SetMaxFileSize(size ByteSize)          // multipart 单文件内存阈值；更大的落临时文件
+func SetMaxFileSize(size ByteSize)          // multipart 文件内容的总内存阈值；超出部分落临时文件
 func SetMaxUploadFileSize(size ByteSize)    // 每个上传文件的单文件硬上限（超限返回 413）
 ```
 
@@ -923,7 +923,7 @@ gbl.SetMaxUploadFileSize(gbl.ByteSize(5 << 20))  // 允许单个文件最大 5 M
 | 设置 | 控制什么 | 超限后果 | 默认值 |
 |---|---|---|---|
 | `SetMaxBodySize` | **整个请求 body 的总大小**（含 multipart 上传） | 以 `413` 拒绝 | **5 MiB** |
-| `SetMaxFileSize` | multipart 解析的**内存阈值**——不超过此大小的 part 留在内存，更大的落临时文件 | 无；它*不是*上限、从不拒绝请求 | **2 MiB** |
+| `SetMaxFileSize` | multipart 文件内容的**总内存阈值**——总量不超过此值时留在内存，超出部分落临时文件 | 无；它*不是*上限、从不拒绝请求 | **2 MiB** |
 | `SetMaxUploadFileSize` | **每一个单独上传文件的最大大小**（任意字段、任意 part） | 进入 handler 前以 `413` 拒绝 | **1 MiB** |
 
 三个一起理解：
