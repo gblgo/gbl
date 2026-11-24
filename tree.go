@@ -181,48 +181,56 @@ func splitPathInto(dst []string, path string) []string {
 
 // matchNode finds the handler registered for method and path, filling params
 // with any bound path-variable values along the way. It returns nil when the
-// method has no tree yet or nothing under it matches.
+// method has no tree yet or nothing under it matches. params may be nil; the
+// dynamic path acquires a pooled map only when needed, and the returned map is
+// caller-owned when non-nil.
 //
-// Optimization: static routes (no path parameters) are stored in a map for O(1)
-// lookup. Only dynamic routes (with path parameters like :id) use the radix tree.
-//
-// A request path carrying empty segments ("/user//x", "/user/") is not in
-// normal form, while every stored route is: registration dropped the same empty
-// segments. The tree already ignores them through splitPathInto, so the static
-// map probes the '/'-joined segments too, and both tables answer such a path
-// identically.
-func (e *engine) matchNode(method httpMethod, path string, params map[string]string) *routeHandler {
+// Exact static routes keep the allocation-free map fast path. A non-normalized
+// request is normalized and rechecked against that map before the dynamic tree,
+// so repeated or trailing separators cannot let a variable route shadow a
+// static one.
+func (e *engine) matchNode(
+	method httpMethod,
+	path string,
+	params map[string]string,
+) (*routeHandler, map[string]string) {
 	// Fast path: try static route map first (O(1))
 	statics := e.staticRoutes[method]
 	if handler, ok := statics[path]; ok {
-		return handler
+		return handler, params
+	}
+
+	if len(statics) > 0 && !isNormalized(path) {
+		bufPool := segmentPool.Get().(*[]string)
+		segments := splitPathInto((*bufPool)[:0], path)
+		path = slash + strings.Join(segments, slash)
+		clear(segments)
+		*bufPool = segments
+		segmentPool.Put(bufPool)
+
+		if handler, ok := statics[path]; ok {
+			return handler, params
+		}
 	}
 
 	// Slow path: fall back to radix tree for dynamic routes (O(path length))
 	root := e.roots[method]
-	if root == nil && (len(statics) == 0 || isNormalized(path)) {
-		// No tree to walk. A normalized path also cannot hit the rejoined
-		// static reprobe below, so splitting it would be wasted work — the
-		// common shape when allowFor probes static-only methods for a 404.
-		return nil
+	if root == nil {
+		return nil, params
 	}
 
+	if params == nil {
+		params = pathParamsPool.Get().(map[string]string)
+	}
 	bufPool := segmentPool.Get().(*[]string)
 	segments := splitPathInto((*bufPool)[:0], path)
+	handler := searchNode(root, segments, 0, params)
 
-	var handler *routeHandler
-	if root != nil {
-		handler = searchNode(root, segments, 0, params)
-	}
-	if handler == nil && len(statics) > 0 && !isNormalized(path) {
-		normalized := slash + strings.Join(segments, slash)
-		handler = statics[normalized]
-	}
-
+	clear(segments)
 	*bufPool = segments
 	segmentPool.Put(bufPool)
 
-	return handler
+	return handler, params
 }
 
 // isNormalized reports whether the path already stores itself: no trailing
@@ -247,7 +255,7 @@ func (e *engine) allowFor(path string) []string {
 
 	for m := range methodCount {
 		clear(scratch)
-		if e.matchNode(m, path, scratch) != nil {
+		if handler, _ := e.matchNode(m, path, scratch); handler != nil {
 			reachable[m] = true
 		}
 	}

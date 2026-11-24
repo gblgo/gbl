@@ -272,8 +272,11 @@ func (e *engine) generateRoute() {
 
 		if t.NumOut() > 0 {
 			out := t.Out(0)
+			for out.Kind() == reflect.Pointer {
+				out = out.Elem()
+			}
 			switch out.Kind() {
-			case reflect.Struct, reflect.Pointer, reflect.Interface, reflect.Map, reflect.Array:
+			case reflect.Struct, reflect.Interface, reflect.Map, reflect.Array:
 				handler.contentType = applicationJsonCharset
 			case reflect.Slice:
 				// []byte is written verbatim; every other slice is JSON-marshaled.

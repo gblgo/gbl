@@ -184,6 +184,9 @@ func (c *Context) Size() int {
 	if n := c.writer.size(); n > 0 {
 		return n
 	}
+	if c.writer.written() || c.writer.status() == http.StatusSwitchingProtocols {
+		return 0
+	}
 	if c.handled {
 		return len(c.bytes)
 	}
@@ -225,6 +228,9 @@ func (c *Context) Get[T any](key string) (T, bool) {
 	stored, ok := c.keys[key]
 	if !ok {
 		return zero, false
+	}
+	if stored == nil && reflect.TypeFor[T]().Kind() == reflect.Interface {
+		return zero, true
 	}
 	typed, ok := stored.(T)
 	return typed, ok
@@ -341,13 +347,14 @@ func (c *Context) invokeHandler() {
 	if len(out) > 0 {
 		buf := responseBufferPool.Get().(*bytes.Buffer)
 		buf.Reset()
-		err = convertToBuffer(buf, out[0])
-		if err != nil {
+		contentType, convertErr := convertToBuffer(buf, out[0])
+		if convertErr != nil {
 			responseBufferPool.Put(buf)
 			// Serialization failures are server side: only the fixed text leaks.
 			abort(http.StatusInternalServerError, responseSerializationFailed)
 			return
 		}
+		c.contentType = contentType
 		c.bytes = buf.Bytes()
 		c.responseBuf = buf
 		// Retain the raw return; Result boxes it only if a middleware asks.

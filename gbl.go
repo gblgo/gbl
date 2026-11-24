@@ -60,10 +60,14 @@ type engine struct {
 	dwarfIndex map[string][]string
 	// live server, set by Run; nil before start
 	server *http.Server
+	// owns connections removed from net/http by Hijack
+	hijacks *hijackRegistry
 
 	// sync primitives
 	// guards listener/server assignment
 	startMu sync.Mutex
+	// serializes shutdown attempts so Run can wait for an in-progress drain
+	shutdownMu sync.Mutex
 
 	// 1-byte fields
 	// routes frozen into trees; also gates the read-only-after-Run contract
@@ -87,6 +91,7 @@ func newEngine() *engine {
 		fest:       token.NewFileSet(),
 		logger:     newStdLogger(),
 		cfg:        defaultConfig(),
+		hijacks:    newHijackRegistry(),
 	}
 }
 
@@ -99,9 +104,10 @@ func newEngine() *engine {
 func Run() { defaultEngine.run() }
 
 // Shutdown gracefully stops the server started by Run, waiting for active
-// requests until ctx expires. It is safe to call more than once and from
-// another goroutine than Run; a failed attempt leaves the server running and
-// can be retried. Calling it before Run returns "http: Server closed".
+// requests until ctx expires. A successful shutdown also closes connections
+// previously hijacked by handlers. It is safe to call more than once and from
+// another goroutine than Run; a failed attempt can be retried for the remaining
+// active connections. Calling it before Run returns "http: Server closed".
 func Shutdown(ctx context.Context) error { return defaultEngine.shutdown(ctx) }
 
 // run is the instance-level counterpart of the package-level Run.
@@ -145,20 +151,23 @@ func (e *engine) run() {
 	// A signal-triggered graceful shutdown returns nil from Serve; without this
 	// goroutine a bare Serve error would panic and skip listener cleanup. The done
 	// channel lets the goroutine exit when Serve returns on its own (e.g. a manual
-	// Shutdown), so it never leaks.
+	// Shutdown), while watcherDone lets Run wait for any signal drain already in
+	// progress before it returns.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	done := make(chan struct{})
+	watcherDone := make(chan struct{})
 	go func() {
+		defer close(watcherDone)
 		select {
 		case <-stop:
 			ctx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
 			defer cancel()
 			if err := e.shutdown(ctx); err != nil {
-				// A failed drain leaves the server listening, which the
-				// operator would otherwise never learn about.
-				e.logger.Warn("graceful shutdown failed; the server is still listening",
+				e.logger.Warn("graceful shutdown failed; forcing connections closed",
 					"error", err)
+				_ = server.Close()
+				e.hijacks.closeAll()
 			}
 		case <-done:
 		}
@@ -174,9 +183,16 @@ func (e *engine) run() {
 		serveErr = server.Serve(ln)
 	}
 
-	// Stop watching for signals and release the watcher goroutine.
+	// Stop watching for signals and wait for a signal-triggered drain that may
+	// already be running. A manual Shutdown owns its own context, so Run waits
+	// for that attempt to release shutdownMu before returning as well.
 	signal.Stop(stop)
 	close(done)
+	<-watcherDone
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		e.shutdownMu.Lock()
+		e.shutdownMu.Unlock()
+	}
 
 	// ErrServerClosed is the expected result of a graceful shutdown, not a
 	// crash: only genuine failures propagate as a panic.
@@ -195,14 +211,19 @@ func (e *engine) shutdown(ctx context.Context) error {
 		return http.ErrServerClosed
 	}
 
+	e.shutdownMu.Lock()
+	defer e.shutdownMu.Unlock()
+
 	// Only a completed drain latches: an expired grace period or an interrupted
-	// wait keeps the server alive, so the same call can be made again.
+	// wait keeps the remaining connections alive, so the same call can be made
+	// again.
 	if e.shutdownDone.Load() {
 		return nil
 	}
 	if err := server.Shutdown(ctx); err != nil {
 		return err
 	}
+	e.hijacks.closeAll()
 	e.shutdownDone.Store(true)
 	return nil
 }
