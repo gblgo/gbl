@@ -89,7 +89,7 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c := newContext(rw, r, pathParams, rh, method, e.logger)
+	c := newContext(rw, r, pathParams, rh, method, e.logger, e.cfg.WriteTimeout)
 	defer c.recycle()
 
 	// Multipart temp files, if any were parsed, are removed once the whole chain

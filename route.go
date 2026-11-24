@@ -292,6 +292,14 @@ func (e *engine) generateRoute() {
 
 		if t.NumIn() > 0 {
 			handler.plan = buildBindPlan(t)
+			if handler.plan.hasSSE {
+				if method != methodGet {
+					e.failStartup(fmt.Sprintf("SSEWriter is only supported on GET routes: %s %s", methodName, meta.path))
+				}
+				if t.NumOut() > 0 {
+					e.failStartup(fmt.Sprintf("SSE handler must not return a value: %s", meta.path))
+				}
+			}
 
 			// Two independent sources for the parameter names, tried in order:
 			//   1. the handler's own source file on disk — fresh, and the path used
