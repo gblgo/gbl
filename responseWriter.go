@@ -284,3 +284,9 @@ func (rw *pooledResponseWriter) Push(target string, opts *http.PushOptions) erro
 	}
 	return pusher.Push(target, opts)
 }
+
+// Unwrap returns the wrapped writer so http.ResponseController can reach
+// capabilities this wrapper does not forward, such as SetWriteDeadline.
+func (rw *pooledResponseWriter) Unwrap() http.ResponseWriter {
+	return rw.w
+}
