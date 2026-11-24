@@ -91,7 +91,13 @@ func Compress(level int) HandlerFunc {
 		c.Next()
 
 		// Only compress if the handler produced a result and nothing wrote yet
-		if !c.handled || c.writer.written() {
+		if !c.handled || c.writer.written() || c.writer.flushed() {
+			return
+		}
+
+		// Small responses cannot benefit from compression, so skip header and MIME
+		// parsing entirely for the common case.
+		if len(c.bytes) < minCompressSize {
 			return
 		}
 
@@ -102,11 +108,6 @@ func Compress(level int) HandlerFunc {
 
 		// Check if content type is compressible
 		if !isCompressible(c.contentType) {
-			return
-		}
-
-		// Check if response is large enough to benefit from compression
-		if len(c.bytes) < minCompressSize {
 			return
 		}
 
@@ -145,24 +146,26 @@ func Compress(level int) HandlerFunc {
 	}
 }
 
-// acceptsGzip reports whether an Accept-Encoding header permits gzip: it lists
-// "gzip", the legacy "x-gzip" or "*" at a non-zero weight. A substring scan
-// would honor an explicit refusal like "gzip;q=0", so tokens are matched whole
-// and a q parameter of zero drops its token.
+// acceptsGzip reports whether an Accept-Encoding header permits gzip. Explicit
+// gzip or x-gzip entries take precedence over the wildcard, so a later q=0
+// refusal cannot be undone by an earlier "*;q=1".
 func acceptsGzip(header string) bool {
+	var explicit, allowed, wildcard bool
 	for part := range strings.SplitSeq(header, comma) {
 		token, params, _ := strings.Cut(part, ";")
+		zero := hasZeroWeight(params)
 		switch strings.ToLower(strings.TrimSpace(token)) {
-		case encodingGzip, encodingXGzip, asterisk:
-		default:
-			continue
+		case encodingGzip, encodingXGzip:
+			explicit = true
+			allowed = allowed || !zero
+		case asterisk:
+			wildcard = wildcard || !zero
 		}
-		if hasZeroWeight(params) {
-			continue
-		}
-		return true
 	}
-	return false
+	if explicit {
+		return allowed
+	}
+	return wildcard
 }
 
 // hasZeroWeight reports whether a media range's parameters pin its quality
@@ -190,7 +193,8 @@ func isCompressible(contentType string) bool {
 
 	// Extract the MIME type without parameters (e.g., "application/json;
 	// charset=utf-8" becomes "application/json")
-	mime := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	mimeType, _, _ := strings.Cut(contentType, ";")
+	mime := strings.ToLower(strings.TrimSpace(mimeType))
 
 	// Compressible MIME types
 	switch mime {

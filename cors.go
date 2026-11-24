@@ -42,6 +42,8 @@ const (
 	corsMethodNotAllowed = "CORS method not allowed"
 	// rejection reason: header outside AllowedHeaders
 	corsHeaderNotAllowed = "CORS header not allowed"
+	// lists up to this size are scanned with EqualFold to avoid lowercasing allocations
+	corsLinearScanLimit = 8
 )
 
 // CorsConfig describes the cross-origin policy applied by the CORS layer.
@@ -172,8 +174,19 @@ func newCorsHandler(e *engine, cc *CorsConfig) *corsHandler {
 	}
 }
 
-// containsInMap reports whether target matches any key in the precomputed map,
-// case-insensitively.
+// containsFold reports whether target matches a small allow-list value,
+// case-insensitively, without allocating a lowercased lookup key.
+func containsFold(values []string, target string) bool {
+	for _, allowed := range values {
+		if strings.EqualFold(allowed, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsInMap reports whether target matches a large precomputed allow-list
+// map, case-insensitively.
 func containsInMap(m map[string]struct{}, target string) bool {
 	_, ok := m[strings.ToLower(target)]
 	return ok
@@ -190,7 +203,13 @@ func (ch *corsHandler) matchOrigin(origin string) (string, bool) {
 		}
 		return asterisk, true
 	}
-	if containsInMap(ch.allowedOriginsMap, origin) {
+	var allowed bool
+	if len(ch.config.AllowedOrigins) <= corsLinearScanLimit {
+		allowed = containsFold(ch.config.AllowedOrigins, origin)
+	} else {
+		allowed = containsInMap(ch.allowedOriginsMap, origin)
+	}
+	if allowed {
 		return origin, true
 	}
 	return empty, false
@@ -201,7 +220,13 @@ func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	header := w.Header()
 	requestMethod := r.Header.Get(accessControlRequestMethod)
 
-	if !containsInMap(ch.allowedMethodsMap, requestMethod) {
+	var methodAllowed bool
+	if len(ch.config.AllowedMethods) <= corsLinearScanLimit {
+		methodAllowed = containsFold(ch.config.AllowedMethods, requestMethod)
+	} else {
+		methodAllowed = containsInMap(ch.allowedMethodsMap, requestMethod)
+	}
+	if !methodAllowed {
 		http.Error(w, corsMethodNotAllowed, http.StatusForbidden)
 		return
 	}
@@ -213,7 +238,13 @@ func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 			if h == empty {
 				continue
 			}
-			if !containsInMap(ch.allowedHeadersMap, h) {
+			var headerAllowed bool
+			if len(ch.config.AllowedHeaders) <= corsLinearScanLimit {
+				headerAllowed = containsFold(ch.config.AllowedHeaders, h)
+			} else {
+				headerAllowed = containsInMap(ch.allowedHeadersMap, h)
+			}
+			if !headerAllowed {
 				http.Error(w, corsHeaderNotAllowed, http.StatusForbidden)
 				return
 			}
