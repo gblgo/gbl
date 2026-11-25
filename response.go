@@ -13,7 +13,7 @@ import (
 	"sync"
 )
 
-// This file holds response serialization: rendering a handler's return value
+// This file holds response serialization: rendering a handler return value
 // into the bytes the pipeline writes. The pooled writer itself lives in
 // responseWriter.go; the dispatch that stages this result lives in handler.go.
 
@@ -21,6 +21,19 @@ import (
 // so a request reuses one backing array instead of allocating fresh bytes every time.
 var responseBufferPool = sync.Pool{
 	New: func() any { return new(bytes.Buffer) },
+}
+
+// largest serialized response buffer retained by the pool
+const maxPooledResponseCapacity = 1 << 20
+
+// releaseResponseBuffer resets and pools a buffer unless its capacity is too
+// large to retain safely.
+func releaseResponseBuffer(buf *bytes.Buffer) {
+	if buf.Cap() > maxPooledResponseCapacity {
+		return
+	}
+	buf.Reset()
+	responseBufferPool.Put(buf)
 }
 
 // responseErrorType identifies values rendered through their Error message.

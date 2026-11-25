@@ -6,7 +6,7 @@ package gbl
 
 import "time"
 
-// Config is the engine's runtime configuration, set entirely in code. The
+// Config is the engine runtime configuration, set entirely in code. The
 // kernel reads no configuration file: defaults apply as-is, and Configure
 // overlays only the fields the application touches. File-based configuration
 // (YAML, environment, profiles, config centers) belongs to an integration
@@ -46,7 +46,7 @@ func defaultConfig() *Config {
 	}
 }
 
-// Configure overlays the default engine's configuration in code. The function
+// Configure overlays the default engine configuration in code. The function
 // receives the live Config already filled with defaults, so it only assigns
 // the fields it cares about:
 //
@@ -58,7 +58,7 @@ func defaultConfig() *Config {
 // Call it before Run. Passing nil is a no-op.
 func Configure(fn func(*Config)) { defaultEngine.configure(fn) }
 
-// configure overlays this engine's configuration. After fn returns, useTLS is
+// configure overlays this engine configuration. After fn returns, useTLS is
 // re-derived from the certificate and key paths, so setting or clearing either
 // path takes effect without a separate switch. Once the engine runs its
 // configuration snapshot is in effect on the live server and re-Configure

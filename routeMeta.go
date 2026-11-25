@@ -7,10 +7,13 @@ package gbl
 // routeMeta is a single queued route registration, recorded at Get/Post/... call
 // time and turned into a real handler later, when generateRoute runs at startup.
 type routeMeta struct {
+	// method is the HTTP verb for this registration
 	method httpMethod
-	path   string
-	fn     any
-	// middleware contributed by the route's group, if any
+	// path is the route pattern before normalization
+	path string
+	// fn is the user handler
+	fn any
+	// middleware contributed by the route group, if any
 	mw []HandlerFunc
 }
 
@@ -22,7 +25,7 @@ func (e *engine) register(method httpMethod, path string, fn any) {
 }
 
 // registerWith queues a route together with the middleware of the group it was
-// registered through; the engine's global middleware are merged in later, at
+// registered through; the engine global middleware are merged in later, at
 // route-generation time. The read-only-after-Run contract is checked by every
 // public verb under its user-facing name, so nothing is asserted here.
 func (e *engine) registerWith(method httpMethod, path string, fn any, mw []HandlerFunc) {

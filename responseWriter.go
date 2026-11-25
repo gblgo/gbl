@@ -38,7 +38,7 @@ type responseWriter interface {
 
 // pooledResponseWriter is the pooled wrapper the engine hands down. It buffers the
 // status and byte count so a panic or post-handler middleware can still flush the
-// right status, and mirrors net/http's rule that the first body write commits
+// right status, and mirrors net/http rule that the first body write commits
 // whatever status was set beforehand.
 type pooledResponseWriter struct {
 	// 16-byte fields (interface and pointer)
@@ -54,7 +54,7 @@ type pooledResponseWriter struct {
 	bytesWritten int
 
 	// 1-byte fields (bool)
-	// a body byte has been written
+	// Write has been called, including a zero-length write
 	writtenStatus bool
 	// WriteHeader has recorded a status
 	headedStatus bool
@@ -160,7 +160,7 @@ func (rw *pooledResponseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 }
 
-// Header exposes the underlying writer's live header map. Headers are not staged
+// Header exposes the underlying writer live header map. Headers are not staged
 // like the status and byte count: net/http snapshots them when the status is
 // flushed, so they must already be on the underlying writer by then.
 func (rw *pooledResponseWriter) Header() http.Header {
@@ -182,7 +182,7 @@ func (rw *pooledResponseWriter) Write(data []byte) (int, error) {
 }
 
 // status reports the response code as it stands or was sent: the recorded one
-// once WriteHeader has run, otherwise net/http's implicit 200 default.
+// once WriteHeader has run, otherwise net/http implicit 200 default.
 func (rw *pooledResponseWriter) status() int {
 	if rw.headedStatus {
 		return rw.statusCode
@@ -190,10 +190,16 @@ func (rw *pooledResponseWriter) status() int {
 	return http.StatusOK
 }
 
+// bodyAllowedForStatus mirrors the net/http rule that informational, 204 and 304
+// responses cannot carry a body.
+func bodyAllowedForStatus(code int) bool {
+	return code >= http.StatusOK && code != http.StatusNoContent && code != http.StatusNotModified
+}
+
 // size reports how many body bytes have been written so far.
 func (rw *pooledResponseWriter) size() int { return rw.bytesWritten }
 
-// written reports whether any body byte has been committed to the wire.
+// written reports whether Write has been called, including a zero-length write.
 func (rw *pooledResponseWriter) written() bool {
 	return rw.writtenStatus
 }

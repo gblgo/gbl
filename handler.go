@@ -48,7 +48,7 @@ func releasePathParams(params map[string]string) {
 }
 
 // serveHTTP is the full request pipeline: method check, route match, HEAD
-// fallback to GET, then the route's frozen middleware chain, whose terminal
+// fallback to GET, then the frozen route middleware chain, whose terminal
 // endpoint runs the business handler; finally the staged result is written.
 // Any panic raised below is recovered and rendered by the deferred
 // catchRuntimePanic.
@@ -89,8 +89,15 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c := newContext(rw, r, pathParams, rh, method, e.logger, e.cfg.WriteTimeout)
+	c := newContext(rw, r, pathParams, rh, method, e.logger)
 	defer c.recycle()
+
+	// Return-value handlers commit a provisional media type before middleware or
+	// the handler can flush. Runtime serialization may still refine it before the
+	// automatic write when the response has not been flushed.
+	if rh.t.NumOut() > 0 {
+		rw.Header().Set(contentType, rh.contentType)
+	}
 
 	// Multipart temp files, if any were parsed, are removed once the whole chain
 	// has completed, whatever the outcome and including a panic unwinding it.
@@ -107,9 +114,10 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// rw.WriteHeader is a no-op once a status is recorded, so the 200 here only
 	// applies as a default when nothing set one, and rw.Write flushes the recorded
 	// status before the body.
-	if c.handled && !rw.written() && !rw.hijacked() &&
-		rw.status() != http.StatusSwitchingProtocols {
-		rw.Header().Set(contentType, c.contentType)
+	if c.handled && !rw.written() && !rw.hijacked() && bodyAllowedForStatus(rw.status()) {
+		if rh.t.NumOut() == 0 || c.contentType != rh.contentType {
+			rw.Header().Set(contentType, c.contentType)
+		}
 		if !rw.headed() {
 			rw.WriteHeader(http.StatusOK)
 		}
@@ -149,7 +157,7 @@ func (e *engine) abortUnmatched(rw *pooledResponseWriter, method httpMethod, pat
 }
 
 // writeRequestError maps a request-parsing failure to its status code and
-// aborts the pipeline. Every error reaching here describes the client's own
+// aborts the pipeline. Every error reaching here describes the client own
 // malformed request (bad Content-Type, unparseable body, oversize payload), so
 // its message is safe to send back.
 func writeRequestError(err error) {

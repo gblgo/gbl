@@ -5,6 +5,7 @@
 package gbl
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -40,7 +42,7 @@ func isGoIdentifier(s string) bool {
 type httpMethod uint8
 
 // Constants used only by this file: the wire spelling of each method, shared
-// between the names table and methodOf's switch so a new verb is written once,
+// between the names table and methodOf switch so a new verb is written once,
 // and the path parameter braces.
 const (
 	// wire spelling of GET, shared by the names table and methodOf
@@ -114,11 +116,12 @@ func (m httpMethod) isBodyMethod() bool {
 // the precomputed bind plan and the frozen middleware chain. Built once in
 // generateRoute and reused verbatim by every matching request.
 type routeHandler struct {
-	// 24-byte fields (reflect.Value, slices)
-	v          reflect.Value
+	// 24-byte fields (reflected value, slices)
+	v reflect.Value
+	// paramNames is parallel to the handler parameter list
 	paramNames []string
-	// this route's frozen request chain: the engine's global middleware,
-	// then the route group's, then the terminal routeEndpoint. It is
+	// this route frozen request chain: the engine global middleware,
+	// then the route group, then the terminal routeEndpoint. It is
 	// assembled once at startup and reused verbatim by every request.
 	handlers []HandlerFunc
 
@@ -127,7 +130,12 @@ type routeHandler struct {
 
 	// 16-byte fields (string, interface)
 	contentType string
-	t           reflect.Type
+	// t is the reflected handler function type
+	t reflect.Type
+	// engine lifetime used to cancel SSE streams during shutdown
+	streamCtx context.Context
+	// server write timeout used by SSE deadline renewal
+	writeTimeout time.Duration
 }
 
 // dealPath splits path into per-segment metadata and a normalized route path.
@@ -159,7 +167,8 @@ func (e *engine) dealPath(path string) ([]segmentMeta, string) {
 		meta := segmentMeta{segment: part, isVar: false}
 		if strings.Contains(part, colon) {
 			if len(part) == 1 || strings.LastIndex(part, colon) != 0 {
-				e.failStartup("when registering a route, the path cannot be '/:' or '/:***:***:' or '/::', etc")
+				e.failStartup("when registering a route, the path cannot be '/:' " +
+					"or '/:***:***:' or '/::', etc")
 			}
 			meta.isVar = true
 			meta.paramName = part[1:]
@@ -219,7 +228,7 @@ const (
 // the handler, chooses a response content type from its return kind, builds the
 // bind plan and recovers parameter names (aborting at startup if name-based
 // binding would be unreliable), freezes the request middleware chain, and
-// inserts the route into the method's tree. It runs once, at startup, then
+// inserts the route into the method tree. It runs once, at startup, then
 // releases the registration queue and AST cache.
 func (e *engine) generateRoute() {
 	for _, meta := range e.routeMetaSlice {
@@ -265,9 +274,11 @@ func (e *engine) generateRoute() {
 		}
 
 		handler := &routeHandler{
-			contentType: textPlainCharset,
-			v:           v,
-			t:           t,
+			contentType:  textPlainCharset,
+			v:            v,
+			t:            t,
+			streamCtx:    e.streamCtx,
+			writeTimeout: e.cfg.WriteTimeout,
 		}
 
 		if t.NumOut() > 0 {
@@ -294,50 +305,45 @@ func (e *engine) generateRoute() {
 			handler.plan = buildBindPlan(t)
 			if handler.plan.hasSSE {
 				if method != methodGet {
-					e.failStartup(fmt.Sprintf("SSEWriter is only supported on GET routes: %s %s", methodName, meta.path))
+					e.failStartup(fmt.Sprintf("SSEWriter is only supported on GET routes: %s %s",
+						methodName, meta.path))
 				}
 				if t.NumOut() > 0 {
 					e.failStartup(fmt.Sprintf("SSE handler must not return a value: %s", meta.path))
 				}
 			}
 
-			// Two independent sources for the parameter names, tried in order:
-			//   1. the handler's own source file on disk — fresh, and the path used
-			//      in development (`go run`, or a build run next to the source);
-			//   2. the binary's own DWARF debug info — the sourceless production
-			//      path. The compiler keeps parameter names in DWARF even under
-			//      -trimpath, so a bare binary still carries them.
-			// Disk wins when both exist so a dev edit is never shadowed by the
-			// DWARF baked into an older binary.
-			names, resolved := e.resolveParamNames(handler.v)
-			if !resolved {
-				names, resolved = e.lookupParamNamesDWARF(handler.v)
+			if handler.plan.needsNames {
+				// Two independent sources for the parameter names, tried in order:
+				//   1. the handler source file on disk — fresh, and the path used
+				//      in development (`go run`, or a build run next to the source);
+				//   2. DWARF debug info in the binary — the sourceless production
+				//      path. The compiler keeps parameter names in DWARF even under
+				//      -trimpath, so a bare binary still carries them.
+				// Disk wins when both exist so a dev edit is never shadowed by the
+				// DWARF baked into an older binary.
+				names, resolved := e.resolveParamNames(handler.v)
+				if !resolved {
+					names, resolved = e.lookupParamNamesDWARF(handler.v)
+				}
+				handler.paramNames = normalizeParamNames(names, t.NumIn())
+				if !resolved {
+					e.failStartup(fmt.Errorf("gbl: handler for %s %s binds parameters by name, "+
+						"but the parameter names are unavailable at runtime: no source on disk "+
+						"and no DWARF debug info in the binary. The binary was likely built with "+
+						"`-ldflags \"-w\"` or `\"-s\"`, which strip DWARF; rebuild without them so "+
+						"gbl can read the names from the binary, or bind through a struct / "+
+						"*struct parameter whose field names come from reflection",
+						methodName, meta.path))
+				}
+			} else {
+				handler.paramNames = normalizeParamNames(nil, t.NumIn())
 			}
-			handler.paramNames = normalizeParamNames(names, t.NumIn())
-
-			// A name-dependent handler whose names came from neither source would
-			// otherwise bind path/query/JSON values to nothing and answer with wrong
-			// data at request time. Fail loudly at startup instead, pointing at the
-			// real causes: the binary was built with `-ldflags "-w"`/`"-s"` (which
-			// strip the DWARF this fallback reads), or it ships without source. The
-			// fix is to keep DWARF (drop -w/-s) or bind through a struct, whose field
-			// names come from reflection and survive any build flag. A self-describing
-			// binding (a lone struct) is not name-dependent, so it falls through to
-			// positional placeholders silently — the normal sourceless path for struct
-			// handlers, where a per-handler warning would be noise.
-			if handler.plan.needsNames && !resolved {
-				e.failStartup(fmt.Errorf("gbl: handler for %s %s binds parameters by name, "+
-					"but the parameter names are unavailable at runtime: no source on disk "+
-					"and no DWARF debug info in the binary. The binary was likely built with "+
-					"`-ldflags \"-w\"` or `\"-s\"`, which strip DWARF; rebuild without them so "+
-					"gbl can read the names from the binary, or bind through a struct / "+
-					"*struct parameter whose field names come from reflection",
-					methodName, meta.path))
-			}
+			handler.plan.prepareKeys(handler.paramNames)
 		}
 
 		// Freeze the request chain: engine middleware run outermost, then the
-		// group's, and the terminal endpoint invokes the business handler. This
+		// group, and the terminal endpoint invokes the business handler. This
 		// slice is shared by every request routed here.
 		chain := make([]HandlerFunc, 0, len(e.middlewares)+len(meta.mw)+1)
 		chain = append(chain, e.middlewares...)
@@ -379,9 +385,9 @@ func (e *engine) generateRoute() {
 	e.generated = true
 }
 
-// resolveParamNames recovers a handler's parameter names from its own source file.
+// resolveParamNames recovers handler parameter names from the source file.
 //
-// The reflection package reports a function's parameter types but never its
+// The reflection package reports a function parameter types but never its
 // parameter names, and
 // GBL binds request values by name, so the source recorded in the binary is parsed
 // once per file at startup. The handler is located by SOURCE POSITION, the line
@@ -398,7 +404,7 @@ func (e *engine) generateRoute() {
 // value.
 //
 // The second return reports whether real names were recovered. The caller acts
-// on it: a handler whose binding needs names first falls back to the binary's
+// on it: a handler whose binding needs names first falls back to the binary
 // DWARF, and only aborts startup (failStartup) if that is missing too, while a
 // self-describing binding (a lone struct, whose fields come from reflection)
 // falls back to positional placeholders and continues.
@@ -442,15 +448,15 @@ func (e *engine) resolveParamNames(v reflect.Value) ([]string, bool) {
 	return paramNames, true
 }
 
-// lookupParamNamesDWARF recovers a handler's parameter names from the binary's
-// own DWARF debug info, when the source on disk is unavailable.
+// lookupParamNamesDWARF recovers handler parameter names from DWARF debug info
+// in the binary when the source on disk is unavailable.
 //
 // It is the production half of name binding: a sourceless image (multi-stage
 // build, -trimpath, bare binary) has no .go file to parse, but the compiler still
 // emits parameter names into DWARF by default. The index is keyed by the SAME
 // source position the runtime reports — "<file>:<line>" — so lookup needs no
 // symbol name and resolves closures and func literals exactly as the disk path
-// does. Position keys are also immune to Go 1.27's merging and renaming of
+// does. Position keys are also immune to Go 1.27 merging and renaming of
 // identical function literals, which makes symbol-keyed lookups unsafe.
 //
 // The index is built lazily on the first handler that misses on disk and cached

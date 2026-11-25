@@ -87,7 +87,7 @@ func (cc *CorsConfig) validate() error {
 
 // SetCorsConfig installs the CORS configuration on the default engine; Run
 // then wraps the handler chain with it. A nil configuration disables CORS.
-// The engine keeps a private deep copy, so later edits to the caller's struct
+// The engine keeps a private deep copy, so later edits to the caller struct
 // can neither race the serving goroutines nor switch policy mid-flight.
 // A configuration rejected by this security policy (see validate) aborts
 // startup here, before Run. Like every assembling API it panics once the
@@ -122,16 +122,27 @@ func isPreflightRequest(r *http.Request) bool {
 // is present; it decides CORS headers and preflight handling, then delegates the
 // actual request to the wrapped engine.
 type corsHandler struct {
-	engine            *engine
-	config            *CorsConfig
-	allowMethods      string
-	allowHeaders      string
-	exposeHeaders     string
-	maxAge            string
-	wildcard          bool
-	expose            bool
+	// engine receives requests that are not answered as preflights
+	engine *engine
+	// config is the immutable-installed policy
+	config *CorsConfig
+	// allowMethods is the preflight Access-Control-Allow-Methods value
+	allowMethods string
+	// allowHeaders is the preflight Access-Control-Allow-Headers value
+	allowHeaders string
+	// exposeHeaders is the Access-Control-Expose-Headers value
+	exposeHeaders string
+	// maxAge is the preflight cache lifetime in seconds
+	maxAge string
+	// wildcard records whether any allowed origin is "*"
+	wildcard bool
+	// expose records whether response headers should be exposed
+	expose bool
+	// allowedOriginsMap holds lowercased origins for large lists
 	allowedOriginsMap map[string]struct{}
+	// allowedMethodsMap holds lowercased methods for large lists
 	allowedMethodsMap map[string]struct{}
+	// allowedHeadersMap holds lowercased headers for large lists
 	allowedHeadersMap map[string]struct{}
 }
 
@@ -143,21 +154,32 @@ func newCorsHandler(e *engine, cc *CorsConfig) *corsHandler {
 		maxAge = strconv.FormatInt(int64(cc.MaxAge.Seconds()), 10)
 	}
 	var wildcard bool
-	originsMap := make(map[string]struct{}, len(cc.AllowedOrigins))
+	var originsMap map[string]struct{}
+	if len(cc.AllowedOrigins) > corsLinearScanLimit {
+		originsMap = make(map[string]struct{}, len(cc.AllowedOrigins))
+	}
 	for _, origin := range cc.AllowedOrigins {
 		lower := strings.ToLower(origin)
-		originsMap[lower] = struct{}{}
+		if originsMap != nil {
+			originsMap[lower] = struct{}{}
+		}
 		if lower == asterisk {
 			wildcard = true
 		}
 	}
-	methodsMap := make(map[string]struct{}, len(cc.AllowedMethods))
-	for _, m := range cc.AllowedMethods {
-		methodsMap[strings.ToLower(m)] = struct{}{}
+	var methodsMap map[string]struct{}
+	if len(cc.AllowedMethods) > corsLinearScanLimit {
+		methodsMap = make(map[string]struct{}, len(cc.AllowedMethods))
+		for _, method := range cc.AllowedMethods {
+			methodsMap[strings.ToLower(method)] = struct{}{}
+		}
 	}
-	headersMap := make(map[string]struct{}, len(cc.AllowedHeaders))
-	for _, h := range cc.AllowedHeaders {
-		headersMap[strings.ToLower(h)] = struct{}{}
+	var headersMap map[string]struct{}
+	if len(cc.AllowedHeaders) > corsLinearScanLimit {
+		headersMap = make(map[string]struct{}, len(cc.AllowedHeaders))
+		for _, header := range cc.AllowedHeaders {
+			headersMap[strings.ToLower(header)] = struct{}{}
+		}
 	}
 	return &corsHandler{
 		engine:            e,
@@ -267,6 +289,8 @@ func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	origin := strings.TrimSpace(r.Header.Get(headerOrigin))
+	header := w.Header()
+	header.Add(vary, headerOrigin)
 
 	// Non-cross-origin request
 	if origin == empty {
@@ -288,9 +312,7 @@ func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set general cross-origin response headers
-	header := w.Header()
 	header.Set(accessControlAllowOrigin, allowOrigin)
-	header.Add(vary, headerOrigin)
 
 	if ch.config.AllowCredentials {
 		header.Set(accessControlAllowCredentials, headerTrue)

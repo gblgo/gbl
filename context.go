@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"reflect"
 	"sync"
-	"time"
 )
 
 // HandlerFunc is one link in the middleware chain. It receives the per-request
@@ -30,14 +29,14 @@ const (
 	responseSerializationFailed = "response serialization failed"
 )
 
-// routeEndpoint is the terminal link appended to every route's chain. It is a
+// routeEndpoint is the terminal link appended to every route chain. It is a
 // shared, stateless function because the concrete handler is read from the
 // per-request Context rather than captured here.
 var routeEndpoint HandlerFunc = func(c *Context) { c.invokeHandler() }
 
 // Context is the single handle threaded through the middleware chain and, when a
 // handler declares it, injected as a parameter. It carries the request, the
-// response writer, the matched route's path parameters and a key/value bag that
+// response writer, the matched route path parameters and a key/value bag that
 // middleware use to hand data to later links and to the handler.
 //
 // A Context is pooled. It must not be retained past the request that produced
@@ -46,18 +45,18 @@ var routeEndpoint HandlerFunc = func(c *Context) { c.invokeHandler() }
 // Field order is optimized for memory alignment: larger fields (slices, interfaces)
 // come first, smaller scalars (bool, uint8) are grouped at the end to minimize padding.
 type Context struct {
-	// 24-byte fields (slice header, reflect.Value, struct with 3 maps)
-	// this route's merged chain, including the terminal endpoint
+	// 24-byte fields (slice header, reflected value, struct with 3 maps)
+	// this route merged chain, including the terminal endpoint
 	handlers []HandlerFunc
 	// serialized handler result
 	bytes []byte
-	// handler's first return, boxed lazily by Result
+	// handler first return, boxed lazily by Result
 	ret reflect.Value
 	// per-request by-name binding sources; primed in injectedParameters
 	src nameSources
 
 	// 16-byte fields (interface = type + data pointer, string = pointer + len)
-	// writer is the framework's pooled response sink. It stays unexported:
+	// writer is the framework pooled response sink. It stays unexported:
 	// handlers own the response by declaring an http.ResponseWriter parameter,
 	// and it must never be stored beyond the request.
 	writer responseWriter
@@ -67,20 +66,21 @@ type Context struct {
 	contentType string
 	// memoized boxed ret, filled only once Result is called
 	result any
-	// engine's log sink, so middleware logging honors SetLogger
+	// engine log sink, so middleware logging honors SetLogger
 	logger Logger
 
 	// 8-byte fields (pointers, int, map, duration)
 	Request *http.Request
 	// cursor into handlers; abortIndex means "stopped"
-	index  int
+	index int
+	// params holds matched path parameters for this request
 	params map[string]string
-	rh     *routeHandler
-	keys   map[string]any
+	// rh is the immutable-matched route handler
+	rh *routeHandler
+	// keys stores middleware request-scoped values
+	keys map[string]any
 	// pooled buffer for handler result serialization, released after Write
 	responseBuf *bytes.Buffer
-	// server write-timeout default used by SSE deadline renewal
-	writeTimeout time.Duration
 
 	// 1-byte fields (grouped at end to minimize padding)
 	method httpMethod
@@ -101,7 +101,6 @@ func newContext(w *pooledResponseWriter,
 	rh *routeHandler,
 	method httpMethod,
 	logger Logger,
-	writeTimeout time.Duration,
 ) *Context {
 	c := contextPool.Get().(*Context)
 	c.writer = w
@@ -121,12 +120,11 @@ func newContext(w *pooledResponseWriter,
 	c.logger = logger
 	c.src = nameSources{}
 	c.responseBuf = nil
-	c.writeTimeout = writeTimeout
 	return c
 }
 
 // recycle clears every reference the Context holds before it returns to the
-// pool, so a pooled Context never pins a finished request's writer, body or
+// pool, so a pooled Context never pins a finished request writer, body or
 // middleware-set values.
 func (c *Context) recycle() {
 	c.writer = nil
@@ -146,11 +144,10 @@ func (c *Context) recycle() {
 	c.ret = reflect.Value{}
 	c.logger = nil
 	c.src = nameSources{}
-	c.writeTimeout = 0
-	// A panic between staging the result and the pipeline's write would
+	// A panic between staging the result and the pipeline write would
 	// otherwise drop the pooled buffer instead of recycling it.
 	if c.responseBuf != nil {
-		responseBufferPool.Put(c.responseBuf)
+		releaseResponseBuffer(c.responseBuf)
 		c.responseBuf = nil
 	}
 	contextPool.Put(c)
@@ -175,15 +172,15 @@ func (c *Context) Abort() {
 // Aborted reports whether the chain has been stopped.
 func (c *Context) Aborted() bool { return c.index >= abortIndex }
 
-// IsWritten reports whether a response body has already been committed, letting
-// a post-handler middleware decide whether to override the default rendering.
+// IsWritten reports whether Write has been called, including a zero-length write,
+// letting post-handler middleware decide whether to override the default rendering.
 func (c *Context) IsWritten() bool { return c.writer.written() }
 
 // StatusCode reports the status that will be, or was, sent for this response:
-// the recorded one once anything has set it, otherwise net/http's 200 default.
+// the recorded one once anything has set it, otherwise net/http 200 default.
 // Because the staged body is committed only after the whole chain unwinds, this
 // prediction is what lets an access-log or metrics middleware read the effective
-// status from c.Next()'s return point.
+// status from c.Next() return point.
 func (c *Context) StatusCode() int { return c.writer.status() }
 
 // Size reports the effective response body length: the bytes already written,
@@ -194,7 +191,7 @@ func (c *Context) Size() int {
 	if n := c.writer.size(); n > 0 {
 		return n
 	}
-	if c.writer.written() || c.writer.status() == http.StatusSwitchingProtocols {
+	if c.writer.written() || !bodyAllowedForStatus(c.writer.status()) {
 		return 0
 	}
 	if c.handled {
@@ -228,7 +225,7 @@ func (c *Context) Set(key string, value any) {
 
 // Get returns a value set earlier, typed by the caller: the type argument
 // asserts the stored value, and a miss (absent key or different type) yields
-// T's zero value and false, so the caller decides how to handle it. Get[any]
+// T zero value and false, so the caller decides how to handle it. Get[any]
 // reads the value without asserting. For the value alone, see Value.
 func (c *Context) Get[T any](key string) (T, bool) {
 	var zero T
@@ -253,7 +250,7 @@ func (c *Context) Value[T any](key string) T {
 	return value
 }
 
-// Result returns the matched handler's boxed return value, or nil when the
+// Result returns the matched handler boxed return value, or nil when the
 // handler produced none. The value is boxed on the first call and memoized, so a
 // request whose middleware never reads Result pays no interface allocation. It
 // is valid only after c.Next() has run the handler.
@@ -291,8 +288,8 @@ func (c *Context) AbortWithStatusJSON(status int, body any) {
 func Use(middleware ...HandlerFunc) { defaultEngine.use(middleware...) }
 
 // use appends middleware that run for every route on this engine. They are
-// combined with each route group's middleware at route-generation time, the
-// engine's running outermost. Register all middleware before Run; calling Use
+// combined with each route group middleware at route-generation time, the
+// engine running outermost. Register all middleware before Run; calling Use
 // afterward panics, because every route chain is already frozen.
 func (e *engine) use(middleware ...HandlerFunc) {
 	e.assertAssembling("Use")
@@ -307,9 +304,9 @@ func (c *Context) invokeHandler() {
 	rh := c.rh
 
 	if rh.plan.hasSSE {
-		sw := newSSEWriter(c.writer, c.Request, c.writeTimeout)
+		sw := newSSEWriter(c.writer, c.Request, rh.writeTimeout, c.logger, rh.streamCtx)
 		c.sse = sw
-		defer sw.cancel(nil)
+		defer sw.complete()
 	}
 
 	var (
@@ -320,7 +317,9 @@ func (c *Context) invokeHandler() {
 		err     error
 	)
 	if rh.plan.needsParse {
-		form, files, bodyBuf, isJSON, err = parseRequestParameters(c.writer, c.Request, c.method)
+		form, files, bodyBuf, isJSON, err = parseRequestParameters(
+			c.writer, c.Request, c.method, rh.plan.queryKeys,
+		)
 		if err != nil {
 			writeRequestError(err)
 			return
@@ -328,11 +327,15 @@ func (c *Context) invokeHandler() {
 	}
 
 	// The pooled body buffer is needed only while binding; the decoded
-	// parameters are independent copies, so release it when this handler returns.
+	// parameters are independent copies, so release it before the handler runs.
 	var body []byte
 	if bodyBuf != nil {
 		body = bodyBuf.Bytes()
-		defer releaseBodyBuffer(bodyBuf)
+		defer func() {
+			if bodyBuf != nil {
+				releaseBodyBuffer(bodyBuf)
+			}
+		}()
 	}
 
 	var in []reflect.Value
@@ -344,7 +347,7 @@ func (c *Context) invokeHandler() {
 		defer releaseParams(paramsBuf, in)
 		if err = injectedParameters(c, form, files, body, isJSON, in); err != nil {
 			// Binding errors are assembled from reflection internals (parameter
-			// names, Go type strings, strconv detail), so only a generic 400 is
+			// names, Go type strings, numeric parsing detail), so only a generic 400 is
 			// returned and the detail stays in the server log.
 			c.logger.Error("request binding failed", "error", err)
 			abort(http.StatusBadRequest, http.StatusText(http.StatusBadRequest))
@@ -359,11 +362,20 @@ func (c *Context) invokeHandler() {
 		}
 	}
 
+	if bodyBuf != nil {
+		releaseBodyBuffer(bodyBuf)
+		bodyBuf = nil
+		body = nil
+	}
+
 	if rh.plan.hasSSE {
 		stopHeartbeat, err := c.startSSE()
 		if err != nil {
-			c.handled = true
-			return
+			c.logger.Error("SSE startup failed", "error", err)
+			if c.writer.flushed() {
+				return
+			}
+			abort(http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError))
 		}
 		defer stopHeartbeat()
 	}
@@ -374,7 +386,7 @@ func (c *Context) invokeHandler() {
 		buf.Reset()
 		mediaType, convertErr := convertToBuffer(buf, out[0])
 		if convertErr != nil {
-			responseBufferPool.Put(buf)
+			releaseResponseBuffer(buf)
 			// Serialization failures are server side: only the fixed text leaks.
 			abort(http.StatusInternalServerError, responseSerializationFailed)
 			return
@@ -391,7 +403,7 @@ func (c *Context) invokeHandler() {
 // startSSE commits the stream and starts its heartbeat after binding succeeds.
 func (c *Context) startSSE() (func(), error) {
 	if err := c.sse.start(); err != nil {
-		return nil, err
+		return nil, c.sse.fail(err)
 	}
 	return c.sse.startHeartbeat(), nil
 }

@@ -8,11 +8,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"mime"
 	"net/http"
 	"net/url"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -30,7 +31,7 @@ var (
 	requestBodyTooLargeError = errors.New("request body too large")
 	// live total request body cap, read per request
 	maxBodySize atomic.Int64
-	// live multipart in-memory threshold, read per part
+	// live multipart file-content memory threshold, read per request
 	maxFileMemory atomic.Int64
 	// live per-file upload cap, read per file
 	maxUploadFileSize atomic.Int64
@@ -48,6 +49,8 @@ const (
 	defaultMaxFileMemory = 2 << 20
 	// Hard cap on each individual uploaded file: 1 MiB.
 	defaultMaxUploadFileSize = 1 << 20
+	// largest JSON body buffer retained by the pool
+	maxPooledBodyCapacity = 1 << 20
 
 	// body type carrying form fields plus uploaded files
 	multipartFormData = "multipart/form-data"
@@ -55,6 +58,7 @@ const (
 	xWwwFormUrlencoded = "application/x-www-form-urlencoded"
 )
 
+// init installs the default request and upload limits.
 func init() {
 	maxBodySize.Store(defaultMaxBodySize)
 	maxFileMemory.Store(defaultMaxFileMemory)
@@ -73,6 +77,9 @@ var bodyBufferPool = sync.Pool{
 // with every slice aliasing it: the decoded parameters are independent copies,
 // so this is safe once binding has finished.
 func releaseBodyBuffer(buf *bytes.Buffer) {
+	if buf.Cap() > maxPooledBodyCapacity {
+		return
+	}
 	buf.Reset()
 	bodyBufferPool.Put(buf)
 }
@@ -136,7 +143,7 @@ func mergeFormBodyWins(query, body url.Values) url.Values {
 }
 
 // queryValues returns the parsed URL query, or nil when the request carries no
-// query string. Returning nil avoids the empty map url.URL.Query() allocates for
+// query string. Returning nil avoids the empty map that URL query parsing allocates
 // an empty RawQuery; form lookups and mergeFormBodyWins already treat nil as "no
 // query values".
 func queryValues(r *http.Request) url.Values {
@@ -146,15 +153,53 @@ func queryValues(r *http.Request) url.Values {
 	return r.URL.Query()
 }
 
+// queryValuesFor parses only the exact keys a handler can bind. It preserves
+// percent decoding, repeated values and the standard treatment of malformed
+// pairs while avoiding a map entry for every unrelated query key.
+func queryValuesFor(r *http.Request, keys []string) url.Values {
+	if len(keys) == 0 || r.URL.RawQuery == empty {
+		return nil
+	}
+	// The standard parser is faster for a single pair, so use it unless the
+	// query contains multiple pairs.
+	if !strings.Contains(r.URL.RawQuery, "&") {
+		return queryValues(r)
+	}
+	var values url.Values
+	for part := range strings.SplitSeq(r.URL.RawQuery, "&") {
+		if part == empty {
+			continue
+		}
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		if strings.Contains(rawKey, ";") {
+			continue
+		}
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil || !slices.Contains(keys, key) {
+			continue
+		}
+		value, err := url.QueryUnescape(rawValue)
+		if err != nil {
+			continue
+		}
+		if values == nil {
+			values = make(url.Values)
+		}
+		values[key] = append(values[key], value)
+	}
+	return values
+}
+
 // parseRequestParameters collects handler-bindable inputs for the request:
 // form values, uploaded files, the JSON body buffer and whether a JSON body
-// with actual content is present. The body buffer is pooled; the caller must
-// release it with releaseBodyBuffer once binding is done, since the decoded
-// parameters are independent copies. The returned flag already folds in the
-// non-empty check, so a whitespace-only JSON body fails here and a body that
-// passed is never scanned again downstream.
+// with actual content is present. queryKeys limits query parsing where the full
+// query does not need to be exposed through Request.Form. The body buffer is
+// pooled; the caller must release it with releaseBodyBuffer once binding is done,
+// since the decoded parameters are independent copies. The returned flag already
+// folds in the non-empty check, so a whitespace-only JSON body fails here and a
+// body that passed is never scanned again downstream.
 func parseRequestParameters(w http.ResponseWriter, r *http.Request,
-	method httpMethod) (url.Values, filesMap, *bytes.Buffer, bool, error) {
+	method httpMethod, queryKeys []string) (url.Values, filesMap, *bytes.Buffer, bool, error) {
 	// GBL deliberately applies a strict parameter-source policy by HTTP method.
 	// GET, HEAD, DELETE and OPTIONS may read only URL path parameters (matched by
 	// the router) and URL query parameters. Their request bodies are never parsed
@@ -164,9 +209,17 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 	// exposes query parameters and leaves the body untouched.
 	if !method.isBodyMethod() {
 		// Only path and query parameters bind for these methods; the body is never
-		// read. queryValues yields nil for an empty query, so no empty map is
-		// allocated and every form lookup treats nil as "not found".
-		return queryValues(r), nil, nil, false, nil
+		// read. A single query pair uses the standard parser directly, while a
+		// larger query can restrict parsing to bindable names.
+		var form url.Values
+		if len(queryKeys) > 0 {
+			if strings.Contains(r.URL.RawQuery, "&") {
+				form = queryValuesFor(r, queryKeys)
+			} else {
+				form = queryValues(r)
+			}
+		}
+		return form, nil, nil, false, nil
 	}
 
 	var (
@@ -266,18 +319,24 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 	case mediaType == xWwwFormUrlencoded || mediaType == empty:
 		// The body is decoded directly rather than through r.ParseForm because
 		// ParseForm would parse the URL query a second time: queryValues below
-		// owns that single parse. MaxBytesReader, installed above, still caps
+		// owns that single parse. When installed above, MaxBytesReader still caps
 		// the read and surfaces its error identically.
 		var bodyValues url.Values
 		if r.Body != nil {
-			raw, readErr := io.ReadAll(r.Body)
-			if readErr != nil {
+			buf := bodyBufferPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			if r.ContentLength > int64(buf.Cap()) && r.ContentLength <= limit {
+				buf.Grow(int(r.ContentLength))
+			}
+			if _, readErr := buf.ReadFrom(r.Body); readErr != nil {
+				releaseBodyBuffer(buf)
 				if _, ok := errors.AsType[*http.MaxBytesError](readErr); ok {
 					return nil, nil, nil, false, requestBodyTooLargeError
 				}
 				return nil, nil, nil, false, readErr
 			}
-			parsed, parseErr := url.ParseQuery(string(raw))
+			parsed, parseErr := url.ParseQuery(string(buf.Bytes()))
+			releaseBodyBuffer(buf)
 			if parseErr != nil {
 				return nil, nil, nil, false, parseErr
 			}
@@ -293,7 +352,13 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 	default:
 		// Unsupported body media types are not interpreted as parameters.
 		// Query parameters are still valid for POST and PUT.
-		form = queryValues(r)
+		if len(queryKeys) > 0 {
+			if strings.Contains(r.URL.RawQuery, "&") {
+				form = queryValuesFor(r, queryKeys)
+			} else {
+				form = queryValues(r)
+			}
+		}
 	}
 
 	return form, files, bodyBuf, jsonMedia && bodyBuf != nil, nil

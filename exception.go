@@ -44,8 +44,10 @@ func (e *engine) setPanicProcessor(p PanicProcessor) {
 // failures). Any other recovered value is treated as an unexpected crash and
 // never echoed to the client.
 type responseAbort struct {
+	// status is the client-safe HTTP status code
 	status int
-	body   string
+	// body is the client-safe response text
+	body string
 }
 
 // abort raises an internal responseAbort panic. Every framework-generated halt
@@ -62,7 +64,7 @@ var typeRecognitionError = []byte("Reflection Type Identification Exception")
 // its reflected kind.
 func errorWriteback(err any) ([]byte, string) {
 	// A nil payload renders as an empty body: a PanicProcessor may deliberately
-	// answer with no content, and reflect.ValueOf(nil) would otherwise fall into
+	// answer with no content, and reflection on nil would otherwise fall into
 	// the unrecognized-kind default and emit the fixed error text.
 	if err == nil {
 		return []byte(empty), textPlainCharset
@@ -131,6 +133,9 @@ func (e *engine) catchRuntimePanic(rw responseWriter) {
 	// A committed body can no longer be rewritten; only the recorded status
 	// (or the default 200) can still be flushed.
 	if rw.written() {
+		if _, ok := err.(responseAbort); !ok {
+			e.logRecoveredPanic(err)
+		}
 		rw.writeHeader()
 		return
 	}
@@ -174,7 +179,7 @@ func (e *engine) catchRuntimePanic(rw responseWriter) {
 
 // logRecoveredPanic records an unexpected panic without exposing it.
 //
-// It routes through the engine's Logger so the sink honors SetLogger; the
+// It routes through the engine Logger so the sink honors SetLogger; the
 // recovered value and the goroutine stack are recorded as structured fields so a
 // leak-free 500 stays debuggable in any backend.
 func (e *engine) logRecoveredPanic(err any) {

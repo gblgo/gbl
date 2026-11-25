@@ -25,7 +25,7 @@ import (
 // GBL exposes exactly one public engine — the package-level API (Get, Post,
 // Group, Use, Run, ...) operates on the single defaultEngine behind the scenes,
 // so registration and startup can never land on two different instances. The
-// type stays unexported: it exists only so the package's own tests can build
+// type stays unexported: it exists only so the package own tests can build
 // isolated engines (each with its own routes and logger) without a listening
 // port, by driving generateRoute and ServeHTTP directly.
 type engine struct {
@@ -34,7 +34,7 @@ type engine struct {
 	roots []*routeNode
 	// registrations queued before generateRoute
 	routeMetaSlice []*routeMeta
-	// global chain, merged with each group's at generation
+	// global chain, merged with each group at generation
 	middlewares []HandlerFunc
 
 	// 16-byte fields (interfaces)
@@ -56,12 +56,16 @@ type engine struct {
 	astSpans map[*ast.File][]funcSpan
 	// file set backing astFileMap
 	fest *token.FileSet
-	// lazily built "<file>:<line>"->param names from the binary's DWARF; the sourceless fallback
+	// lazily built "<file>:<line>"->param names from the binary DWARF; the sourceless fallback
 	dwarfIndex map[string][]string
 	// live server, set by Run; nil before start
 	server *http.Server
 	// owns connections removed from net/http by Hijack
 	hijacks *hijackRegistry
+	// lifetime shared by every SSE stream and canceled when shutdown starts
+	streamCtx context.Context
+	// cancels streamCtx so long-lived SSE handlers can drain
+	cancelStreams context.CancelFunc
 
 	// sync primitives
 	// guards listener/server assignment
@@ -84,14 +88,17 @@ var defaultEngine = newEngine()
 // callers reach the framework through the package-level functions, while tests
 // use it to stand up an isolated instance.
 func newEngine() *engine {
+	streamCtx, cancelStreams := context.WithCancel(context.Background())
 	return &engine{
-		roots:      make([]*routeNode, methodCount),
-		astFileMap: make(map[string]*ast.File),
-		astSpans:   make(map[*ast.File][]funcSpan),
-		fest:       token.NewFileSet(),
-		logger:     newStdLogger(),
-		cfg:        defaultConfig(),
-		hijacks:    newHijackRegistry(),
+		roots:         make([]*routeNode, methodCount),
+		astFileMap:    make(map[string]*ast.File),
+		astSpans:      make(map[*ast.File][]funcSpan),
+		fest:          token.NewFileSet(),
+		logger:        newStdLogger(),
+		cfg:           defaultConfig(),
+		hijacks:       newHijackRegistry(),
+		streamCtx:     streamCtx,
+		cancelStreams: cancelStreams,
 	}
 }
 
@@ -100,7 +107,7 @@ func newEngine() *engine {
 //
 // On SIGINT or SIGTERM it performs a graceful shutdown instead of exiting
 // abruptly: the listener closes and in-flight requests get a window to finish.
-// Any fatal startup error panics, matching the framework's existing contract.
+// Any fatal startup error panics, matching the framework existing contract.
 func Run() { defaultEngine.run() }
 
 // Shutdown gracefully stops the server started by Run, waiting for active
@@ -215,11 +222,12 @@ func (e *engine) shutdown(ctx context.Context) error {
 	defer e.shutdownMu.Unlock()
 
 	// Only a completed drain latches: an expired grace period or an interrupted
-	// wait keeps the remaining connections alive, so the same call can be made
-	// again.
+	// wait keeps remaining non-SSE connections alive, so the same call can be
+	// made again. SSE streams are canceled as soon as shutdown starts.
 	if e.shutdownDone.Load() {
 		return nil
 	}
+	e.cancelStreams()
 	if err := server.Shutdown(ctx); err != nil {
 		return err
 	}
@@ -247,7 +255,7 @@ func (e *engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // in-flight requests before forcing connections closed.
 const shutdownGracePeriod = 5 * time.Second
 
-// assertAssembling is the engine's read-only-after-Run contract: route
+// assertAssembling is the engine read-only-after-Run contract: route
 // registration, middleware, loggers, CORS, configuration, panic renderers and
 // size limits are all assembling-time decisions, merged into frozen structures
 // by generateRoute. Calling one of those setters afterward cannot take effect

@@ -56,7 +56,7 @@ const (
 // produced its result. The middleware replaces c.bytes with the compressed
 // data and sets Content-Encoding: gzip. Every response passing through also
 // gains Vary: Accept-Encoding, whether compressed or not: whether a cached
-// representation fits depends on the client's encoding, so caches must key
+// representation fits depends on the client encoding, so caches must key
 // on it. An invalid level yields a middleware that never compresses.
 //
 // Usage:
@@ -69,8 +69,8 @@ const (
 //	api.GroupUse(gbl.Compress(gbl.BestSpeed))
 func Compress(level int) HandlerFunc {
 	// Validate the level once here rather than per request, and let the pool
-	// below create writers at the same (now known-valid) level. This bound is
-	// exactly gzip.NewWriterLevel's own, so the pool's New can ignore its error.
+	// below create writers at the same known-valid level. These bounds match
+	// gzip.NewWriterLevel, so the pool constructor can ignore its error.
 	if level < gzip.HuffmanOnly || level > gzip.BestCompression {
 		return func(c *Context) { c.Next() }
 	}
@@ -130,15 +130,14 @@ func Compress(level int) HandlerFunc {
 		closeErr := gw.Close()
 		writerPool.Put(gw)
 		if writeErr != nil || closeErr != nil {
-			responseBufferPool.Put(buf)
+			releaseResponseBuffer(buf)
 			return
 		}
 
-		// The compressed buffer takes over the pooled slot, so the Context's
-		// recycle releases it once the response is written; the staged body is
-		// done and returns now.
+		// The compressed buffer takes over the pooled slot, so Context recycle
+		// releases it once the response is written; the staged body is done.
 		if c.responseBuf != nil {
-			responseBufferPool.Put(c.responseBuf)
+			releaseResponseBuffer(c.responseBuf)
 		}
 		c.bytes = buf.Bytes()
 		c.responseBuf = buf
@@ -168,8 +167,8 @@ func acceptsGzip(header string) bool {
 	return wildcard
 }
 
-// hasZeroWeight reports whether a media range's parameters pin its quality
-// value to zero, the RFC's way of explicitly refusing an encoding.
+// hasZeroWeight reports whether a media range parameters pin its quality
+// value to zero, the RFC way of explicitly refusing an encoding.
 func hasZeroWeight(params string) bool {
 	for param := range strings.SplitSeq(params, ";") {
 		key, value, ok := strings.Cut(param, "=")
