@@ -150,7 +150,7 @@ func (c *Context) recycle() {
 	// A panic between staging the result and the pipeline's write would
 	// otherwise drop the pooled buffer instead of recycling it.
 	if c.responseBuf != nil {
-		responseBufferPool.Put(c.responseBuf)
+		releaseResponseBuffer(c.responseBuf)
 		c.responseBuf = nil
 	}
 	contextPool.Put(c)
@@ -328,11 +328,15 @@ func (c *Context) invokeHandler() {
 	}
 
 	// The pooled body buffer is needed only while binding; the decoded
-	// parameters are independent copies, so release it when this handler returns.
+	// parameters are independent copies, so release it before the handler runs.
 	var body []byte
 	if bodyBuf != nil {
 		body = bodyBuf.Bytes()
-		defer releaseBodyBuffer(bodyBuf)
+		defer func() {
+			if bodyBuf != nil {
+				releaseBodyBuffer(bodyBuf)
+			}
+		}()
 	}
 
 	var in []reflect.Value
@@ -359,6 +363,12 @@ func (c *Context) invokeHandler() {
 		}
 	}
 
+	if bodyBuf != nil {
+		releaseBodyBuffer(bodyBuf)
+		bodyBuf = nil
+		body = nil
+	}
+
 	if rh.plan.hasSSE {
 		stopHeartbeat, err := c.startSSE()
 		if err != nil {
@@ -374,7 +384,7 @@ func (c *Context) invokeHandler() {
 		buf.Reset()
 		mediaType, convertErr := convertToBuffer(buf, out[0])
 		if convertErr != nil {
-			responseBufferPool.Put(buf)
+			releaseResponseBuffer(buf)
 			// Serialization failures are server side: only the fixed text leaks.
 			abort(http.StatusInternalServerError, responseSerializationFailed)
 			return

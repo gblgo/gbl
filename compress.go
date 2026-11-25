@@ -130,7 +130,7 @@ func Compress(level int) HandlerFunc {
 		closeErr := gw.Close()
 		writerPool.Put(gw)
 		if writeErr != nil || closeErr != nil {
-			responseBufferPool.Put(buf)
+			releaseResponseBuffer(buf)
 			return
 		}
 
@@ -138,7 +138,7 @@ func Compress(level int) HandlerFunc {
 		// recycle releases it once the response is written; the staged body is
 		// done and returns now.
 		if c.responseBuf != nil {
-			responseBufferPool.Put(c.responseBuf)
+			releaseResponseBuffer(c.responseBuf)
 		}
 		c.bytes = buf.Bytes()
 		c.responseBuf = buf

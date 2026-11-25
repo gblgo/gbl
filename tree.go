@@ -162,6 +162,19 @@ var segmentPool = sync.Pool{
 	New: func() any { s := make([]string, 0, 8); return &s },
 }
 
+// largest segment slice retained by the pool
+const maxPooledPathSegments = 64
+
+// releaseSegments clears path references and pools a reasonably sized slice.
+func releaseSegments(bufPool *[]string, segments []string) {
+	clear(segments)
+	if cap(segments) > maxPooledPathSegments {
+		return
+	}
+	*bufPool = segments[:0]
+	segmentPool.Put(bufPool)
+}
+
 // splitPathInto appends the non-empty "/"-separated segments of path to dst and
 // returns the grown slice, reusing dst's backing array. Segments are substrings
 // sharing path's storage, so unlike strings.Split this copies nothing.
@@ -204,9 +217,7 @@ func (e *engine) matchNode(
 		bufPool := segmentPool.Get().(*[]string)
 		segments := splitPathInto((*bufPool)[:0], path)
 		path = slash + strings.Join(segments, slash)
-		clear(segments)
-		*bufPool = segments
-		segmentPool.Put(bufPool)
+		releaseSegments(bufPool, segments)
 
 		if handler, ok := statics[path]; ok {
 			return handler, params
@@ -226,9 +237,7 @@ func (e *engine) matchNode(
 	segments := splitPathInto((*bufPool)[:0], path)
 	handler := searchNode(root, segments, 0, params)
 
-	clear(segments)
-	*bufPool = segments
-	segmentPool.Put(bufPool)
+	releaseSegments(bufPool, segments)
 
 	return handler, params
 }

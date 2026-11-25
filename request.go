@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"mime"
 	"net/http"
@@ -48,6 +47,8 @@ const (
 	defaultMaxFileMemory = 2 << 20
 	// Hard cap on each individual uploaded file: 1 MiB.
 	defaultMaxUploadFileSize = 1 << 20
+	// largest body buffer retained by the pool
+	maxPooledBodyCapacity = 1 << 20
 
 	// body type carrying form fields plus uploaded files
 	multipartFormData = "multipart/form-data"
@@ -73,6 +74,9 @@ var bodyBufferPool = sync.Pool{
 // with every slice aliasing it: the decoded parameters are independent copies,
 // so this is safe once binding has finished.
 func releaseBodyBuffer(buf *bytes.Buffer) {
+	if buf.Cap() > maxPooledBodyCapacity {
+		return
+	}
 	buf.Reset()
 	bodyBufferPool.Put(buf)
 }
@@ -270,14 +274,20 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 		// the read and surfaces its error identically.
 		var bodyValues url.Values
 		if r.Body != nil {
-			raw, readErr := io.ReadAll(r.Body)
-			if readErr != nil {
+			buf := bodyBufferPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			if r.ContentLength > int64(buf.Cap()) && r.ContentLength <= limit {
+				buf.Grow(int(r.ContentLength))
+			}
+			if _, readErr := buf.ReadFrom(r.Body); readErr != nil {
+				releaseBodyBuffer(buf)
 				if _, ok := errors.AsType[*http.MaxBytesError](readErr); ok {
 					return nil, nil, nil, false, requestBodyTooLargeError
 				}
 				return nil, nil, nil, false, readErr
 			}
-			parsed, parseErr := url.ParseQuery(string(raw))
+			parsed, parseErr := url.ParseQuery(string(buf.Bytes()))
+			releaseBodyBuffer(buf)
 			if parseErr != nil {
 				return nil, nil, nil, false, parseErr
 			}
