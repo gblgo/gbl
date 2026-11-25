@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,42 +40,53 @@ type (
 	// structField is one settable (exported) field of a struct parameter,
 	// cached so bindStruct can skip reflection-based field introspection per
 	// request.
-	// name is the exact bind key: the JSON tag's name when present, else the Go
+	// name is the exact bind key: the JSON tag name when present, else the Go
 	// field name with its first letter lowercased, so a lowercase request key
 	// binds to an exported PascalCase field without the user adding any tag.
 	structField struct {
+		// index is the field position in the reflected struct
 		index int
-		name  string
-		typ   reflect.Type
+		// name is the exact request key for this field
+		name string
+		// typ is the reflected field type
+		typ reflect.Type
 	}
 
-	// bindPlan is a handler's immutable binding blueprint, built in generateRoute
+	// bindPlan is an immutable handler binding blueprint, built in generateRoute
 	// from the handler signature. It carries the per-parameter type and class, the
 	// business-parameter indexes, cached top-level struct fields, and whether the
 	// request body/query must be parsed at all, so serveHTTP can skip work for
 	// handlers that bind nothing.
 	bindPlan struct {
-		types           []reflect.Type
-		classes         []paramClass
-		structFields    [][]structField // parallel to types; non-nil only for struct business params
+		// types is parallel to the handler parameter list
+		types []reflect.Type
+		// classes is parallel to types and records each injection strategy
+		classes []paramClass
+		// structFields is parallel to types and caches top-level struct fields
+		structFields [][]structField
+		// businessIndexes identifies parameters bound from request data
 		businessIndexes []int
 		// writerOK is parallel to types, non-nil only when a parameter is a writer
 		// (classWriter): it records whether the pooled writer satisfies that
-		// parameter's type, decided once here so the request path injects without
-		// re-running the reflection package's interface-satisfaction probe.
+		// parameter type, decided once here so the request path injects without
+		// re-running the reflection package interface-satisfaction probe.
 		writerOK []bool
 		// validatableIndexes is the subset of businessIndexes whose type (or its
 		// pointer) implements Validatable, precomputed here so a handler that does
 		// not validate pays no per-request reflection or interface boxing.
 		validatableIndexes []int
-		needsParse         bool
+		// needsParse records whether request data must be parsed
+		needsParse bool
 		// hasSSE is true when any parameter declares gbl.SSEWriter.
 		hasSSE bool
-		// needsNames is true when at least one business parameter must be matched
-		// against the request by its handler parameter name — any scalar, or more
-		// than one business argument (whose JSON members are split by name). A
-		// lone struct/pointer-to-struct is self-describing: its fields come from
-		// reflection, so it binds correctly even when source names are unavailable.
+		// queryKeys are the exact request keys needed by scalar and struct fields
+		queryKeys []string
+		// jsonKeys are the top-level members needed by multi-parameter JSON handlers
+		jsonKeys []string
+		// needsNames is true when at least one business or file parameter must be
+		// matched against the request by its handler parameter name. A lone struct
+		// or pointer-to-struct is self-describing: its fields come from reflection,
+		// so it binds correctly even when source names are unavailable.
 		needsNames bool
 	}
 )
@@ -232,6 +244,7 @@ func buildBindPlan(rt reflect.Type) bindPlan {
 			}
 		case classFiles:
 			plan.needsParse = true
+			plan.needsNames = true
 		case classWriter:
 			if plan.writerOK == nil {
 				plan.writerOK = make([]bool, n)
@@ -248,8 +261,42 @@ func buildBindPlan(rt reflect.Type) bindPlan {
 	return plan
 }
 
+// prepareKeys records the exact query and JSON names this handler can consume.
+// It runs after parameter-name recovery and never changes during serving.
+func (p *bindPlan) prepareKeys(names []string) {
+	for _, index := range p.businessIndexes {
+		name := paramNameAt(names, index)
+		fields := p.structFields[index]
+		if fields == nil && selfDescribing(p.types[index]) {
+			typ := p.types[index]
+			for typ.Kind() == reflect.Pointer {
+				typ = typ.Elem()
+			}
+			fields = structFieldsOf(typ)
+		}
+		if fields != nil {
+			for _, field := range fields {
+				p.queryKeys = appendUniqueKey(p.queryKeys, field.name)
+			}
+		} else {
+			p.queryKeys = appendUniqueKey(p.queryKeys, name)
+		}
+		if len(p.businessIndexes) > 1 {
+			p.jsonKeys = append(p.jsonKeys, name)
+		}
+	}
+}
+
+// appendUniqueKey adds key once so repeated struct tags do not repeat scans.
+func appendUniqueKey(keys []string, key string) []string {
+	if slices.Contains(keys, key) {
+		return keys
+	}
+	return append(keys, key)
+}
+
 // prewarmNestedStructs recursively warms the structFieldsCache for every nested
-// struct reachable from t, so request-time binding never pays the sync.Map miss.
+// struct reachable from t, so request-time binding never pays a concurrent-map miss.
 func prewarmNestedStructs(t reflect.Type, visited map[reflect.Type]bool) {
 	if visited[t] {
 		return
@@ -525,18 +572,18 @@ func lookupString(values map[string]string, name string) (string, bool) {
 func bindFormParameter(t reflect.Type, name string, src *nameSources) (reflect.Value, error) {
 	// The file-header shapes are checked first: multipart.FileHeader is itself a
 	// struct, and letting the struct branch below catch it would bind the
-	// header's own exported fields from form keys instead of the uploaded file.
+	// header exported fields from form keys instead of the uploaded file.
 	if isFileHeaderType(t) {
 		headers, _ := src.filesGet(name)
 		return bindFileHeaders(t, headers)
 	}
 
 	if t.Kind() == reflect.Pointer {
-		// A missing non-struct pointer stays nil; a missing *struct is still
-		// allocated (zero-valued) so its fields can be bound individually.
+		// A missing non-struct pointer stays nil; a pointer chain leading to a
+		// struct is allocated so its fields can be bound individually.
 		if _, ok := src.pathGet(name); !ok {
 			if _, ok = src.formGet(name); !ok {
-				if _, ok = src.filesGet(name); !ok && t.Elem().Kind() != reflect.Struct {
+				if _, ok = src.filesGet(name); !ok && !selfDescribing(t) {
 					return reflect.Zero(t), nil
 				}
 			}

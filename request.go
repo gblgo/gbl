@@ -12,6 +12,8 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -150,15 +152,53 @@ func queryValues(r *http.Request) url.Values {
 	return r.URL.Query()
 }
 
+// queryValuesFor parses only the exact keys a handler can bind. It preserves
+// percent decoding, repeated values and the standard treatment of malformed
+// pairs while avoiding a map entry for every unrelated query key.
+func queryValuesFor(r *http.Request, keys []string) url.Values {
+	if len(keys) == 0 || r.URL.RawQuery == empty {
+		return nil
+	}
+	// The standard parser is faster for a single pair, so use it unless the
+	// query contains multiple pairs.
+	if !strings.Contains(r.URL.RawQuery, "&") {
+		return queryValues(r)
+	}
+	var values url.Values
+	for part := range strings.SplitSeq(r.URL.RawQuery, "&") {
+		if part == empty {
+			continue
+		}
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		if strings.Contains(rawKey, ";") {
+			continue
+		}
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil || !slices.Contains(keys, key) {
+			continue
+		}
+		value, err := url.QueryUnescape(rawValue)
+		if err != nil {
+			continue
+		}
+		if values == nil {
+			values = make(url.Values)
+		}
+		values[key] = append(values[key], value)
+	}
+	return values
+}
+
 // parseRequestParameters collects handler-bindable inputs for the request:
 // form values, uploaded files, the JSON body buffer and whether a JSON body
-// with actual content is present. The body buffer is pooled; the caller must
-// release it with releaseBodyBuffer once binding is done, since the decoded
-// parameters are independent copies. The returned flag already folds in the
-// non-empty check, so a whitespace-only JSON body fails here and a body that
-// passed is never scanned again downstream.
+// with actual content is present. queryKeys limits query parsing where the full
+// query does not need to be exposed through Request.Form. The body buffer is
+// pooled; the caller must release it with releaseBodyBuffer once binding is done,
+// since the decoded parameters are independent copies. The returned flag already
+// folds in the non-empty check, so a whitespace-only JSON body fails here and a
+// body that passed is never scanned again downstream.
 func parseRequestParameters(w http.ResponseWriter, r *http.Request,
-	method httpMethod) (url.Values, filesMap, *bytes.Buffer, bool, error) {
+	method httpMethod, queryKeys []string) (url.Values, filesMap, *bytes.Buffer, bool, error) {
 	// GBL deliberately applies a strict parameter-source policy by HTTP method.
 	// GET, HEAD, DELETE and OPTIONS may read only URL path parameters (matched by
 	// the router) and URL query parameters. Their request bodies are never parsed
@@ -168,9 +208,17 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 	// exposes query parameters and leaves the body untouched.
 	if !method.isBodyMethod() {
 		// Only path and query parameters bind for these methods; the body is never
-		// read. queryValues yields nil for an empty query, so no empty map is
-		// allocated and every form lookup treats nil as "not found".
-		return queryValues(r), nil, nil, false, nil
+		// read. A single query pair uses the standard parser directly, while a
+		// larger query can restrict parsing to bindable names.
+		var form url.Values
+		if len(queryKeys) > 0 {
+			if strings.Contains(r.URL.RawQuery, "&") {
+				form = queryValuesFor(r, queryKeys)
+			} else {
+				form = queryValues(r)
+			}
+		}
+		return form, nil, nil, false, nil
 	}
 
 	var (
@@ -303,7 +351,13 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 	default:
 		// Unsupported body media types are not interpreted as parameters.
 		// Query parameters are still valid for POST and PUT.
-		form = queryValues(r)
+		if len(queryKeys) > 0 {
+			if strings.Contains(r.URL.RawQuery, "&") {
+				form = queryValuesFor(r, queryKeys)
+			} else {
+				form = queryValues(r)
+			}
+		}
 	}
 
 	return form, files, bodyBuf, jsonMedia && bodyBuf != nil, nil

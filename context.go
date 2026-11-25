@@ -317,7 +317,9 @@ func (c *Context) invokeHandler() {
 		err     error
 	)
 	if rh.plan.needsParse {
-		form, files, bodyBuf, isJSON, err = parseRequestParameters(c.writer, c.Request, c.method)
+		form, files, bodyBuf, isJSON, err = parseRequestParameters(
+			c.writer, c.Request, c.method, rh.plan.queryKeys,
+		)
 		if err != nil {
 			writeRequestError(err)
 			return

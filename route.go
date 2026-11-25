@@ -303,50 +303,45 @@ func (e *engine) generateRoute() {
 			handler.plan = buildBindPlan(t)
 			if handler.plan.hasSSE {
 				if method != methodGet {
-					e.failStartup(fmt.Sprintf("SSEWriter is only supported on GET routes: %s %s", methodName, meta.path))
+					e.failStartup(fmt.Sprintf("SSEWriter is only supported on GET routes: %s %s",
+						methodName, meta.path))
 				}
 				if t.NumOut() > 0 {
 					e.failStartup(fmt.Sprintf("SSE handler must not return a value: %s", meta.path))
 				}
 			}
 
-			// Two independent sources for the parameter names, tried in order:
-			//   1. the handler's own source file on disk — fresh, and the path used
-			//      in development (`go run`, or a build run next to the source);
-			//   2. the binary's own DWARF debug info — the sourceless production
-			//      path. The compiler keeps parameter names in DWARF even under
-			//      -trimpath, so a bare binary still carries them.
-			// Disk wins when both exist so a dev edit is never shadowed by the
-			// DWARF baked into an older binary.
-			names, resolved := e.resolveParamNames(handler.v)
-			if !resolved {
-				names, resolved = e.lookupParamNamesDWARF(handler.v)
+			if handler.plan.needsNames {
+				// Two independent sources for the parameter names, tried in order:
+				//   1. the handler source file on disk — fresh, and the path used
+				//      in development (`go run`, or a build run next to the source);
+				//   2. DWARF debug info in the binary — the sourceless production
+				//      path. The compiler keeps parameter names in DWARF even under
+				//      -trimpath, so a bare binary still carries them.
+				// Disk wins when both exist so a dev edit is never shadowed by the
+				// DWARF baked into an older binary.
+				names, resolved := e.resolveParamNames(handler.v)
+				if !resolved {
+					names, resolved = e.lookupParamNamesDWARF(handler.v)
+				}
+				handler.paramNames = normalizeParamNames(names, t.NumIn())
+				if !resolved {
+					e.failStartup(fmt.Errorf("gbl: handler for %s %s binds parameters by name, "+
+						"but the parameter names are unavailable at runtime: no source on disk "+
+						"and no DWARF debug info in the binary. The binary was likely built with "+
+						"`-ldflags \"-w\"` or `\"-s\"`, which strip DWARF; rebuild without them so "+
+						"gbl can read the names from the binary, or bind through a struct / "+
+						"*struct parameter whose field names come from reflection",
+						methodName, meta.path))
+				}
+			} else {
+				handler.paramNames = normalizeParamNames(nil, t.NumIn())
 			}
-			handler.paramNames = normalizeParamNames(names, t.NumIn())
-
-			// A name-dependent handler whose names came from neither source would
-			// otherwise bind path/query/JSON values to nothing and answer with wrong
-			// data at request time. Fail loudly at startup instead, pointing at the
-			// real causes: the binary was built with `-ldflags "-w"`/`"-s"` (which
-			// strip the DWARF this fallback reads), or it ships without source. The
-			// fix is to keep DWARF (drop -w/-s) or bind through a struct, whose field
-			// names come from reflection and survive any build flag. A self-describing
-			// binding (a lone struct) is not name-dependent, so it falls through to
-			// positional placeholders silently — the normal sourceless path for struct
-			// handlers, where a per-handler warning would be noise.
-			if handler.plan.needsNames && !resolved {
-				e.failStartup(fmt.Errorf("gbl: handler for %s %s binds parameters by name, "+
-					"but the parameter names are unavailable at runtime: no source on disk "+
-					"and no DWARF debug info in the binary. The binary was likely built with "+
-					"`-ldflags \"-w\"` or `\"-s\"`, which strip DWARF; rebuild without them so "+
-					"gbl can read the names from the binary, or bind through a struct / "+
-					"*struct parameter whose field names come from reflection",
-					methodName, meta.path))
-			}
+			handler.plan.prepareKeys(handler.paramNames)
 		}
 
 		// Freeze the request chain: engine middleware run outermost, then the
-		// group's, and the terminal endpoint invokes the business handler. This
+		// group, and the terminal endpoint invokes the business handler. This
 		// slice is shared by every request routed here.
 		chain := make([]HandlerFunc, 0, len(e.middlewares)+len(meta.mw)+1)
 		chain = append(chain, e.middlewares...)
