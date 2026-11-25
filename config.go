@@ -65,8 +65,15 @@ func Configure(fn func(*Config)) { defaultEngine.configure(fn) }
 // panics: it could no longer change what is already serving.
 func (e *engine) configure(fn func(*Config)) {
 	e.assertAssembling("Configure")
+	next := *e.cfg
 	if fn != nil {
-		fn(e.cfg)
-		e.cfg.useTLS = e.cfg.CertFile != empty && e.cfg.KeyFile != empty
+		callbackCfg := next
+		fn(&callbackCfg)
+		next = callbackCfg
 	}
+	if (next.CertFile == empty) != (next.KeyFile == empty) {
+		e.failStartup("gbl: CertFile and KeyFile must both be set or both be empty")
+	}
+	next.useTLS = next.CertFile != empty && next.KeyFile != empty
+	e.cfg = &next
 }
