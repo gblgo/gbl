@@ -171,7 +171,7 @@ func queryValuesFor(r *http.Request, keys []string) url.Values {
 			continue
 		}
 		rawKey, rawValue, _ := strings.Cut(part, "=")
-		if strings.Contains(rawKey, ";") {
+		if strings.Contains(part, ";") {
 			continue
 		}
 		key, err := url.QueryUnescape(rawKey)

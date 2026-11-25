@@ -30,15 +30,12 @@ type RouteGroup interface {
 // routeGroup is the concrete RouteGroup: it remembers the engine it came from,
 // the path prefix to prepend, and the middleware to attach to its routes.
 type routeGroup struct {
-	// 24-byte fields (slice)
 	// middleware that runs only for this group routes
 	middlewares []HandlerFunc
 
-	// 16-byte fields (string)
 	// group is the path prefix prepended to each route
 	group string
 
-	// 8-byte fields (pointer)
 	// engine owns registration and the frozen route set
 	engine *engine
 }

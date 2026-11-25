@@ -44,6 +44,8 @@ const (
 	corsHeaderNotAllowed = "CORS header not allowed"
 	// lists up to this size are scanned with EqualFold to avoid lowercasing allocations
 	corsLinearScanLimit = 8
+	// maximum accepted Access-Control-Request-Headers tokens per preflight
+	corsMaxPreflightHeaders = 128
 )
 
 // CorsConfig describes the cross-origin policy applied by the CORS layer.
@@ -106,6 +108,9 @@ func (e *engine) useCors(cc *CorsConfig) {
 		owned := *cc
 		owned.AllowedOrigins = slices.Clone(cc.AllowedOrigins)
 		owned.AllowedMethods = slices.Clone(cc.AllowedMethods)
+		for i := range owned.AllowedMethods {
+			owned.AllowedMethods[i] = strings.ToUpper(strings.TrimSpace(owned.AllowedMethods[i]))
+		}
 		owned.AllowedHeaders = slices.Clone(cc.AllowedHeaders)
 		owned.ExposedHeaders = slices.Clone(cc.ExposedHeaders)
 		cc = &owned
@@ -208,9 +213,25 @@ func containsFold(values []string, target string) bool {
 }
 
 // containsInMap reports whether target matches a large precomputed allow-list
-// map, case-insensitively.
+// map, using stack storage for the ASCII tokens HTTP methods and headers require.
 func containsInMap(m map[string]struct{}, target string) bool {
-	_, ok := m[strings.ToLower(target)]
+	var lowered [256]byte
+	if len(target) > len(lowered) {
+		_, ok := m[strings.ToLower(target)]
+		return ok
+	}
+	for i := range len(target) {
+		c := target[i]
+		if c >= 0x80 {
+			_, ok := m[strings.ToLower(target)]
+			return ok
+		}
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		lowered[i] = c
+	}
+	_, ok := m[string(lowered[:len(target)])]
 	return ok
 }
 
@@ -255,7 +276,13 @@ func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 
 	requestHeaders := r.Header.Get(accessControlRequestHeaders)
 	if requestHeaders != empty {
+		count := 0
 		for h := range strings.SplitSeq(requestHeaders, comma) {
+			count++
+			if count > corsMaxPreflightHeaders {
+				http.Error(w, corsHeaderNotAllowed, http.StatusForbidden)
+				return
+			}
 			h = strings.TrimSpace(h)
 			if h == empty {
 				continue
@@ -290,7 +317,9 @@ func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	origin := strings.TrimSpace(r.Header.Get(headerOrigin))
 	header := w.Header()
-	header.Add(vary, headerOrigin)
+	if !ch.wildcard || ch.config.AllowCredentials {
+		header.Add(vary, headerOrigin)
+	}
 
 	// Non-cross-origin request
 	if origin == empty {

@@ -26,6 +26,9 @@ var responseBufferPool = sync.Pool{
 // largest serialized response buffer retained by the pool
 const maxPooledResponseCapacity = 1 << 20
 
+// maxResponseDerefDepth bounds cyclic or pathological pointer/interface chains.
+const maxResponseDerefDepth = 64
+
 // releaseResponseBuffer resets and pools a buffer unless its capacity is too
 // large to retain safely.
 func releaseResponseBuffer(buf *bytes.Buffer) {
@@ -44,11 +47,20 @@ var responseErrorType = reflect.TypeFor[error]()
 // scalars are plain text, errors use their message, composites are JSON, and nil
 // pointers or interfaces become an empty plain-text body.
 func convertToBuffer(buf *bytes.Buffer, val reflect.Value) (string, error) {
+	return convertToBufferDepth(buf, val, 0)
+}
+
+// convertToBufferDepth renders one value while bounding pointer/interface walks.
+func convertToBufferDepth(buf *bytes.Buffer, val reflect.Value, depth int) (string, error) {
 	if !val.IsValid() {
 		return textPlainCharset, nil
 	}
 
 	for val.Kind() == reflect.Interface || val.Kind() == reflect.Pointer {
+		if depth >= maxResponseDerefDepth {
+			return empty, fmt.Errorf("response value exceeds maximum pointer depth")
+		}
+		depth++
 		if val.IsNil() {
 			return textPlainCharset, nil
 		}

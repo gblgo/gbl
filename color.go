@@ -31,6 +31,8 @@ const (
 	// incidental all-caps word in a message body from ever reaching the tint
 	// lookup.
 	maxLevelScanTokens = 4
+	// largest tinted log line retained by the scratch pool
+	maxPooledColorCapacity = 256 << 10
 )
 
 // levelColor maps a log level label to its terminal tint: ordinary info in
@@ -105,7 +107,10 @@ func (c colorWriter) Write(p []byte) (int, error) {
 	buf.WriteString(ansiReset)
 	buf.Write(p[levelEnd:])
 	_, err := c.w.Write(buf.Bytes())
-	colorBufPool.Put(buf)
+	if buf.Cap() <= maxPooledColorCapacity {
+		buf.Reset()
+		colorBufPool.Put(buf)
+	}
 	if err != nil {
 		return 0, err
 	}
