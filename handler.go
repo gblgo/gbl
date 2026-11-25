@@ -75,8 +75,8 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	rh, pathParams := e.matchNode(method, r.URL.Path, nil)
 
-	// An unregistered HEAD borrows the GET route: the handler runs normally and
-	// net/http drops the body while keeping Content-Length.
+	// An unregistered HEAD borrows the GET route: ordinary handlers run normally
+	// and net/http drops the body, while SSE routes only commit their headers.
 	if rh == nil && method == methodHead {
 		rh, pathParams = e.matchNode(methodGet, r.URL.Path, pathParams)
 	}
@@ -99,11 +99,14 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		rw.Header().Set(contentType, rh.contentType)
 	}
 
-	// Multipart temp files, if any were parsed, are removed once the whole chain
-	// has completed, whatever the outcome and including a panic unwinding it.
-	defer cleanupMultipart(r)
+	// Multipart temp files are removed by Context.recycle, which sees the final
+	// request pointer even if middleware replaced c.Request.
 
 	c.Next()
+
+	if !c.handled && rw.headed() && !rw.flushed() {
+		rw.writeHeader()
+	}
 
 	// The chain has fully unwound. If the handler produced a result and nothing
 	// wrote a response — the handler directly or a post-handler middleware —
@@ -114,14 +117,18 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// rw.WriteHeader is a no-op once a status is recorded, so the 200 here only
 	// applies as a default when nothing set one, and rw.Write flushes the recorded
 	// status before the body.
-	if c.handled && !rw.written() && !rw.hijacked() && bodyAllowedForStatus(rw.status()) {
-		if rh.t.NumOut() == 0 || c.contentType != rh.contentType {
-			rw.Header().Set(contentType, c.contentType)
+	if c.handled && !c.skipWriteback && !rw.written() && !rw.hijacked() {
+		if !bodyAllowedForStatus(rw.status()) {
+			rw.writeHeader()
+		} else {
+			if rh.t.NumOut() == 0 || c.contentType != rh.contentType {
+				rw.Header().Set(contentType, c.contentType)
+			}
+			if !rw.headed() {
+				rw.WriteHeader(http.StatusOK)
+			}
+			_, _ = rw.Write(c.bytes)
 		}
-		if !rw.headed() {
-			rw.WriteHeader(http.StatusOK)
-		}
-		_, _ = rw.Write(c.bytes)
 	}
 }
 
@@ -130,7 +137,7 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 // actually parsed as multipart, so removing files is not actionable here: the
 // response is already decided and removal failures are silently dropped.
 func cleanupMultipart(r *http.Request) {
-	if r.MultipartForm != nil {
+	if r != nil && r.MultipartForm != nil {
 		_ = r.MultipartForm.RemoveAll()
 	}
 }

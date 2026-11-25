@@ -41,11 +41,7 @@ var routeEndpoint HandlerFunc = func(c *Context) { c.invokeHandler() }
 //
 // A Context is pooled. It must not be retained past the request that produced
 // it, exactly like the response writer it holds.
-//
-// Field order is optimized for memory alignment: larger fields (slices, interfaces)
-// come first, smaller scalars (bool, uint8) are grouped at the end to minimize padding.
 type Context struct {
-	// 24-byte fields (slice header, reflected value, struct with 3 maps)
 	// this route merged chain, including the terminal endpoint
 	handlers []HandlerFunc
 	// serialized handler result
@@ -55,13 +51,10 @@ type Context struct {
 	// per-request by-name binding sources; primed in injectedParameters
 	src nameSources
 
-	// 16-byte fields (interface = type + data pointer, string = pointer + len)
 	// writer is the framework pooled response sink. It stays unexported:
 	// handlers own the response by declaring an http.ResponseWriter parameter,
 	// and it must never be stored beyond the request.
 	writer responseWriter
-	// sse is non-nil while an SSE handler is binding or running.
-	sse *sseWriter
 	// result content type chosen at registration
 	contentType string
 	// memoized boxed ret, filled only once Result is called
@@ -69,7 +62,6 @@ type Context struct {
 	// engine log sink, so middleware logging honors SetLogger
 	logger Logger
 
-	// 8-byte fields (pointers, int, map, duration)
 	Request *http.Request
 	// cursor into handlers; abortIndex means "stopped"
 	index int
@@ -81,11 +73,14 @@ type Context struct {
 	keys map[string]any
 	// pooled buffer for handler result serialization, released after Write
 	responseBuf *bytes.Buffer
+	// sse is non-nil while an SSE handler is binding or running.
+	sse *sseWriter
 
-	// 1-byte fields (grouped at end to minimize padding)
 	method httpMethod
 	// the handler actually ran
 	handled bool
+	// SSE routes own their response and skip automatic return-value writeback.
+	skipWriteback bool
 }
 
 // contextPool recycles Context objects across requests.
@@ -117,6 +112,7 @@ func newContext(w *pooledResponseWriter,
 	c.result = nil
 	c.ret = reflect.Value{}
 	c.handled = false
+	c.skipWriteback = false
 	c.logger = logger
 	c.src = nameSources{}
 	c.responseBuf = nil
@@ -127,6 +123,7 @@ func newContext(w *pooledResponseWriter,
 // pool, so a pooled Context never pins a finished request writer, body or
 // middleware-set values.
 func (c *Context) recycle() {
+	cleanupMultipart(c.Request)
 	c.writer = nil
 	c.sse = nil
 	c.Request = nil
@@ -142,6 +139,8 @@ func (c *Context) recycle() {
 	c.bytes = nil
 	c.result = nil
 	c.ret = reflect.Value{}
+	c.handled = false
+	c.skipWriteback = false
 	c.logger = nil
 	c.src = nameSources{}
 	// A panic between staging the result and the pipeline write would
@@ -261,11 +260,27 @@ func (c *Context) Result() any {
 	return c.result
 }
 
+// commitPendingResponse preserves a status recorded before an abort without
+// allowing the abort to replace it.
+func (c *Context) commitPendingResponse() {
+	if c.writer.headed() && !c.writer.flushed() && !c.writer.written() && !c.writer.hijacked() {
+		c.writer.writeHeader()
+	}
+}
+
 // AbortWithStatusString denies the request with a plain-text body and stops the chain.
 func (c *Context) AbortWithStatusString(status int, body string) {
+	if c.writer.headed() || c.writer.flushed() || c.writer.written() || c.writer.hijacked() {
+		c.commitPendingResponse()
+		c.Abort()
+		return
+	}
 	c.writer.Header().Set(contentType, textPlainCharset)
 	c.writer.WriteHeader(status)
-	_, _ = c.writer.Write([]byte(body))
+	c.writer.writeHeader()
+	if bodyAllowedForStatus(status) {
+		_, _ = c.writer.Write([]byte(body))
+	}
 	c.Abort()
 }
 
@@ -273,6 +288,11 @@ func (c *Context) AbortWithStatusString(status int, body string) {
 // A marshaling failure is a server-side fault, so it aborts with a generic 500
 // rather than echoing detail.
 func (c *Context) AbortWithStatusJSON(status int, body any) {
+	if c.writer.headed() || c.writer.flushed() || c.writer.written() || c.writer.hijacked() {
+		c.commitPendingResponse()
+		c.Abort()
+		return
+	}
 	data, err := json.Marshal(body)
 	if err != nil {
 		abort(http.StatusInternalServerError, responseSerializationFailed)
@@ -280,7 +300,10 @@ func (c *Context) AbortWithStatusJSON(status int, body any) {
 	}
 	c.writer.Header().Set(contentType, applicationJsonCharset)
 	c.writer.WriteHeader(status)
-	_, _ = c.writer.Write(data)
+	c.writer.writeHeader()
+	if bodyAllowedForStatus(status) {
+		_, _ = c.writer.Write(data)
+	}
 	c.Abort()
 }
 
@@ -304,6 +327,7 @@ func (c *Context) invokeHandler() {
 	rh := c.rh
 
 	if rh.plan.hasSSE {
+		c.skipWriteback = true
 		sw := newSSEWriter(c.writer, c.Request, rh.writeTimeout, c.logger, rh.streamCtx)
 		c.sse = sw
 		defer sw.complete()
@@ -369,6 +393,13 @@ func (c *Context) invokeHandler() {
 	}
 
 	if rh.plan.hasSSE {
+		if c.method == methodHead {
+			c.sse.setHeaders()
+			c.writer.WriteHeader(http.StatusOK)
+			c.writer.writeHeader()
+			c.handled = true
+			return
+		}
 		stopHeartbeat, err := c.startSSE()
 		if err != nil {
 			c.logger.Error("SSE startup failed", "error", err)

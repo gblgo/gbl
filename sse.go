@@ -7,7 +7,6 @@ package gbl
 import (
 	"bytes"
 	"context"
-	"errors"
 	"net/http"
 	"reflect"
 	"runtime/debug"
@@ -23,6 +22,8 @@ const (
 	// sseMaxHeartbeatInterval caps idle heartbeats when WriteTimeout is disabled
 	// or much longer than the interval.
 	sseMaxHeartbeatInterval = 15 * time.Second
+	// sseDefaultWriteTimeout bounds writes when the server has no write timeout.
+	sseDefaultWriteTimeout = 30 * time.Second
 )
 
 var (
@@ -47,14 +48,13 @@ type SSEWriter interface {
 	Send(v any) error
 	// Done closes when the client disconnects, a write fails or the handler exits.
 	Done() <-chan struct{}
-	// OnError sets the callback for the first write or flush failure. Register it
-	// at handler entry; startup failures happen before the handler runs. A callback
-	// registered after termination runs immediately with the retained failure.
+	// OnError sets the callback for the first write or flush failure. It runs
+	// asynchronously after termination, including when registered late with the
+	// retained failure. Startup failures happen before the handler runs.
 	OnError(func(error))
-	// OnComplete sets the callback invoked once when the handler exits or the
-	// stream fails. A callback registered after termination runs immediately.
-	// Callbacks may run on the request or heartbeat goroutine, must return promptly,
-	// and must not call Send.
+	// OnComplete sets the callback invoked once after the handler exits or the
+	// stream fails and all in-flight writes drain. It runs asynchronously, including
+	// when registered late. Callbacks must not call Send.
 	OnComplete(func())
 }
 
@@ -79,12 +79,20 @@ type sseWriter struct {
 	onComplete func()
 	// stops the engine-shutdown callback when the stream finishes
 	stopShutdown func() bool
+	// sendMu guards closing and WaitGroup Add against complete Wait.
+	sendMu sync.Mutex
+	// sends tracks business writes that may still touch the response writer.
+	sends sync.WaitGroup
+	// closing rejects new sends before cleanup starts.
+	closing bool
 	// guards callback registration and terminal state
 	callbackMu sync.Mutex
 	// serializes heartbeat and business frames
 	mu sync.Mutex
 	// prevents duplicate terminal callbacks and failure logs
 	completed bool
+	// drained is true after all in-flight business sends have finished.
+	drained bool
 	// records a successful header flush so startup errors are not logged twice
 	started bool
 	// tracks whether the error callback has already run
@@ -126,6 +134,10 @@ func sseHeartbeatInterval(writeTimeout time.Duration) time.Duration {
 // Send converts one value with the same rules as a normal handler result, then
 // writes it as one complete SSE event.
 func (s *sseWriter) Send(v any) error {
+	if err := s.beginSend(); err != nil {
+		return err
+	}
+	defer s.sends.Done()
 	if err := context.Cause(s.ctx); err != nil {
 		return err
 	}
@@ -141,6 +153,28 @@ func (s *sseWriter) Send(v any) error {
 	return err
 }
 
+// beginSend registers one in-flight business write unless closing has started.
+func (s *sseWriter) beginSend() error {
+	s.sendMu.Lock()
+	if s.closing {
+		s.sendMu.Unlock()
+		if err := context.Cause(s.ctx); err != nil {
+			return err
+		}
+		return context.Canceled
+	}
+	s.sends.Add(1)
+	s.sendMu.Unlock()
+	return nil
+}
+
+// beginClosing prevents new sends before cleanup waits for existing ones.
+func (s *sseWriter) beginClosing() {
+	s.sendMu.Lock()
+	s.closing = true
+	s.sendMu.Unlock()
+}
+
 // Done reports stream cancellation to the user event loop.
 func (s *sseWriter) Done() <-chan struct{} { return s.ctx.Done() }
 
@@ -153,7 +187,7 @@ func (s *sseWriter) OnError(fn func(error)) {
 		s.errorNotified = true
 		err := s.terminalErr
 		s.callbackMu.Unlock()
-		s.runCallback("error", func() { fn(err) })
+		go s.runCallback("error", func() { fn(err) })
 		return
 	}
 	s.callbackMu.Unlock()
@@ -164,10 +198,10 @@ func (s *sseWriter) OnError(fn func(error)) {
 func (s *sseWriter) OnComplete(fn func()) {
 	s.callbackMu.Lock()
 	s.onComplete = fn
-	if s.completed && !s.completeNotified && fn != nil {
+	if s.completed && s.drained && !s.completeNotified && fn != nil {
 		s.completeNotified = true
 		s.callbackMu.Unlock()
-		s.runCallback("complete", fn)
+		go s.runCallback("complete", fn)
 		return
 	}
 	s.callbackMu.Unlock()
@@ -258,25 +292,23 @@ func (s *sseWriter) writeData(data []byte) error {
 }
 
 // beforeWrite rejects a canceled stream and renews the request write deadline.
-// Writers without deadline support can still stream; only unsupported deadlines
-// are ignored, while real deadline failures terminate the stream.
+// SSE always uses a finite deadline so cleanup can drain blocked writes; a writer
+// that cannot set deadlines cannot provide that guarantee and fails startup.
 func (s *sseWriter) beforeWrite() error {
 	if err := context.Cause(s.ctx); err != nil {
 		return err
 	}
-	if s.writeTimeout <= 0 {
-		return nil
+	timeout := s.writeTimeout
+	if timeout <= 0 {
+		timeout = sseDefaultWriteTimeout
 	}
-	err := http.NewResponseController(s.w).SetWriteDeadline(time.Now().Add(s.writeTimeout))
-	if errors.Is(err, http.ErrNotSupported) {
-		return nil
-	}
-	return err
+	return http.NewResponseController(s.w).SetWriteDeadline(time.Now().Add(timeout))
 }
 
 // fail records the first stream error as the cancellation cause and invokes
 // terminal callbacks once.
 func (s *sseWriter) fail(err error) error {
+	s.beginClosing()
 	if s.stopShutdown != nil {
 		s.stopShutdown()
 	}
@@ -289,13 +321,9 @@ func (s *sseWriter) fail(err error) error {
 	s.completed = true
 	s.terminalErr = err
 	onError := s.onError
-	onComplete := s.onComplete
 	started := s.started
 	if onError != nil {
 		s.errorNotified = true
-	}
-	if onComplete != nil {
-		s.completeNotified = true
 	}
 	s.callbackMu.Unlock()
 
@@ -303,34 +331,31 @@ func (s *sseWriter) fail(err error) error {
 		s.logger.Error("SSE stream failed", "error", err)
 	}
 	if onError != nil {
-		s.runCallback("error", func() { onError(err) })
-	}
-	if onComplete != nil {
-		s.runCallback("complete", onComplete)
+		go s.runCallback("error", func() { onError(err) })
 	}
 	return err
 }
 
-// complete cancels a finished stream and invokes OnComplete once.
+// complete cancels a finished stream, drains business writes and invokes
+// OnComplete once.
 func (s *sseWriter) complete() {
+	s.beginClosing()
 	if s.stopShutdown != nil {
 		s.stopShutdown()
 	}
 	s.cancel(nil)
+	s.sends.Wait()
 	s.callbackMu.Lock()
-	if s.completed {
-		s.callbackMu.Unlock()
-		return
-	}
+	s.drained = true
 	s.completed = true
 	onComplete := s.onComplete
-	if onComplete != nil {
+	if onComplete != nil && !s.completeNotified {
 		s.completeNotified = true
+		s.callbackMu.Unlock()
+		go s.runCallback("complete", onComplete)
+		return
 	}
 	s.callbackMu.Unlock()
-	if onComplete != nil {
-		s.runCallback("complete", onComplete)
-	}
 }
 
 // runCallback isolates user callback panics so a heartbeat goroutine or deferred
