@@ -379,12 +379,119 @@ func computeStructFields(t reflect.Type) []structField {
 	return fields
 }
 
+// decodeJSONFields validates one JSON object and retains only the raw fields
+// named by keys. Duplicate names keep the last value, matching encoding/json map
+// semantics, and the returned slices alias body until binding completes.
+func decodeJSONFields(body []byte, keys []string) (map[string]json.RawMessage, error) {
+	if !json.Valid(body) {
+		var raw json.RawMessage
+		if err := json.Unmarshal(body, &raw); err != nil {
+			return nil, fmt.Errorf("invalid JSON body: %w", err)
+		}
+		return nil, errors.New("invalid JSON body")
+	}
+
+	index := skipJSONSpace(body, 0)
+	if index+4 <= len(body) && bytes.Equal(body[index:index+4], []byte("null")) {
+		return nil, multipleRequireError
+	}
+	if body[index] != '{' {
+		return nil, errors.New("invalid JSON body: expected an object")
+	}
+
+	fields := make(map[string]json.RawMessage, len(keys))
+	index = skipJSONSpace(body, index+1)
+	for body[index] != '}' {
+		keyStart := index
+		index = scanJSONStringEnd(body, index)
+		var name string
+		if err := json.Unmarshal(body[keyStart:index], &name); err != nil {
+			return nil, fmt.Errorf("invalid JSON body: %w", err)
+		}
+		index = skipJSONSpace(body, index)
+		index = skipJSONSpace(body, index+1)
+		valueStart := index
+		index = skipJSONValueEnd(body, index)
+		if slices.Contains(keys, name) {
+			fields[name] = body[valueStart:index]
+		}
+		index = skipJSONSpace(body, index)
+		switch body[index] {
+		case ',':
+			index = skipJSONSpace(body, index+1)
+		case '}':
+			return fields, nil
+		}
+	}
+	return fields, nil
+}
+
+// skipJSONSpace returns the first non-whitespace position at or after index.
+func skipJSONSpace(body []byte, index int) int {
+	for index < len(body) {
+		switch body[index] {
+		case ' ', '\t', '\r', '\n':
+			index++
+		default:
+			return index
+		}
+	}
+	return index
+}
+
+// scanJSONStringEnd returns the position after a valid JSON string.
+func scanJSONStringEnd(body []byte, index int) int {
+	index++
+	for body[index] != '"' {
+		if body[index] == '\\' {
+			index++
+		}
+		index++
+	}
+	return index + 1
+}
+
+// skipJSONValueEnd returns the end of one already validated JSON value.
+func skipJSONValueEnd(body []byte, index int) int {
+	switch body[index] {
+	case '"':
+		return scanJSONStringEnd(body, index)
+	case '{', '[':
+		depth := 0
+		for index < len(body) {
+			switch body[index] {
+			case '"':
+				index = scanJSONStringEnd(body, index)
+				continue
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+				if depth == 0 {
+					return index + 1
+				}
+			}
+			index++
+		}
+		return index
+	default:
+		for index < len(body) {
+			switch body[index] {
+			case ',', '}', ']', ' ', '\t', '\r', '\n':
+				return index
+			}
+			index++
+		}
+		return index
+	}
+}
+
 // injectedParameters fills the reflection argument list for a handler call, driven
-// by the handler's precomputed bind plan. Each parameter is injected directly
+// by the handler precomputed bind plan. Each parameter is injected directly
 // (request, writer, file headers) or bound by name from path parameters, a JSON
 // body, or form values, in that precedence order. Type classification already
 // happened in generateRoute, so nothing here re-inspects the signature with
-// reflection. params is the caller's scratch slice, already sized to the
+// reflection. params is the scratch slice owned by the caller, already sized to
 // parameter count; the caller recycles it. The jsonMedia flag already carries
 // the empty-body check, so the body is never re-scanned here.
 func injectedParameters(
@@ -404,8 +511,10 @@ func injectedParameters(
 
 	var jsonFields map[string]json.RawMessage
 	if jsonMedia && len(plan.businessIndexes) > 1 {
-		if err := json.Unmarshal(body, &jsonFields); err != nil {
-			return fmt.Errorf("invalid JSON body: %w", err)
+		var err error
+		jsonFields, err = decodeJSONFields(body, plan.jsonKeys)
+		if err != nil {
+			return err
 		}
 		if jsonFields == nil {
 			return multipleRequireError
@@ -459,18 +568,22 @@ func injectedParameters(
 
 		if jsonMedia {
 			// A lone business parameter decodes the whole body; several split
-			// the JSON object by parameter name.
+			// the JSON object by parameter name. Missing members keep addressable
+			// zero values so pointer-receiver validation still runs.
 			raw := body
+			found := true
 			if len(plan.businessIndexes) > 1 {
-				var ok bool
-				raw, ok = jsonFields[name]
-				if !ok {
-					return fmt.Errorf("JSON field %q not found", name)
-				}
+				raw, found = jsonFields[name]
 			}
-			v, err := decodeJSON(t, raw)
-			if err != nil {
-				return fmt.Errorf(jsonParameterErrFormat, name, err)
+			var v reflect.Value
+			if found {
+				decoded, err := decodeJSON(t, raw)
+				if err != nil {
+					return fmt.Errorf(jsonParameterErrFormat, name, err)
+				}
+				v = decoded
+			} else {
+				v = reflect.New(t).Elem()
 			}
 			params[i] = v
 			continue

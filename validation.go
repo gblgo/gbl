@@ -6,14 +6,15 @@ package gbl
 
 import "reflect"
 
-// Validatable is the framework's zero-dependency validation convention. A bound
+// Validatable is the framework zero-dependency validation convention. A bound
 // business parameter whose type (or whose pointer) implements Validate() error
 // is checked immediately after binding and before the handler runs. Returning a
 // non-nil error stops the request with a 400 whose body is the error text: the
 // message is authored by the application developer, so echoing it respects
 // their intent — whoever writes it owns what it discloses.
 //
-// Types that do not implement it are bound exactly as before, at no cost.
+// Types that do not implement it are bound exactly as before, at no cost. A nil
+// pointer is passed to the handler without calling Validate.
 type Validatable interface {
 	Validate() error
 }
@@ -43,6 +44,10 @@ func asValidatable(v reflect.Value) (Validatable, bool) {
 		return nil, false
 	}
 	if target, ok := v.Interface().(Validatable); ok {
+		value := reflect.ValueOf(target)
+		if value.Kind() == reflect.Pointer && value.IsNil() {
+			return nil, false
+		}
 		return target, true
 	}
 	if v.CanAddr() {
