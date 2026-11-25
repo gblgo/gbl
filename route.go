@@ -5,6 +5,7 @@
 package gbl
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -127,7 +129,12 @@ type routeHandler struct {
 
 	// 16-byte fields (string, interface)
 	contentType string
-	t           reflect.Type
+	// t is the reflected handler function type
+	t reflect.Type
+	// engine lifetime used to cancel SSE streams during shutdown
+	streamCtx context.Context
+	// server write timeout used by SSE deadline renewal
+	writeTimeout time.Duration
 }
 
 // dealPath splits path into per-segment metadata and a normalized route path.
@@ -265,9 +272,11 @@ func (e *engine) generateRoute() {
 		}
 
 		handler := &routeHandler{
-			contentType: textPlainCharset,
-			v:           v,
-			t:           t,
+			contentType:  textPlainCharset,
+			v:            v,
+			t:            t,
+			streamCtx:    e.streamCtx,
+			writeTimeout: e.cfg.WriteTimeout,
 		}
 
 		if t.NumOut() > 0 {

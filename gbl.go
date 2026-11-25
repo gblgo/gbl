@@ -62,6 +62,10 @@ type engine struct {
 	server *http.Server
 	// owns connections removed from net/http by Hijack
 	hijacks *hijackRegistry
+	// lifetime shared by every SSE stream and canceled when shutdown starts
+	streamCtx context.Context
+	// cancels streamCtx so long-lived SSE handlers can drain
+	cancelStreams context.CancelFunc
 
 	// sync primitives
 	// guards listener/server assignment
@@ -84,14 +88,17 @@ var defaultEngine = newEngine()
 // callers reach the framework through the package-level functions, while tests
 // use it to stand up an isolated instance.
 func newEngine() *engine {
+	streamCtx, cancelStreams := context.WithCancel(context.Background())
 	return &engine{
-		roots:      make([]*routeNode, methodCount),
-		astFileMap: make(map[string]*ast.File),
-		astSpans:   make(map[*ast.File][]funcSpan),
-		fest:       token.NewFileSet(),
-		logger:     newStdLogger(),
-		cfg:        defaultConfig(),
-		hijacks:    newHijackRegistry(),
+		roots:         make([]*routeNode, methodCount),
+		astFileMap:    make(map[string]*ast.File),
+		astSpans:      make(map[*ast.File][]funcSpan),
+		fest:          token.NewFileSet(),
+		logger:        newStdLogger(),
+		cfg:           defaultConfig(),
+		hijacks:       newHijackRegistry(),
+		streamCtx:     streamCtx,
+		cancelStreams: cancelStreams,
 	}
 }
 
@@ -220,6 +227,7 @@ func (e *engine) shutdown(ctx context.Context) error {
 	if e.shutdownDone.Load() {
 		return nil
 	}
+	e.cancelStreams()
 	if err := server.Shutdown(ctx); err != nil {
 		return err
 	}

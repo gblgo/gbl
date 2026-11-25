@@ -89,7 +89,7 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c := newContext(rw, r, pathParams, rh, method, e.logger, e.cfg.WriteTimeout)
+	c := newContext(rw, r, pathParams, rh, method, e.logger)
 	defer c.recycle()
 
 	// Return-value handlers commit a provisional media type before middleware or

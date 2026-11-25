@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"reflect"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -41,32 +42,71 @@ var (
 // by the framework.
 type SSEWriter interface {
 	// Send encodes v as event data, writes it and flushes immediately. Strings and
-	// byte slices are sent verbatim; other values follow gbl's normal response
+	// byte slices are sent verbatim; other values follow the normal gbl response
 	// serialization, including JSON for composite values.
 	Send(v any) error
 	// Done closes when the client disconnects, a write fails or the handler exits.
 	Done() <-chan struct{}
+	// OnError sets the callback for the first write or flush failure. Register it
+	// at handler entry; startup failures happen before the handler runs. A callback
+	// registered after termination runs immediately with the retained failure.
+	OnError(func(error))
+	// OnComplete sets the callback invoked once when the handler exits or the
+	// stream fails. A callback registered after termination runs immediately.
+	// Callbacks may run on the request or heartbeat goroutine, must return promptly,
+	// and must not call Send.
+	OnComplete(func())
 }
 
 // sseWriter serializes business events with heartbeat comments and owns the
-// request-scoped cancellation used to stop the user's event loop.
+// request-scoped cancellation used to stop the user event loop.
 type sseWriter struct {
-	// 16-byte fields (interfaces)
+	// wrapped response sink used for frames and flushes
 	w responseWriter
-	// ctx is derived from the request and canceled on any stream failure.
+	// logger records stream failures and callback panics
+	logger Logger
+	// request and engine lifetime combined into one stream context
 	ctx context.Context
-	// 8-byte fields (function, duration)
-	cancel       context.CancelCauseFunc
+	// first terminal error retained for callbacks registered after termination
+	terminalErr error
+	// cancels the stream context with a cause
+	cancel context.CancelCauseFunc
+	// default write deadline renewed before every frame
 	writeTimeout time.Duration
-	// mu prevents heartbeat and business writes from interleaving frames.
+	// error callback invoked once for the first stream failure
+	onError func(error)
+	// completion callback invoked once after normal exit or failure
+	onComplete func()
+	// stops the engine-shutdown callback when the stream finishes
+	stopShutdown func() bool
+	// guards callback registration and terminal state
+	callbackMu sync.Mutex
+	// serializes heartbeat and business frames
 	mu sync.Mutex
+	// prevents duplicate terminal callbacks and failure logs
+	completed bool
+	// records a successful header flush so startup errors are not logged twice
+	started bool
+	// tracks whether the error callback has already run
+	errorNotified bool
+	// tracks whether the completion callback has already run
+	completeNotified bool
 }
 
 // newSSEWriter creates the request-scoped stream without committing headers, so
 // parameter binding can still answer a normal 400 before streaming starts.
-func newSSEWriter(w responseWriter, r *http.Request, writeTimeout time.Duration) *sseWriter {
+func newSSEWriter(w responseWriter, r *http.Request, writeTimeout time.Duration,
+	logger Logger, streamCtx context.Context) *sseWriter {
 	ctx, cancel := context.WithCancelCause(r.Context())
-	return &sseWriter{w: w, ctx: ctx, cancel: cancel, writeTimeout: writeTimeout}
+	stopShutdown := context.AfterFunc(streamCtx, func() { cancel(streamCtx.Err()) })
+	return &sseWriter{
+		w:            w,
+		ctx:          ctx,
+		cancel:       cancel,
+		writeTimeout: writeTimeout,
+		logger:       logger,
+		stopShutdown: stopShutdown,
+	}
 }
 
 // sseHeartbeatInterval keeps idle writes ahead of the configured write deadline.
@@ -86,20 +126,52 @@ func sseHeartbeatInterval(writeTimeout time.Duration) time.Duration {
 // Send converts one value with the same rules as a normal handler result, then
 // writes it as one complete SSE event.
 func (s *sseWriter) Send(v any) error {
+	if err := context.Cause(s.ctx); err != nil {
+		return err
+	}
 	buf := responseBufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	_, err := convertToBuffer(buf, reflect.ValueOf(v))
 	if err != nil {
-		responseBufferPool.Put(buf)
+		releaseResponseBuffer(buf)
 		return err
 	}
 	err = s.writeData(buf.Bytes())
-	responseBufferPool.Put(buf)
+	releaseResponseBuffer(buf)
 	return err
 }
 
-// Done reports stream cancellation to the user's event loop.
+// Done reports stream cancellation to the user event loop.
 func (s *sseWriter) Done() <-chan struct{} { return s.ctx.Done() }
+
+// OnError sets the callback for the first stream failure. A callback registered
+// after termination runs immediately with the retained failure.
+func (s *sseWriter) OnError(fn func(error)) {
+	s.callbackMu.Lock()
+	s.onError = fn
+	if s.completed && s.terminalErr != nil && !s.errorNotified && fn != nil {
+		s.errorNotified = true
+		err := s.terminalErr
+		s.callbackMu.Unlock()
+		s.runCallback("error", func() { fn(err) })
+		return
+	}
+	s.callbackMu.Unlock()
+}
+
+// OnComplete sets the callback for stream termination. A callback registered
+// after termination runs immediately.
+func (s *sseWriter) OnComplete(fn func()) {
+	s.callbackMu.Lock()
+	s.onComplete = fn
+	if s.completed && !s.completeNotified && fn != nil {
+		s.completeNotified = true
+		s.callbackMu.Unlock()
+		s.runCallback("complete", fn)
+		return
+	}
+	s.callbackMu.Unlock()
+}
 
 // setHeaders applies the SSE response headers without committing them.
 func (s *sseWriter) setHeaders() {
@@ -116,7 +188,13 @@ func (s *sseWriter) start() error {
 	if err := s.beforeWrite(); err != nil {
 		return err
 	}
-	return http.NewResponseController(s.w).Flush()
+	if err := http.NewResponseController(s.w).Flush(); err != nil {
+		return err
+	}
+	s.callbackMu.Lock()
+	s.started = true
+	s.callbackMu.Unlock()
+	return nil
 }
 
 // startHeartbeat launches the idle heartbeat and returns a function that stops
@@ -179,7 +257,7 @@ func (s *sseWriter) writeData(data []byte) error {
 	return nil
 }
 
-// beforeWrite rejects a canceled stream and renews the request's write deadline.
+// beforeWrite rejects a canceled stream and renews the request write deadline.
 // Writers without deadline support can still stream; only unsupported deadlines
 // are ignored, while real deadline failures terminate the stream.
 func (s *sseWriter) beforeWrite() error {
@@ -196,10 +274,77 @@ func (s *sseWriter) beforeWrite() error {
 	return err
 }
 
-// fail records the first stream error as the cancellation cause.
+// fail records the first stream error as the cancellation cause and invokes
+// terminal callbacks once.
 func (s *sseWriter) fail(err error) error {
+	if s.stopShutdown != nil {
+		s.stopShutdown()
+	}
 	s.cancel(err)
+	s.callbackMu.Lock()
+	if s.completed {
+		s.callbackMu.Unlock()
+		return err
+	}
+	s.completed = true
+	s.terminalErr = err
+	onError := s.onError
+	onComplete := s.onComplete
+	started := s.started
+	if onError != nil {
+		s.errorNotified = true
+	}
+	if onComplete != nil {
+		s.completeNotified = true
+	}
+	s.callbackMu.Unlock()
+
+	if started && s.logger != nil {
+		s.logger.Error("SSE stream failed", "error", err)
+	}
+	if onError != nil {
+		s.runCallback("error", func() { onError(err) })
+	}
+	if onComplete != nil {
+		s.runCallback("complete", onComplete)
+	}
 	return err
+}
+
+// complete cancels a finished stream and invokes OnComplete once.
+func (s *sseWriter) complete() {
+	if s.stopShutdown != nil {
+		s.stopShutdown()
+	}
+	s.cancel(nil)
+	s.callbackMu.Lock()
+	if s.completed {
+		s.callbackMu.Unlock()
+		return
+	}
+	s.completed = true
+	onComplete := s.onComplete
+	if onComplete != nil {
+		s.completeNotified = true
+	}
+	s.callbackMu.Unlock()
+	if onComplete != nil {
+		s.runCallback("complete", onComplete)
+	}
+}
+
+// runCallback isolates user callback panics so a heartbeat goroutine or deferred
+// cleanup cannot crash the process.
+func (s *sseWriter) runCallback(kind string, fn func()) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if s.logger != nil {
+				s.logger.Error("SSE "+kind+" callback panic", "error", recovered,
+					"stack", string(debug.Stack()))
+			}
+		}
+	}()
+	fn()
 }
 
 // writeSSEData frames every payload line as a data field. CRLF and bare CR are
