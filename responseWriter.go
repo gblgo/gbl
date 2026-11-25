@@ -30,6 +30,8 @@ type responseWriter interface {
 	headed() bool
 	// flushes the recorded status exactly once
 	writeHeader()
+	// replaces an unflushed staged status during panic recovery
+	replaceStatus(int)
 	// effective status, defaulting to 200
 	status() int
 	// body bytes written so far
@@ -41,19 +43,16 @@ type responseWriter interface {
 // right status, and mirrors net/http rule that the first body write commits
 // whatever status was set beforehand.
 type pooledResponseWriter struct {
-	// 16-byte fields (interface and pointer)
 	// wrapped sink, reset per request; never retained across requests
 	w http.ResponseWriter
 	// registry that owns hijacked connections until user Close or Shutdown
 	hijacks *hijackRegistry
 
-	// 8-byte fields (int)
 	// recorded status code
 	statusCode int
 	// total body bytes passed to the underlying writer
 	bytesWritten int
 
-	// 1-byte fields (bool)
 	// Write has been called, including a zero-length write
 	writtenStatus bool
 	// WriteHeader has recorded a status
@@ -190,10 +189,11 @@ func (rw *pooledResponseWriter) status() int {
 	return http.StatusOK
 }
 
-// bodyAllowedForStatus mirrors the net/http rule that informational, 204 and 304
-// responses cannot carry a body.
+// bodyAllowedForStatus mirrors the net/http rule that informational, 204, 205 and
+// 304 responses cannot carry a body.
 func bodyAllowedForStatus(code int) bool {
-	return code >= http.StatusOK && code != http.StatusNoContent && code != http.StatusNotModified
+	return code >= http.StatusOK && code != http.StatusNoContent &&
+		code != http.StatusResetContent && code != http.StatusNotModified
 }
 
 // size reports how many body bytes have been written so far.
@@ -234,6 +234,15 @@ func (rw *pooledResponseWriter) writeHeader() {
 	rw.w.WriteHeader(rw.statusCode)
 }
 
+// replaceStatus overrides a staged status only while no response has been sent.
+func (rw *pooledResponseWriter) replaceStatus(code int) {
+	if rw.flushedStatus || rw.hijackedStatus || rw.writtenStatus {
+		return
+	}
+	rw.headedStatus = true
+	rw.statusCode = code
+}
+
 // Flush commits the current status and forwards to the underlying flusher when
 // the sink supports streaming.
 func (rw *pooledResponseWriter) Flush() {
@@ -246,16 +255,29 @@ func (rw *pooledResponseWriter) FlushError() error {
 	if rw.hijackedStatus {
 		return http.ErrHijacked
 	}
-	if flusher, ok := rw.w.(interface{ FlushError() error }); ok {
-		rw.writeHeader()
-		return flusher.FlushError()
+	if !supportsFlush(rw.w) {
+		return http.ErrNotSupported
 	}
-	if flusher, ok := rw.w.(http.Flusher); ok {
-		rw.writeHeader()
-		flusher.Flush()
-		return nil
+	rw.writeHeader()
+	return http.NewResponseController(rw.w).Flush()
+}
+
+// supportsFlush reports whether the Unwrap chain exposes FlushError or Flusher.
+func supportsFlush(w http.ResponseWriter) bool {
+	for w != nil {
+		if _, ok := w.(interface{ FlushError() error }); ok {
+			return true
+		}
+		if _, ok := w.(http.Flusher); ok {
+			return true
+		}
+		unwrapper, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return false
+		}
+		w = unwrapper.Unwrap()
 	}
-	return http.ErrNotSupported
+	return false
 }
 
 // Hijack forwards connection ownership when the underlying sink supports it.
@@ -263,11 +285,7 @@ func (rw *pooledResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if rw.hijackedStatus {
 		return nil, nil, http.ErrHijacked
 	}
-	hijacker, ok := rw.w.(http.Hijacker)
-	if !ok {
-		return nil, nil, http.ErrNotSupported
-	}
-	conn, buffered, err := hijacker.Hijack()
+	conn, buffered, err := http.NewResponseController(rw.w).Hijack()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -284,11 +302,17 @@ func (rw *pooledResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 // Push forwards HTTP/2 server pushes when the underlying sink supports them.
 func (rw *pooledResponseWriter) Push(target string, opts *http.PushOptions) error {
-	pusher, ok := rw.w.(http.Pusher)
-	if !ok {
-		return http.ErrNotSupported
+	for current := rw.w; current != nil; {
+		if pusher, ok := current.(http.Pusher); ok {
+			return pusher.Push(target, opts)
+		}
+		unwrapper, ok := current.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		current = unwrapper.Unwrap()
 	}
-	return pusher.Push(target, opts)
+	return http.ErrNotSupported
 }
 
 // Unwrap returns the wrapped writer so http.ResponseController can reach

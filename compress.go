@@ -91,7 +91,8 @@ func Compress(level int) HandlerFunc {
 		c.Next()
 
 		// Only compress if the handler produced a result and nothing wrote yet
-		if !c.handled || c.writer.written() || c.writer.flushed() {
+		if !c.handled || c.writer.written() || c.writer.flushed() ||
+			!bodyAllowedForStatus(c.writer.status()) {
 			return
 		}
 
@@ -142,6 +143,7 @@ func Compress(level int) HandlerFunc {
 		c.bytes = buf.Bytes()
 		c.responseBuf = buf
 		c.writer.Header().Set(contentEncoding, encodingGzip)
+		c.writer.Header().Del("Content-Length")
 	}
 }
 

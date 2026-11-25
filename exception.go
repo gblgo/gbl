@@ -63,6 +63,11 @@ var typeRecognitionError = []byte("Reflection Type Identification Exception")
 // errorWriteback renders a panic payload as response bytes, choosing the form by
 // its reflected kind.
 func errorWriteback(err any) ([]byte, string) {
+	return errorWritebackDepth(err, 0)
+}
+
+// errorWritebackDepth bounds recursive pointer/interface rendering.
+func errorWritebackDepth(err any, depth int) ([]byte, string) {
 	// A nil payload renders as an empty body: a PanicProcessor may deliberately
 	// answer with no content, and reflection on nil would otherwise fall into
 	// the unrecognized-kind default and emit the fixed error text.
@@ -90,13 +95,16 @@ func errorWriteback(err any) ([]byte, string) {
 	case reflect.String:
 		return []byte(val.String()), textPlainCharset
 	case reflect.Pointer, reflect.Interface:
+		if depth >= maxResponseDerefDepth {
+			return typeRecognitionError, textPlainCharset
+		}
 		// A nil pointer/interface has no element to unwrap.
 		if val.IsNil() {
 			return []byte(empty), textPlainCharset
 		}
 		// Unwrap one layer and return the result, passing the element value
 		// itself rather than the reflection wrapper around it.
-		return errorWriteback(val.Elem().Interface())
+		return errorWritebackDepth(val.Elem().Interface(), depth+1)
 	case reflect.Bool:
 		return strconv.AppendBool(nil, val.Bool()), textPlainCharset
 	case reflect.Float32, reflect.Float64:
@@ -109,6 +117,24 @@ func errorWriteback(err any) ([]byte, string) {
 		return []byte(strconv.FormatComplex(val.Complex(), 'f', -1, val.Type().Bits())), textPlainCharset
 	default:
 		return typeRecognitionError, textPlainCharset
+	}
+}
+
+// writeResponseAbort renders a framework-controlled halt during request-level
+// panic recovery. Middleware that recovers the halt itself owns the response.
+func (e *engine) writeResponseAbort(rw responseWriter, halt responseAbort) {
+	if rw.hijacked() || rw.flushed() || rw.written() {
+		return
+	}
+	if rw.headed() {
+		rw.writeHeader()
+		return
+	}
+	rw.Header().Set(contentType, textPlainCharset)
+	rw.WriteHeader(halt.status)
+	rw.writeHeader()
+	if bodyAllowedForStatus(halt.status) {
+		_, _ = rw.Write([]byte(halt.body))
 	}
 }
 
@@ -144,27 +170,26 @@ func (e *engine) catchRuntimePanic(rw responseWriter) {
 	// displayable aborts and genuine crashes alike.
 	if e.panicProcessor != nil {
 		payload, httpStatus := e.panicProcessor(err)
-		// The hook is user code, so its status is not trusted: net/http panics
-		// on an out-of-range WriteHeader code, and a second panic inside the
-		// recovery path would kill the connection with no answer at all.
+		// The hook is user code, so its status is not trusted: only final response
+		// statuses are meaningful here. Protocol switches belong to an explicit
+		// Upgrade/Hijack flow, not panic rendering.
 		code := int(httpStatus)
-		if code < 100 || code > 999 {
+		if code < http.StatusOK || code > 999 {
 			code = http.StatusInternalServerError
 		}
 		body, mediaType := errorWriteback(payload)
 		rw.Header().Set(contentType, mediaType)
-		rw.WriteHeader(code)
+		rw.replaceStatus(code)
 		rw.writeHeader()
-		_, _ = rw.Write(body)
+		if bodyAllowedForStatus(code) {
+			_, _ = rw.Write(body)
+		}
 		return
 	}
 
 	// An explicit halt carries its own client-safe status and message.
 	if halt, ok := err.(responseAbort); ok {
-		rw.Header().Set(contentType, textPlainCharset)
-		rw.WriteHeader(halt.status)
-		rw.writeHeader()
-		_, _ = rw.Write([]byte(halt.body))
+		e.writeResponseAbort(rw, halt)
 		return
 	}
 
@@ -172,7 +197,7 @@ func (e *engine) catchRuntimePanic(rw responseWriter) {
 	// client behind a generic 500.
 	e.logRecoveredPanic(err)
 	rw.Header().Set(contentType, textPlainCharset)
-	rw.WriteHeader(http.StatusInternalServerError)
+	rw.replaceStatus(http.StatusInternalServerError)
 	rw.writeHeader()
 	_, _ = rw.Write([]byte(http.StatusText(http.StatusInternalServerError)))
 }
