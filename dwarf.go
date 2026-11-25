@@ -13,6 +13,13 @@ import (
 	"strconv"
 )
 
+// dwarfParamNames records one source position. Duplicate positions are marked
+// ambiguous instead of allowing the later function to overwrite the earlier one.
+type dwarfParamNames struct {
+	names     []string
+	ambiguous bool
+}
+
 // buildDWARFIndex recovers parameter names from the running binary own DWARF
 // debug information, keyed by the source position the runtime reports for each
 // function ("<file>:<line>").
@@ -37,7 +44,7 @@ import (
 // then pseudo-parameters for the results (`~r0`, ...) and, for methods, the
 // receiver (`~p0`). The caller slices the list to the handler NumIn. That keeps
 // exactly the input names and drops the trailing result pseudo-parameters.
-func buildDWARFIndex() map[string][]string {
+func buildDWARFIndex() map[string]dwarfParamNames {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil
@@ -47,7 +54,7 @@ func buildDWARFIndex() map[string][]string {
 		return nil
 	}
 
-	index := make(map[string][]string)
+	index := make(map[string]dwarfParamNames)
 	reader := data.Reader()
 	var files []*dwarf.LineFile
 
@@ -63,7 +70,11 @@ func buildDWARFIndex() map[string][]string {
 	)
 	flush := func() {
 		if seen && key != empty {
-			index[key] = names
+			if _, exists := index[key]; exists {
+				index[key] = dwarfParamNames{ambiguous: true}
+			} else {
+				index[key] = dwarfParamNames{names: names}
+			}
 		}
 		key, names, seen = empty, nil, false
 	}

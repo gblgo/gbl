@@ -41,6 +41,33 @@ type segmentMeta struct {
 	isVar bool
 }
 
+// findOverlappingRoute walks only existing branches compatible with the new
+// pattern, avoiding a full tree scan and pattern allocations during registration.
+func findOverlappingRoute(node *routeNode, segments []segmentMeta, index int) (bool, string) {
+	if node == nil {
+		return false, empty
+	}
+	if index == len(segments) {
+		return node.exist, node.path
+	}
+	meta := segments[index]
+	if meta.isVar {
+		for _, child := range node.staticNode {
+			if found, path := findOverlappingRoute(child, segments, index+1); found {
+				return true, path
+			}
+		}
+	} else if found, path := findOverlappingRoute(node.staticNode[meta.segment], segments, index+1); found {
+		return true, path
+	}
+	for _, child := range node.varNode {
+		if found, path := findOverlappingRoute(child, segments, index+1); found {
+			return true, path
+		}
+	}
+	return false, empty
+}
+
 // newNode builds an empty, non-terminal node for segment, ready to receive children.
 func newNode(segment string) *routeNode {
 	return &routeNode{
@@ -50,35 +77,6 @@ func newNode(segment string) *routeNode {
 		staticNode: make(map[string]*routeNode),
 		varNode:    make([]*routeNode, 0),
 	}
-}
-
-// hasSameRoute reports whether segments[index:] already terminates on an
-// existing route beneath node, returning that route full path. It is the
-// conflict probe used before inserting a new variable node: two differently
-// named variables occupying the same position would match identically, and the
-// caller rejects that.
-func hasSameRoute(node *routeNode, segments []segmentMeta, index int) (bool, string) {
-	if node == nil {
-		return false, empty
-	}
-
-	if index == len(segments) {
-		return node.exist, node.path
-	}
-
-	meta := segments[index]
-
-	if meta.isVar {
-		for _, vn := range node.varNode {
-			if found, path := hasSameRoute(vn, segments, index+1); found {
-				return true, path
-			}
-		}
-		return false, empty
-	}
-
-	next := node.staticNode[meta.segment]
-	return hasSameRoute(next, segments, index+1)
 }
 
 // insertNode walks segmentMetas down the tree for method, creating static and
@@ -95,6 +93,9 @@ func (e *engine) insertNode(segmentMetas []segmentMeta, path string,
 		root = newNode(slash)
 		e.roots[method] = root
 	}
+	if found, existingPath := findOverlappingRoute(root, segmentMetas, 0); found {
+		e.failStartup(fmt.Errorf("variable route conflicts: [%s %s]", path, existingPath))
+	}
 	// Insert route segments
 	for i, meta := range segmentMetas {
 		isLast := i == len(segmentMetas)-1
@@ -108,14 +109,7 @@ func (e *engine) insertNode(segmentMetas []segmentMeta, path string,
 				}
 			}
 
-			// If there is no node with the same name, check whether the same routing structure exists
 			if node == nil {
-				for _, vn := range root.varNode {
-					if found, existPath := hasSameRoute(vn, segmentMetas, i+1); found {
-						e.failStartup(fmt.Errorf("variable route conflicts: [%s %s]", path, existPath))
-					}
-				}
-
 				node = newNode(meta.segment)
 				node.paramName = meta.paramName
 				root.varNode = append(root.varNode, node)

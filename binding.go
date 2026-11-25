@@ -75,14 +75,14 @@ type (
 		// pointer) implements Validatable, precomputed here so a handler that does
 		// not validate pays no per-request reflection or interface boxing.
 		validatableIndexes []int
-		// needsParse records whether request data must be parsed
-		needsParse bool
-		// hasSSE is true when any parameter declares gbl.SSEWriter.
-		hasSSE bool
 		// queryKeys are the exact request keys needed by scalar and struct fields
 		queryKeys []string
 		// jsonKeys are the top-level members needed by multi-parameter JSON handlers
 		jsonKeys []string
+		// needsParse records whether request data must be parsed
+		needsParse bool
+		// hasSSE is true when any parameter declares gbl.SSEWriter.
+		hasSSE bool
 		// needsNames is true when at least one business or file parameter must be
 		// matched against the request by its handler parameter name. A lone struct
 		// or pointer-to-struct is self-describing: its fields come from reflection,
@@ -174,16 +174,28 @@ func releaseParams(bufPool *[]reflect.Value, params []reflect.Value) {
 	paramsPool.Put(bufPool)
 }
 
+// maxTypePointerDepth bounds walks through recursive named pointer types.
+const maxTypePointerDepth = 64
+
+// derefType strips pointers while rejecting recursive pointer cycles.
+func derefType(t reflect.Type) (reflect.Type, bool) {
+	for depth := 0; t.Kind() == reflect.Pointer; depth++ {
+		if depth >= maxTypePointerDepth {
+			return nil, false
+		}
+		t = t.Elem()
+	}
+	return t, true
+}
+
 // selfDescribing reports whether a business parameter can be bound without its
 // handler parameter name. A struct — or any pointer chain leading to one — names
 // its values by field, which reflection supplies even when the source file is
 // unavailable at runtime; every other kind (scalar, slice, map, interface and
 // pointer to those) is matched against the request by the parameter name.
 func selfDescribing(t reflect.Type) bool {
-	for t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	return t.Kind() == reflect.Struct
+	terminal, ok := derefType(t)
+	return ok && terminal.Kind() == reflect.Struct
 }
 
 // classifyParam decides a parameter binding class once, at route-generation
@@ -214,7 +226,7 @@ func classifyParam(t reflect.Type) paramClass {
 // It records each parameter type and class, collects the business-parameter
 // indexes, caches the top-level fields of struct parameters, and flags whether
 // any parameter forces the request body/query to be parsed.
-func buildBindPlan(rt reflect.Type) bindPlan {
+func buildBindPlan(rt reflect.Type) (bindPlan, error) {
 	n := rt.NumIn()
 	plan := bindPlan{
 		types:        make([]reflect.Type, n),
@@ -230,10 +242,15 @@ func buildBindPlan(rt reflect.Type) bindPlan {
 		plan.classes[i] = class
 		switch class {
 		case classBind:
+			if _, ok := derefType(t); !ok {
+				return plan, fmt.Errorf("recursive pointer type: %s", t)
+			}
 			plan.businessIndexes = append(plan.businessIndexes, i)
 			plan.needsParse = true
 			if t.Kind() == reflect.Struct {
 				plan.structFields[i] = structFieldsOf(t)
+			}
+			if selfDescribing(t) {
 				prewarmNestedStructs(t, visited)
 			}
 			if !selfDescribing(t) {
@@ -258,26 +275,17 @@ func buildBindPlan(rt reflect.Type) bindPlan {
 	if len(plan.businessIndexes) > 1 {
 		plan.needsNames = true
 	}
-	return plan
+	return plan, nil
 }
 
 // prepareKeys records the exact query and JSON names this handler can consume.
 // It runs after parameter-name recovery and never changes during serving.
 func (p *bindPlan) prepareKeys(names []string) {
+	visited := make(map[reflect.Type]bool)
 	for _, index := range p.businessIndexes {
 		name := paramNameAt(names, index)
-		fields := p.structFields[index]
-		if fields == nil && selfDescribing(p.types[index]) {
-			typ := p.types[index]
-			for typ.Kind() == reflect.Pointer {
-				typ = typ.Elem()
-			}
-			fields = structFieldsOf(typ)
-		}
-		if fields != nil {
-			for _, field := range fields {
-				p.queryKeys = appendUniqueKey(p.queryKeys, field.name)
-			}
+		if selfDescribing(p.types[index]) {
+			p.queryKeys = appendStructQueryKeys(p.queryKeys, p.types[index], visited)
 		} else {
 			p.queryKeys = appendUniqueKey(p.queryKeys, name)
 		}
@@ -285,6 +293,28 @@ func (p *bindPlan) prepareKeys(names []string) {
 			p.jsonKeys = append(p.jsonKeys, name)
 		}
 	}
+}
+
+// appendStructQueryKeys collects leaf field names because nested structs bind
+// their own fields rather than a value for the outer struct field.
+func appendStructQueryKeys(keys []string, t reflect.Type, visited map[reflect.Type]bool) []string {
+	t, ok := derefType(t)
+	if !ok || t.Kind() != reflect.Struct || visited[t] {
+		return keys
+	}
+	visited[t] = true
+	for _, field := range structFieldsOf(t) {
+		fieldType, ok := derefType(field.typ)
+		if !ok {
+			continue
+		}
+		if fieldType.Kind() == reflect.Struct {
+			keys = appendStructQueryKeys(keys, fieldType, visited)
+		} else {
+			keys = appendUniqueKey(keys, field.name)
+		}
+	}
+	return keys
 }
 
 // appendUniqueKey adds key once so repeated struct tags do not repeat scans.
@@ -298,16 +328,11 @@ func appendUniqueKey(keys []string, key string) []string {
 // prewarmNestedStructs recursively warms the structFieldsCache for every nested
 // struct reachable from t, so request-time binding never pays a concurrent-map miss.
 func prewarmNestedStructs(t reflect.Type, visited map[reflect.Type]bool) {
-	if visited[t] {
+	t, ok := derefType(t)
+	if !ok || t.Kind() != reflect.Struct || visited[t] {
 		return
 	}
 	visited[t] = true
-	for t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	if t.Kind() != reflect.Struct {
-		return
-	}
 	fields := structFieldsOf(t)
 	for _, f := range fields {
 		prewarmNestedStructs(f.typ, visited)
@@ -509,16 +534,6 @@ func injectedParameters(
 	src := &c.src
 
 	var jsonFields map[string]json.RawMessage
-	if jsonMedia && len(plan.businessIndexes) > 1 {
-		var err error
-		jsonFields, err = decodeJSONFields(body, plan.jsonKeys)
-		if err != nil {
-			return err
-		}
-		if jsonFields == nil {
-			return multipleRequireError
-		}
-	}
 
 	for i := range plan.types {
 		t := plan.types[i]
@@ -567,8 +582,18 @@ func injectedParameters(
 
 		if jsonMedia {
 			// A lone business parameter decodes the whole body; several split
-			// the JSON object by parameter name. Missing members keep addressable
-			// zero values so pointer-receiver validation still runs.
+			// the JSON object by parameter name. Decode only after path precedence
+			// has failed for the first parameter that actually needs JSON.
+			if len(plan.businessIndexes) > 1 && jsonFields == nil {
+				var err error
+				jsonFields, err = decodeJSONFields(body, plan.jsonKeys)
+				if err != nil {
+					return err
+				}
+				if jsonFields == nil {
+					return multipleRequireError
+				}
+			}
 			raw := body
 			found := true
 			if len(plan.businessIndexes) > 1 {
@@ -688,6 +713,11 @@ func lookupString(values map[string]string, name string) (string, bool) {
 // types pull from the uploaded files, slices/arrays consume repeated values,
 // and scalars take the first value. name is matched against the request exactly.
 func bindFormParameter(t reflect.Type, name string, src *nameSources) (reflect.Value, error) {
+	return bindFormParameterDepth(t, name, src, 0)
+}
+
+// bindFormParameterDepth bounds recursive named pointer types at request time.
+func bindFormParameterDepth(t reflect.Type, name string, src *nameSources, depth int) (reflect.Value, error) {
 	// The file-header shapes are checked first: multipart.FileHeader is itself a
 	// struct, and letting the struct branch below catch it would bind the
 	// header exported fields from form keys instead of the uploaded file.
@@ -697,6 +727,9 @@ func bindFormParameter(t reflect.Type, name string, src *nameSources) (reflect.V
 	}
 
 	if t.Kind() == reflect.Pointer {
+		if depth >= maxTypePointerDepth {
+			return reflect.Value{}, fmt.Errorf("recursive pointer type: %s", t)
+		}
 		// A missing non-struct pointer stays nil; a pointer chain leading to a
 		// struct is allocated so its fields can be bound individually.
 		if _, ok := src.pathGet(name); !ok {
@@ -706,7 +739,7 @@ func bindFormParameter(t reflect.Type, name string, src *nameSources) (reflect.V
 				}
 			}
 		}
-		value, err := bindFormParameter(t.Elem(), name, src)
+		value, err := bindFormParameterDepth(t.Elem(), name, src, depth+1)
 		if err != nil {
 			return reflect.Value{}, err
 		}
@@ -737,7 +770,8 @@ func bindFormParameter(t reflect.Type, name string, src *nameSources) (reflect.V
 			}
 			result = reflect.New(t).Elem()
 		} else {
-			result = reflect.MakeSlice(t, len(values), len(values))
+			result = reflect.New(t).Elem()
+			result.Set(reflect.MakeSlice(t, len(values), len(values)))
 		}
 		for i, text := range values {
 			elem, err := bindTextValue(t.Elem(), []string{text})
@@ -815,7 +849,7 @@ func bindFileHeaders(t reflect.Type, headers []*multipart.FileHeader) (reflect.V
 		}
 		return reflect.ValueOf(*headers[0]), nil
 	case fileHeaderPs:
-		return reflect.ValueOf(headers), nil
+		return reflect.ValueOf(slices.Clone(headers)), nil
 	case fileHeaderSlice:
 		result := make([]multipart.FileHeader, len(headers))
 		for i, header := range headers {
@@ -854,11 +888,19 @@ func wrapPointer(t reflect.Type, elem reflect.Value) reflect.Value {
 // scalar) of type t. Only the first value is used; repeated values should be
 // bound to a slice or array parameter instead.
 func bindTextValue(t reflect.Type, values []string) (reflect.Value, error) {
+	return bindTextValueDepth(t, values, 0)
+}
+
+// bindTextValueDepth bounds pointer recursion for path and scalar binding.
+func bindTextValueDepth(t reflect.Type, values []string, depth int) (reflect.Value, error) {
 	if t.Kind() == reflect.Pointer {
+		if depth >= maxTypePointerDepth {
+			return reflect.Value{}, fmt.Errorf("recursive pointer type: %s", t)
+		}
 		if len(values) == 0 {
 			return reflect.Zero(t), nil
 		}
-		value, err := bindTextValue(t.Elem(), values)
+		value, err := bindTextValueDepth(t.Elem(), values, depth+1)
 		if err != nil {
 			return reflect.Value{}, err
 		}

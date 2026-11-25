@@ -6,6 +6,7 @@ package gbl
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"go/ast"
 	"go/token"
@@ -29,7 +30,6 @@ import (
 // isolated engines (each with its own routes and logger) without a listening
 // port, by driving generateRoute and ServeHTTP directly.
 type engine struct {
-	// 24-byte fields (slices)
 	// one routing tree per supported method (dynamic routes with path params)
 	roots []*routeNode
 	// registrations queued before generateRoute
@@ -37,13 +37,13 @@ type engine struct {
 	// global chain, merged with each group at generation
 	middlewares []HandlerFunc
 
-	// 16-byte fields (interfaces)
 	// user hook that renders panic values
 	panicProcessor PanicProcessor
 	// sink for internal logs; never nil
 	logger Logger
+	// lifetime shared by every SSE stream and canceled when shutdown starts
+	streamCtx context.Context
 
-	// 8-byte fields (pointers, maps)
 	// O(1) lookup for static routes (no path params)
 	staticRoutes [methodCount]map[string]*routeHandler
 	// runtime configuration; defaults overlaid by Configure
@@ -57,13 +57,11 @@ type engine struct {
 	// file set backing astFileMap
 	fest *token.FileSet
 	// lazily built "<file>:<line>"->param names from the binary DWARF; the sourceless fallback
-	dwarfIndex map[string][]string
+	dwarfIndex map[string]dwarfParamNames
 	// live server, set by Run; nil before start
 	server *http.Server
 	// owns connections removed from net/http by Hijack
 	hijacks *hijackRegistry
-	// lifetime shared by every SSE stream and canceled when shutdown starts
-	streamCtx context.Context
 	// cancels streamCtx so long-lived SSE handlers can drain
 	cancelStreams context.CancelFunc
 
@@ -73,7 +71,6 @@ type engine struct {
 	// serializes shutdown attempts so Run can wait for an in-progress drain
 	shutdownMu sync.Mutex
 
-	// 1-byte fields
 	// routes frozen into trees; also gates the read-only-after-Run contract
 	generated bool
 	// the server has been drained successfully; later Shutdown calls are no-ops
@@ -130,6 +127,11 @@ func (e *engine) run() {
 	// included. The kernel reads no file; an integration layer resolves its
 	// own sources and calls Configure before Run.
 	cfg := e.cfg
+	if cfg.useTLS {
+		if _, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile); err != nil {
+			e.failStartup(err)
+		}
+	}
 
 	// Build the routing trees from everything registered so far.
 	e.generateRoute()
