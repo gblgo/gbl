@@ -8,15 +8,16 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 )
 
 // Logger is the minimal, zero-dependency logging contract of gbl. The framework
 // routes every message it emits internally — a recovered panic, a validation
-// failure — through the engine's Logger. It never binds
+// failure — through the engine Logger. It never binds
 // hard to a specific package. So the destination, the format and (where the
 // implementation supports them) the structured fields are all the
-// application's choice.
+// application choice.
 //
 // Each method takes trailing key/value pairs: msg describes the event, then
 // alternating keys and their values. A structured backend such as zap or slog
@@ -46,16 +47,16 @@ type BannerLogger interface {
 // files, rotation or routing — an application that integrates a real logging
 // component replaces it through SetLogger.
 //
-// It writes through a private *log.Logger, not the standard library's
-// package-level one, which keeps framework and application isolated in both
-// directions: the application's log.SetOutput and log.SetFlags calls never
-// move or restyle framework lines, and the framework never reaches into the
-// application's own log.Println output. The private logger sits on a
-// level-tinting writer over os.Stderr, so framework lines keep the familiar
-// date/time prefix and are colored without polluting the global logger.
-// Sending framework logs somewhere else has exactly one path: install a
-// Logger with SetLogger.
+// It writes through a private *log.Logger rather than the standard library
+// package-level logger, which keeps framework and application output isolated.
+// Application calls to log.SetOutput and log.SetFlags never move or restyle
+// framework lines, and the framework never captures application log.Println
+// output. The private logger sits on a level-tinting writer over os.Stderr, so
+// framework lines keep the familiar date/time prefix without polluting the
+// global logger. Sending framework logs somewhere else has exactly one path:
+// install a Logger with SetLogger.
 type stdLogger struct {
+	// l is the private standard-library logger
 	l *log.Logger
 }
 
@@ -76,7 +77,7 @@ func (s stdLogger) Warn(msg string, kv ...any) { s.emit("WARN", msg, kv) }
 // Error logs a failure at ERROR level.
 func (s stdLogger) Error(msg string, kv ...any) { s.emit("ERROR", msg, kv) }
 
-// Banner writes the startup block straight to the sink's underlying writer,
+// Banner writes the startup block straight to the sink underlying writer,
 // bypassing the private logger so the art keeps its alignment and no
 // date/level label is glued to its first line. The tinting writer is still
 // underneath and passes the block through untouched: it carries no level
@@ -87,7 +88,7 @@ func (s stdLogger) Banner(block string) {
 
 // emit renders "LEVEL msg key=value ..." and writes it through the private
 // logger. The fixed call depth names the package-level Info/Warn/Error wrapper;
-// the logger's flags are pinned to date/time, so no file/line is ever printed.
+// the logger flags are pinned to date/time, so no file/line is ever printed.
 // All levels share the one logger because log itself is level-free; the label
 // preserves the distinction for readers.
 func (s stdLogger) emit(level, msg string, kv []any) {
@@ -98,20 +99,69 @@ func (s stdLogger) emit(level, msg string, kv []any) {
 // trailing value (odd count) is appended bare so no information is dropped.
 func logLine(level, msg string, kv []any) string {
 	var b strings.Builder
+	b.Grow(len(level) + len(msg) + len(kv)*8)
 	b.WriteString(level)
 	b.WriteByte(' ')
 	b.WriteString(msg)
 	for i := 0; i+1 < len(kv); i += 2 {
 		b.WriteByte(' ')
-		b.WriteString(fmt.Sprint(kv[i]))
+		appendLogValue(&b, kv[i])
 		b.WriteByte('=')
-		b.WriteString(fmt.Sprint(kv[i+1]))
+		appendLogValue(&b, kv[i+1])
 	}
 	if len(kv)%2 == 1 {
 		b.WriteByte(' ')
-		b.WriteString(fmt.Sprint(kv[len(kv)-1]))
+		appendLogValue(&b, kv[len(kv)-1])
 	}
 	return b.String()
+}
+
+// appendLogValue avoids interface formatting allocations for common scalar
+// values while preserving the default fmt.Sprint behavior for other types.
+func appendLogValue(b *strings.Builder, value any) {
+	var number [64]byte
+	switch v := value.(type) {
+	case nil:
+		b.WriteString("<nil>")
+	case string:
+		b.WriteString(v)
+	case bool:
+		b.WriteString(strconv.FormatBool(v))
+	case int:
+		b.Write(strconv.AppendInt(number[:0], int64(v), 10))
+	case int8:
+		b.Write(strconv.AppendInt(number[:0], int64(v), 10))
+	case int16:
+		b.Write(strconv.AppendInt(number[:0], int64(v), 10))
+	case int32:
+		b.Write(strconv.AppendInt(number[:0], int64(v), 10))
+	case int64:
+		b.Write(strconv.AppendInt(number[:0], v, 10))
+	case uint:
+		b.Write(strconv.AppendUint(number[:0], uint64(v), 10))
+	case uint8:
+		b.Write(strconv.AppendUint(number[:0], uint64(v), 10))
+	case uint16:
+		b.Write(strconv.AppendUint(number[:0], uint64(v), 10))
+	case uint32:
+		b.Write(strconv.AppendUint(number[:0], uint64(v), 10))
+	case uint64:
+		b.Write(strconv.AppendUint(number[:0], v, 10))
+	case uintptr:
+		b.Write(strconv.AppendUint(number[:0], uint64(v), 10))
+	case float32:
+		b.Write(strconv.AppendFloat(number[:0], float64(v), 'g', -1, 32))
+	case float64:
+		b.Write(strconv.AppendFloat(number[:0], v, 'g', -1, 64))
+	case fmt.Formatter:
+		b.WriteString(fmt.Sprint(v))
+	case error:
+		b.WriteString(v.Error())
+	case fmt.Stringer:
+		b.WriteString(v.String())
+	default:
+		b.WriteString(fmt.Sprint(v))
+	}
 }
 
 // SetLogger installs a Logger on the default engine. Passing nil is ignored, so
@@ -123,8 +173,8 @@ func SetLogger(l Logger) { defaultEngine.setLogger(l) }
 
 // Info logs at info level through the Logger installed on the default engine.
 // The three package-level log functions are the ergonomic entry for business
-// code: once a logger is injected with SetLogger it is the framework's sink,
-// and calling it through the framework's own API is the intended use — no need
+// code: once a logger is injected with SetLogger it is the framework sink,
+// and calling it through the framework own API is the intended use — no need
 // to keep or fetch a reference. msg describes the event, followed by
 // alternating key/value pairs (see Logger).
 func Info(msg string, keysAndValues ...any) { defaultEngine.logger.Info(msg, keysAndValues...) }
