@@ -190,6 +190,12 @@ func (rw *pooledResponseWriter) status() int {
 	return http.StatusOK
 }
 
+// bodyAllowedForStatus mirrors the net/http rule that informational, 204 and 304
+// responses cannot carry a body.
+func bodyAllowedForStatus(code int) bool {
+	return code >= http.StatusOK && code != http.StatusNoContent && code != http.StatusNotModified
+}
+
 // size reports how many body bytes have been written so far.
 func (rw *pooledResponseWriter) size() int { return rw.bytesWritten }
 

@@ -194,7 +194,7 @@ func (c *Context) Size() int {
 	if n := c.writer.size(); n > 0 {
 		return n
 	}
-	if c.writer.written() || c.writer.status() == http.StatusSwitchingProtocols {
+	if c.writer.written() || !bodyAllowedForStatus(c.writer.status()) {
 		return 0
 	}
 	if c.handled {

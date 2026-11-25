@@ -92,6 +92,13 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	c := newContext(rw, r, pathParams, rh, method, e.logger, e.cfg.WriteTimeout)
 	defer c.recycle()
 
+	// Return-value handlers commit a provisional media type before middleware or
+	// the handler can flush. Runtime serialization may still refine it before the
+	// automatic write when the response has not been flushed.
+	if rh.t.NumOut() > 0 {
+		rw.Header().Set(contentType, rh.contentType)
+	}
+
 	// Multipart temp files, if any were parsed, are removed once the whole chain
 	// has completed, whatever the outcome and including a panic unwinding it.
 	defer cleanupMultipart(r)
@@ -107,9 +114,10 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// rw.WriteHeader is a no-op once a status is recorded, so the 200 here only
 	// applies as a default when nothing set one, and rw.Write flushes the recorded
 	// status before the body.
-	if c.handled && !rw.written() && !rw.hijacked() &&
-		rw.status() != http.StatusSwitchingProtocols {
-		rw.Header().Set(contentType, c.contentType)
+	if c.handled && !rw.written() && !rw.hijacked() && bodyAllowedForStatus(rw.status()) {
+		if rh.t.NumOut() == 0 || c.contentType != rh.contentType {
+			rw.Header().Set(contentType, c.contentType)
+		}
 		if !rw.headed() {
 			rw.WriteHeader(http.StatusOK)
 		}
