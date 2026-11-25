@@ -13,16 +13,16 @@ import (
 	"strconv"
 )
 
-// buildDWARFIndex recovers parameter names from the running binary's own DWARF
+// buildDWARFIndex recovers parameter names from the running binary own DWARF
 // debug information, keyed by the source position the runtime reports for each
 // function ("<file>:<line>").
 //
 // This is the production half of name binding. The Go compiler discards parameter
-// names from the runtime type metadata that reflect exposes. It still emits them
-// into the binary's DWARF section by default, and -trimpath does not strip that
+// names from the runtime type metadata. It still emits them
+// into the binary DWARF section by default, and -trimpath does not strip that
 // section. So even a sourceless production binary — a multi-stage image, a bare
-// executable — carries every function's parameter names. The section also records
-// each declaration's file and line, so a handler is matched to its DWARF entry by
+// executable — carries every function parameter names. The section also records
+// each declaration file and line, so a handler is matched to its DWARF entry by
 // the SAME position key the disk parser uses. Position keys also resolve closures
 // and func literals, and are immune to the merging and renaming of identical
 // literals introduced in Go 1.27.
@@ -33,9 +33,9 @@ import (
 // startup for a handler that binds by name, pointing the user at struct binding
 // instead.
 //
-// DWARF lists a function's formal parameters in source order: the inputs first,
+// DWARF lists a function formal parameters in source order: the inputs first,
 // then pseudo-parameters for the results (`~r0`, ...) and, for methods, the
-// receiver (`~p0`). The caller slices the list to the handler's NumIn. That keeps
+// receiver (`~p0`). The caller slices the list to the handler NumIn. That keeps
 // exactly the input names and drops the trailing result pseudo-parameters.
 func buildDWARFIndex() map[string][]string {
 	exe, err := os.Executable()
@@ -53,7 +53,7 @@ func buildDWARFIndex() map[string][]string {
 
 	// The DWARF reader is a flat pre-order walk: a subprogram is followed by its
 	// formal parameters, then the next subprogram. We accumulate parameters into
-	// the most recent subprogram's key and flush on each new subprogram/unit, so
+	// the most recent subprogram key and flush on each new subprogram/unit, so
 	// every entry is processed exactly once (reading children by lookahead would
 	// consume and lose the following sibling).
 	var (
@@ -76,7 +76,7 @@ func buildDWARFIndex() map[string][]string {
 		switch entry.Tag {
 		case dwarf.TagCompileUnit:
 			flush()
-			// DeclFile on a subprogram is a 1-based index into its unit's line-table
+			// DeclFile on a subprogram is a 1-based index into its unit line-table
 			// file list, so the list must be refreshed per compile unit.
 			if lr, lErr := data.LineReader(entry); lErr == nil && lr != nil {
 				files = lr.Files()
@@ -111,7 +111,7 @@ func buildDWARFIndex() map[string][]string {
 					}
 				}
 				// An unnamed parameter contributes an empty string, preserving its
-				// position so the caller's slice-to-NumIn stays aligned.
+				// position so the caller slice-to-NumIn stays aligned.
 				names = append(names, name)
 			}
 		}
@@ -134,7 +134,7 @@ type dwarfFile interface {
 type dwarfOpener func(string) (dwarfFile, error)
 
 // openSelfDWARF reads the DWARF section from the executable at path, trying each
-// platform's format. The debug sections are loaded into memory by the call, so
+// platform format. The debug sections are loaded into memory by the call, so
 // closing the file afterward is safe. It returns nil for an unknown format, for a
 // binary with no DWARF (e.g. built with -w / -s), or when the DWARF data cannot
 // be read — none of these leave a usable result behind.
@@ -147,12 +147,14 @@ func openSelfDWARF(path string) *dwarf.Data {
 	for _, open := range openers {
 		f, err := open(path)
 		if err != nil {
-			continue // not this container format
+			// The file uses a different container format.
+			continue
 		}
 		data, dErr := f.DWARF()
 		_ = f.Close()
 		if dErr != nil {
-			return nil // right format, no readable DWARF: nothing left to try
+			// The container matched but has no readable DWARF data.
+			return nil
 		}
 		return data
 	}

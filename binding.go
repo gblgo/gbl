@@ -103,7 +103,7 @@ const (
 	classFiles
 	// *Context, injected directly
 	classContext
-	// gbl.SSEWriter, injected as the request's event stream
+	// gbl.SSEWriter, injected as the request event stream
 	classSSE
 )
 
@@ -178,7 +178,7 @@ func releaseParams(bufPool *[]reflect.Value, params []reflect.Value) {
 // handler parameter name. A struct — or any pointer chain leading to one — names
 // its values by field, which reflection supplies even when the source file is
 // unavailable at runtime; every other kind (scalar, slice, map, interface and
-// pointer to those) is matched against the request by the parameter's own name.
+// pointer to those) is matched against the request by the parameter name.
 func selfDescribing(t reflect.Type) bool {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
@@ -186,7 +186,7 @@ func selfDescribing(t reflect.Type) bool {
 	return t.Kind() == reflect.Struct
 }
 
-// classifyParam decides a parameter's binding class once, at route-generation
+// classifyParam decides a parameter binding class once, at route-generation
 // time. It mirrors the old per-request isSpecialParameter checks but runs the
 // costlier interface-satisfaction probe (t.Implements) only during startup.
 func classifyParam(t reflect.Type) paramClass {
@@ -211,7 +211,7 @@ func classifyParam(t reflect.Type) paramClass {
 }
 
 // buildBindPlan turns a handler signature into its immutable binding blueprint.
-// It records each parameter's type and class, collects the business-parameter
+// It records each parameter type and class, collects the business-parameter
 // indexes, caches the top-level fields of struct parameters, and flags whether
 // any parameter forces the request body/query to be parsed.
 func buildBindPlan(rt reflect.Type) bindPlan {
@@ -314,12 +314,11 @@ func prewarmNestedStructs(t reflect.Type, visited map[reflect.Type]bool) {
 	}
 }
 
-// structFieldsCache memorizes field lists per struct type, so nested structs
-// (bound via bindStruct at request time) skip reflection introspection just
-// like top-level parameters. Concurrent first computes may both run; LoadOrStore
-// keeps the first slice so every caller shares one instance. The duplicate
-// compute is harmless and rare.
-var structFieldsCache sync.Map // reflect.Type -> []structField
+// structFieldsCache stores field lists per struct type so nested structs bound
+// through bindStruct skip request-time reflection introspection. Concurrent first
+// computations may both run; LoadOrStore keeps the first slice. The duplicate
+// computation is harmless and rare.
+var structFieldsCache sync.Map
 
 // structFieldsOf returns the cached bindable-field list of a struct type.
 func structFieldsOf(t reflect.Type) []structField {
@@ -332,7 +331,7 @@ func structFieldsOf(t reflect.Type) []structField {
 }
 
 // lowerFirst lowercases the first rune of s, leaving the rest verbatim. It
-// bridges an exported struct field's PascalCase name (Name) to the lowercase
+// bridges an exported struct field PascalCase name (Name) to the lowercase
 // key clients usually send (name), so no JSON tag is needed. Request keys are
 // matched exactly and never transformed.
 func lowerFirst(s string) string {
@@ -346,10 +345,10 @@ func lowerFirst(s string) string {
 	return s
 }
 
-// computeStructFields lists a struct type's exported fields in declaration
+// computeStructFields lists a struct type exported fields in declaration
 // order. Every exported field of a freshly allocated value is settable, so the
 // per-request CanSet/PkgPath checks in bindStruct collapse to this cached slice.
-// The bind key is the JSON tag's name when present, else the Go field name with
+// The bind key is the JSON tag name when present, else the Go field name with
 // its first letter lowercased — so a lowercase request key binds to an exported
 // PascalCase field without a tag. `json:"-"` drops the field entirely.
 func computeStructFields(t reflect.Type) []structField {
@@ -358,14 +357,14 @@ func computeStructFields(t reflect.Type) []structField {
 	for i := range n {
 		field := t.Field(i)
 		if field.PkgPath != empty {
-			continue // unexported
+			continue
 		}
 		name := lowerFirst(field.Name)
 		if tag, ok := field.Tag.Lookup("json"); ok {
 			if tag == "-" {
 				continue
 			}
-			// `json:"-,"` names the field "-" rather than skipping it.
+			// A trailing comma makes the dash a literal field name.
 			if tagName, _, _ := strings.Cut(tag, ","); tagName != "" {
 				name = tagName
 			}
@@ -651,21 +650,27 @@ func isJSONMediaType(mediaType string) bool {
 // field names are pre-lowercased at registration so clients can send lowercase
 // keys without tags; the request data itself is never transformed.
 type nameSources struct {
-	path  map[string]string
-	form  url.Values
+	// path holds matched path parameters
+	path map[string]string
+	// form holds query and body form values
+	form url.Values
+	// files holds multipart file headers by field name
 	files filesMap
 }
 
+// pathGet looks up an exact path-parameter name.
 func (s *nameSources) pathGet(name string) (string, bool) {
 	v, ok := s.path[name]
 	return v, ok
 }
 
+// formGet looks up an exact query or form key.
 func (s *nameSources) formGet(name string) ([]string, bool) {
 	v, ok := s.form[name]
 	return v, ok
 }
 
+// filesGet looks up an exact multipart field name.
 func (s *nameSources) filesGet(name string) ([]*multipart.FileHeader, bool) {
 	v, ok := s.files[name]
 	return v, ok
@@ -715,7 +720,7 @@ func bindFormParameter(t reflect.Type, name string, src *nameSources) (reflect.V
 	values, _ := src.formGet(name)
 	switch t.Kind() {
 	case reflect.Array, reflect.Slice:
-		// []byte in a form field is treated as a string's raw bytes.
+		// []byte in a form field is treated as the raw bytes of a string.
 		if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 {
 			if len(values) == 0 {
 				return reflect.Zero(t), nil
@@ -749,7 +754,7 @@ func bindFormParameter(t reflect.Type, name string, src *nameSources) (reflect.V
 }
 
 // bindStruct fills an exported-field struct from form and path values, matching
-// each field's exact bind name (JSON tag, or the field name with its first
+// each field exact bind name (JSON tag, or the field name with its first
 // letter lowercased). The field list is cached per type, so nested structs cost
 // no per-request reflection introspection either.
 func bindStruct(t reflect.Type, src *nameSources) (reflect.Value, error) {

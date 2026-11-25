@@ -29,14 +29,14 @@ const (
 	responseSerializationFailed = "response serialization failed"
 )
 
-// routeEndpoint is the terminal link appended to every route's chain. It is a
+// routeEndpoint is the terminal link appended to every route chain. It is a
 // shared, stateless function because the concrete handler is read from the
 // per-request Context rather than captured here.
 var routeEndpoint HandlerFunc = func(c *Context) { c.invokeHandler() }
 
 // Context is the single handle threaded through the middleware chain and, when a
 // handler declares it, injected as a parameter. It carries the request, the
-// response writer, the matched route's path parameters and a key/value bag that
+// response writer, the matched route path parameters and a key/value bag that
 // middleware use to hand data to later links and to the handler.
 //
 // A Context is pooled. It must not be retained past the request that produced
@@ -45,18 +45,18 @@ var routeEndpoint HandlerFunc = func(c *Context) { c.invokeHandler() }
 // Field order is optimized for memory alignment: larger fields (slices, interfaces)
 // come first, smaller scalars (bool, uint8) are grouped at the end to minimize padding.
 type Context struct {
-	// 24-byte fields (slice header, reflect.Value, struct with 3 maps)
-	// this route's merged chain, including the terminal endpoint
+	// 24-byte fields (slice header, reflected value, struct with 3 maps)
+	// this route merged chain, including the terminal endpoint
 	handlers []HandlerFunc
 	// serialized handler result
 	bytes []byte
-	// handler's first return, boxed lazily by Result
+	// handler first return, boxed lazily by Result
 	ret reflect.Value
 	// per-request by-name binding sources; primed in injectedParameters
 	src nameSources
 
 	// 16-byte fields (interface = type + data pointer, string = pointer + len)
-	// writer is the framework's pooled response sink. It stays unexported:
+	// writer is the framework pooled response sink. It stays unexported:
 	// handlers own the response by declaring an http.ResponseWriter parameter,
 	// and it must never be stored beyond the request.
 	writer responseWriter
@@ -172,15 +172,15 @@ func (c *Context) Abort() {
 // Aborted reports whether the chain has been stopped.
 func (c *Context) Aborted() bool { return c.index >= abortIndex }
 
-// IsWritten reports whether a response body has already been committed, letting
-// a post-handler middleware decide whether to override the default rendering.
+// IsWritten reports whether Write has been called, including a zero-length write,
+// letting post-handler middleware decide whether to override the default rendering.
 func (c *Context) IsWritten() bool { return c.writer.written() }
 
 // StatusCode reports the status that will be, or was, sent for this response:
-// the recorded one once anything has set it, otherwise net/http's 200 default.
+// the recorded one once anything has set it, otherwise net/http 200 default.
 // Because the staged body is committed only after the whole chain unwinds, this
 // prediction is what lets an access-log or metrics middleware read the effective
-// status from c.Next()'s return point.
+// status from c.Next() return point.
 func (c *Context) StatusCode() int { return c.writer.status() }
 
 // Size reports the effective response body length: the bytes already written,
@@ -225,7 +225,7 @@ func (c *Context) Set(key string, value any) {
 
 // Get returns a value set earlier, typed by the caller: the type argument
 // asserts the stored value, and a miss (absent key or different type) yields
-// T's zero value and false, so the caller decides how to handle it. Get[any]
+// T zero value and false, so the caller decides how to handle it. Get[any]
 // reads the value without asserting. For the value alone, see Value.
 func (c *Context) Get[T any](key string) (T, bool) {
 	var zero T
@@ -250,7 +250,7 @@ func (c *Context) Value[T any](key string) T {
 	return value
 }
 
-// Result returns the matched handler's boxed return value, or nil when the
+// Result returns the matched handler boxed return value, or nil when the
 // handler produced none. The value is boxed on the first call and memoized, so a
 // request whose middleware never reads Result pays no interface allocation. It
 // is valid only after c.Next() has run the handler.
@@ -288,8 +288,8 @@ func (c *Context) AbortWithStatusJSON(status int, body any) {
 func Use(middleware ...HandlerFunc) { defaultEngine.use(middleware...) }
 
 // use appends middleware that run for every route on this engine. They are
-// combined with each route group's middleware at route-generation time, the
-// engine's running outermost. Register all middleware before Run; calling Use
+// combined with each route group middleware at route-generation time, the
+// engine running outermost. Register all middleware before Run; calling Use
 // afterward panics, because every route chain is already frozen.
 func (e *engine) use(middleware ...HandlerFunc) {
 	e.assertAssembling("Use")
@@ -347,7 +347,7 @@ func (c *Context) invokeHandler() {
 		defer releaseParams(paramsBuf, in)
 		if err = injectedParameters(c, form, files, body, isJSON, in); err != nil {
 			// Binding errors are assembled from reflection internals (parameter
-			// names, Go type strings, strconv detail), so only a generic 400 is
+			// names, Go type strings, numeric parsing detail), so only a generic 400 is
 			// returned and the detail stays in the server log.
 			c.logger.Error("request binding failed", "error", err)
 			abort(http.StatusBadRequest, http.StatusText(http.StatusBadRequest))

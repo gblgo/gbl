@@ -10,7 +10,7 @@ import (
 	"sync"
 )
 
-// routeNode is one segment in a method's routing tree. A path is matched by
+// routeNode is one segment in a method routing tree. A path is matched by
 // walking segments from the root; the node where the last segment lands either
 // terminates in a handler (exist) or is only a waypoint on a longer route.
 type routeNode struct {
@@ -33,9 +33,12 @@ type routeNode struct {
 // segmentMeta is one parsed segment of a registration path: its text, whether
 // it is a variable, and the parameter name to bind when it is.
 type segmentMeta struct {
-	segment   string
+	// segment is the literal or variable segment text
+	segment string
+	// paramName is the binding name for a variable segment
 	paramName string
-	isVar     bool
+	// isVar distinguishes parameters from literal segments
+	isVar bool
 }
 
 // newNode builds an empty, non-terminal node for segment, ready to receive children.
@@ -50,7 +53,7 @@ func newNode(segment string) *routeNode {
 }
 
 // hasSameRoute reports whether segments[index:] already terminates on an
-// existing route beneath node, returning that route's full path. It is the
+// existing route beneath node, returning that route full path. It is the
 // conflict probe used before inserting a new variable node: two differently
 // named variables occupying the same position would match identically, and the
 // caller rejects that.
@@ -176,8 +179,8 @@ func releaseSegments(bufPool *[]string, segments []string) {
 }
 
 // splitPathInto appends the non-empty "/"-separated segments of path to dst and
-// returns the grown slice, reusing dst's backing array. Segments are substrings
-// sharing path's storage, so unlike strings.Split this copies nothing.
+// returns the grown slice, reusing dst backing array. Segments are substrings
+// sharing path storage, so unlike strings.Split this copies nothing.
 func splitPathInto(dst []string, path string) []string {
 	for {
 		for len(path) > 0 && path[0] == '/' {
@@ -287,7 +290,7 @@ func (e *engine) allowFor(path string) []string {
 
 // searchNode recursively matches segments[index:] starting at root, preferring
 // a static child over a variable one at every level. When it commits to a
-// variable branch it records the segment under that node's parameter name and,
+// variable branch it records the segment under that node parameter name and,
 // if the branch later proves dead, deletes it again so a failed search leaves
 // no stray params behind.
 func searchNode(root *routeNode, segments []string, index int,

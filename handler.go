@@ -48,7 +48,7 @@ func releasePathParams(params map[string]string) {
 }
 
 // serveHTTP is the full request pipeline: method check, route match, HEAD
-// fallback to GET, then the route's frozen middleware chain, whose terminal
+// fallback to GET, then the frozen route middleware chain, whose terminal
 // endpoint runs the business handler; finally the staged result is written.
 // Any panic raised below is recovered and rendered by the deferred
 // catchRuntimePanic.
@@ -157,7 +157,7 @@ func (e *engine) abortUnmatched(rw *pooledResponseWriter, method httpMethod, pat
 }
 
 // writeRequestError maps a request-parsing failure to its status code and
-// aborts the pipeline. Every error reaching here describes the client's own
+// aborts the pipeline. Every error reaching here describes the client own
 // malformed request (bad Content-Type, unparseable body, oversize payload), so
 // its message is safe to send back.
 func writeRequestError(err error) {

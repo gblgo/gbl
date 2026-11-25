@@ -42,7 +42,7 @@ func isGoIdentifier(s string) bool {
 type httpMethod uint8
 
 // Constants used only by this file: the wire spelling of each method, shared
-// between the names table and methodOf's switch so a new verb is written once,
+// between the names table and methodOf switch so a new verb is written once,
 // and the path parameter braces.
 const (
 	// wire spelling of GET, shared by the names table and methodOf
@@ -116,11 +116,12 @@ func (m httpMethod) isBodyMethod() bool {
 // the precomputed bind plan and the frozen middleware chain. Built once in
 // generateRoute and reused verbatim by every matching request.
 type routeHandler struct {
-	// 24-byte fields (reflect.Value, slices)
-	v          reflect.Value
+	// 24-byte fields (reflected value, slices)
+	v reflect.Value
+	// paramNames is parallel to the handler parameter list
 	paramNames []string
-	// this route's frozen request chain: the engine's global middleware,
-	// then the route group's, then the terminal routeEndpoint. It is
+	// this route frozen request chain: the engine global middleware,
+	// then the route group, then the terminal routeEndpoint. It is
 	// assembled once at startup and reused verbatim by every request.
 	handlers []HandlerFunc
 
@@ -166,7 +167,8 @@ func (e *engine) dealPath(path string) ([]segmentMeta, string) {
 		meta := segmentMeta{segment: part, isVar: false}
 		if strings.Contains(part, colon) {
 			if len(part) == 1 || strings.LastIndex(part, colon) != 0 {
-				e.failStartup("when registering a route, the path cannot be '/:' or '/:***:***:' or '/::', etc")
+				e.failStartup("when registering a route, the path cannot be '/:' " +
+					"or '/:***:***:' or '/::', etc")
 			}
 			meta.isVar = true
 			meta.paramName = part[1:]
@@ -226,7 +228,7 @@ const (
 // the handler, chooses a response content type from its return kind, builds the
 // bind plan and recovers parameter names (aborting at startup if name-based
 // binding would be unreliable), freezes the request middleware chain, and
-// inserts the route into the method's tree. It runs once, at startup, then
+// inserts the route into the method tree. It runs once, at startup, then
 // releases the registration queue and AST cache.
 func (e *engine) generateRoute() {
 	for _, meta := range e.routeMetaSlice {
@@ -383,9 +385,9 @@ func (e *engine) generateRoute() {
 	e.generated = true
 }
 
-// resolveParamNames recovers a handler's parameter names from its own source file.
+// resolveParamNames recovers handler parameter names from the source file.
 //
-// The reflection package reports a function's parameter types but never its
+// The reflection package reports a function parameter types but never its
 // parameter names, and
 // GBL binds request values by name, so the source recorded in the binary is parsed
 // once per file at startup. The handler is located by SOURCE POSITION, the line
@@ -402,7 +404,7 @@ func (e *engine) generateRoute() {
 // value.
 //
 // The second return reports whether real names were recovered. The caller acts
-// on it: a handler whose binding needs names first falls back to the binary's
+// on it: a handler whose binding needs names first falls back to the binary
 // DWARF, and only aborts startup (failStartup) if that is missing too, while a
 // self-describing binding (a lone struct, whose fields come from reflection)
 // falls back to positional placeholders and continues.
@@ -446,15 +448,15 @@ func (e *engine) resolveParamNames(v reflect.Value) ([]string, bool) {
 	return paramNames, true
 }
 
-// lookupParamNamesDWARF recovers a handler's parameter names from the binary's
-// own DWARF debug info, when the source on disk is unavailable.
+// lookupParamNamesDWARF recovers handler parameter names from DWARF debug info
+// in the binary when the source on disk is unavailable.
 //
 // It is the production half of name binding: a sourceless image (multi-stage
 // build, -trimpath, bare binary) has no .go file to parse, but the compiler still
 // emits parameter names into DWARF by default. The index is keyed by the SAME
 // source position the runtime reports — "<file>:<line>" — so lookup needs no
 // symbol name and resolves closures and func literals exactly as the disk path
-// does. Position keys are also immune to Go 1.27's merging and renaming of
+// does. Position keys are also immune to Go 1.27 merging and renaming of
 // identical function literals, which makes symbol-keyed lookups unsafe.
 //
 // The index is built lazily on the first handler that misses on disk and cached

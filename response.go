@@ -13,7 +13,7 @@ import (
 	"sync"
 )
 
-// This file holds response serialization: rendering a handler's return value
+// This file holds response serialization: rendering a handler return value
 // into the bytes the pipeline writes. The pooled writer itself lives in
 // responseWriter.go; the dispatch that stages this result lives in handler.go.
 

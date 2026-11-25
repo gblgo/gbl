@@ -16,7 +16,7 @@ import (
 // the server is live, and the build-info keys that resolve the version.
 const (
 	// bannerArt is the startup logo, a small fixed mark rendered once at Run.
-	// The raw string's backticks preserve the alignment byte-for-byte, so the
+	// The raw string backticks preserve the alignment byte-for-byte, so the
 	// box-drawing art stays intact without any escaping.
 	bannerArt = `  ┏━╸  ┏┓   ╻
   ┃╺┓  ┣┻┓  ┃
@@ -24,7 +24,7 @@ const (
 
 	// startupSuccessMessage is the one-line confirmation emitted right after
 	// the banner block. Unlike the art it is an ordinary Info record, so it
-	// carries the Logger's timestamp and level (and console tint) as an
+	// carries the Logger timestamp and level (and console tint) as an
 	// explicit "we are live" event.
 	startupSuccessMessage = "started successfully, ready to accept requests"
 
@@ -36,12 +36,12 @@ const (
 	versionDevel = "(devel)"
 )
 
-// printBanner emits the startup banner through the engine's Logger so a
+// printBanner emits the startup banner through the engine Logger so a
 // redirected or structured sink captures startup like any other event. The whole
 // block (logo plus status table) goes out verbatim: through BannerLogger when
 // present, otherwise as a single Info record, so no timestamp or level label
 // crowds the art. A one-line startupSuccessMessage Info record follows the block,
-// and that line does carry the Logger's timestamp and level like any event.
+// and that line does carry the Logger timestamp and level like any event.
 func (e *engine) printBanner(cfg *Config, addr net.Addr) {
 	block := e.renderBanner(cfg, addr)
 	if bl, ok := e.logger.(BannerLogger); ok {
@@ -89,7 +89,7 @@ func bannerVersion() string {
 
 // frameworkVersion extracts the version of gbl from build info. When gbl is the
 // main module (its own examples and tests), it reads Main.Version. When gbl is a
-// dependency of the consumer's app, it reads the gbl entry in Deps, which carries
+// dependency of the consumer app, it reads the gbl entry in Deps, which carries
 // the tagged version that app requires. A local or replaced build has no tag,
 // so it yields "(devel)".
 func frameworkVersion(info *debug.BuildInfo) string {

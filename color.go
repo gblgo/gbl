@@ -26,7 +26,7 @@ const (
 	ansiYellow = "\x1b[33m"
 
 	// maxLevelScanTokens bounds the level-label scan. logLine always puts the
-	// label first, and the standard logger's optional header precedes it with
+	// label first, and the standard logger optional header precedes it with
 	// at most date, time and file:line tokens. Stopping early also keeps an
 	// incidental all-caps word in a message body from ever reaching the tint
 	// lookup.
@@ -42,7 +42,7 @@ var levelColor = map[string]string{
 }
 
 // findLevel locates the level label: the first whitespace-delimited token that
-// names a known level. It returns the label's byte range and its tint, and
+// names a known level. It returns the label byte range and its tint, and
 // reports false when the line carries none — a label-less line is a foreign
 // write (the startup banner, for example) and must pass through untouched.
 func findLevel(p []byte) (start, end int, ansi string, found bool) {
@@ -77,13 +77,15 @@ var colorBufPool = sync.Pool{
 // Lines that carry no level label (the startup banner, written verbatim) are
 // always passed through untouched.
 type colorWriter struct {
-	w       io.Writer
+	// w is the wrapped console destination
+	w io.Writer
+	// enabled records whether ANSI coloring is active
 	enabled bool
 }
 
 // Write tints the level label when enabled and forwards the line to the
-// underlying console. It reports the caller's original byte count so log.Logger
-// sees the whole line consumed; the extra escape bytes are this writer's own
+// underlying console. It reports the caller original byte count so log.Logger
+// sees the whole line consumed; the extra escape bytes belong to this writer.
 // business.
 func (c colorWriter) Write(p []byte) (int, error) {
 	if !c.enabled {
@@ -111,7 +113,7 @@ func (c colorWriter) Write(p []byte) (int, error) {
 }
 
 // isTerminal reports whether f is an interactive console rather than a regular
-// file or a pipe. The Stat-based check is the standard library's own idiom, so
+// file or a pipe. The Stat-based check is the standard library own idiom, so
 // it stays dependency-free across platforms.
 func isTerminal(f *os.File) bool {
 	if f == nil {
@@ -134,8 +136,8 @@ func noColorRequested() bool {
 // render ANSI, and f itself otherwise. On Windows the VT-processing mode must be
 // switched on first; if that fails the writer stays plain rather than leaking
 // raw escape codes into a console that would not interpret them. It is the
-// framework's own development aid for the default console, not an offered entry
-// point: users who integrate a logging component take that library's coloring.
+// framework own development aid for the default console, not an offered entry
+// point: users who integrate a logging component take that library coloring.
 func consoleWriter(f *os.File) io.Writer {
 	if noColorRequested() || !isTerminal(f) {
 		return f

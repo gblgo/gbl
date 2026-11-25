@@ -31,7 +31,7 @@ var (
 	requestBodyTooLargeError = errors.New("request body too large")
 	// live total request body cap, read per request
 	maxBodySize atomic.Int64
-	// live multipart in-memory threshold, read per part
+	// live multipart file-content memory threshold, read per request
 	maxFileMemory atomic.Int64
 	// live per-file upload cap, read per file
 	maxUploadFileSize atomic.Int64
@@ -49,7 +49,7 @@ const (
 	defaultMaxFileMemory = 2 << 20
 	// Hard cap on each individual uploaded file: 1 MiB.
 	defaultMaxUploadFileSize = 1 << 20
-	// largest body buffer retained by the pool
+	// largest JSON body buffer retained by the pool
 	maxPooledBodyCapacity = 1 << 20
 
 	// body type carrying form fields plus uploaded files
@@ -58,6 +58,7 @@ const (
 	xWwwFormUrlencoded = "application/x-www-form-urlencoded"
 )
 
+// init installs the default request and upload limits.
 func init() {
 	maxBodySize.Store(defaultMaxBodySize)
 	maxFileMemory.Store(defaultMaxFileMemory)
@@ -142,7 +143,7 @@ func mergeFormBodyWins(query, body url.Values) url.Values {
 }
 
 // queryValues returns the parsed URL query, or nil when the request carries no
-// query string. Returning nil avoids the empty map url.URL.Query() allocates for
+// query string. Returning nil avoids the empty map that URL query parsing allocates
 // an empty RawQuery; form lookups and mergeFormBodyWins already treat nil as "no
 // query values".
 func queryValues(r *http.Request) url.Values {
@@ -318,7 +319,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 	case mediaType == xWwwFormUrlencoded || mediaType == empty:
 		// The body is decoded directly rather than through r.ParseForm because
 		// ParseForm would parse the URL query a second time: queryValues below
-		// owns that single parse. MaxBytesReader, installed above, still caps
+		// owns that single parse. When installed above, MaxBytesReader still caps
 		// the read and surfaces its error identically.
 		var bodyValues url.Values
 		if r.Body != nil {
