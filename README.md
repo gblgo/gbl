@@ -79,8 +79,9 @@ Detailed guides are available for
 ## Handlers and binding
 
 A handler is a non-nil function with **at most one return value**. Variadic
-functions, method values and generic instantiations are not supported; wrap a
-method value in a closure when needed.
+functions, method values, method expressions and generic instantiations are not
+supported; wrap a method value or expression in a closure when needed. Name-bound
+handlers must start on distinct source lines; ambiguous positions fail startup.
 
 ### Injected parameters
 
@@ -162,11 +163,13 @@ gbl.Use(func(c *gbl.Context) {
 ```
 
 - Static routes take precedence over dynamic routes. Repeated or trailing `/`
-  separators are normalized for matching.
+  separators are normalized for matching. Overlapping dynamic patterns are
+  rejected at startup.
 - Unregistered `HEAD` reuses the matching `GET` route. Unregistered `OPTIONS`
   returns `204` with an `Allow` header.
 - `c.Next()` runs the remaining chain; code after it runs while the chain unwinds.
-- Only `Abort` stops downstream execution. Upstream post-`Next()` code still runs.
+- `Abort` and framework binding/validation errors stop downstream execution.
+  Upstream post-`Next()` code still runs.
 - Install `GroupUse` before registering routes in that group.
 
 ## SSE and raw responses
@@ -193,7 +196,8 @@ gbl.Get("/events", func(s gbl.SSEWriter) {
 
 gbl manages SSE headers, flushing, idle heartbeats, write deadlines and
 cancellation. Optional `OnError` and `OnComplete` callbacks cover stream failures
-and termination.
+and termination; they run asynchronously after the stream has terminated and its
+in-flight writes have drained.
 
 For direct HTTP control, inject `http.ResponseWriter`. Standard optional
 interfaces and `http.ResponseController` remain available. A direct `Write` or
