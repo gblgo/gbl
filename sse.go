@@ -54,9 +54,9 @@ type SSEWriter interface {
 	// retained failure. Startup failures happen before the handler runs; normal
 	// completion and cancellation do not invoke it.
 	OnError(func(error))
-	// OnComplete sets the callback invoked once after the handler exits or the
-	// stream fails and all in-flight writes drain. It runs asynchronously, including
-	// when registered late. Callbacks must not call Send.
+	// OnComplete sets the callback invoked once after the handler exits and all
+	// in-flight writes drain. Stream failures are reported by OnError. It runs
+	// asynchronously, including when registered late. Callbacks must not call Send.
 	OnComplete(func())
 }
 
@@ -145,13 +145,22 @@ func (s *sseWriter) Send(v any) error {
 	}
 	buf := responseBufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
-	_, err := convertToBuffer(buf, reflect.ValueOf(v))
-	if err != nil {
-		releaseResponseBuffer(buf)
+	defer releaseResponseBuffer(buf)
+	if err := serializeSSEValue(buf, v); err != nil {
 		return err
 	}
-	err = s.writeData(buf.Bytes())
-	releaseResponseBuffer(buf)
+	return s.writeData(buf.Bytes())
+}
+
+// serializeSSEValue contains panics from user Error and MarshalJSON methods so
+// concurrent Send calls cannot escape and terminate the process.
+func serializeSSEValue(buf *bytes.Buffer, value any) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("SSE value serialization panicked")
+		}
+	}()
+	_, err = convertToBuffer(buf, reflect.ValueOf(value))
 	return err
 }
 
@@ -339,7 +348,7 @@ func (s *sseWriter) fail(err error) error {
 	s.callbackMu.Unlock()
 
 	if started && s.logger != nil {
-		s.logger.Error("SSE stream failed", "error", err)
+		safeLog(func() { s.logger.Error("SSE stream failed", "error", err) })
 	}
 	if onError != nil {
 		go s.runCallback("error", func() { onError(err) })
@@ -375,8 +384,10 @@ func (s *sseWriter) runCallback(kind string, fn func()) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			if s.logger != nil {
-				s.logger.Error("SSE "+kind+" callback panic", "error", recovered,
-					"stack", string(debug.Stack()))
+				safeLog(func() {
+					s.logger.Error("SSE "+kind+" callback panic", "error", recovered,
+						"stack", string(debug.Stack()))
+				})
 			}
 		}
 	}()

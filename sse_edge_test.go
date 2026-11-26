@@ -297,6 +297,34 @@ func TestSSEEdgeHeartbeatLoopExitsOnFailureAndCancellation(t *testing.T) {
 	})
 }
 
+type sseEdgePanicError struct{}
+
+func (*sseEdgePanicError) Error() string { panic("error boom") }
+
+type sseEdgePanicMarshaler struct{}
+
+func (sseEdgePanicMarshaler) MarshalJSON() ([]byte, error) { panic("marshal boom") }
+
+func TestSSEEdgeSendSerializationPanicThenRecovery(t *testing.T) {
+	for _, value := range []any{&sseEdgePanicError{}, &sseEdgePanicMarshaler{}} {
+		writer, sink := sseTestNewWriter(t, time.Second, nil, nil)
+		sseTestStart(t, writer, sink)
+		if err := writer.Send(value); err == nil {
+			t.Fatalf("Send(%T) succeeded, want serialization panic error", value)
+		}
+		if cause := context.Cause(writer.ctx); cause != nil {
+			t.Fatalf("serialization panic canceled stream with %v", cause)
+		}
+		_, body, _, flushes, deadlines, _ := sink.snapshot()
+		if body != "" || flushes != 1 || deadlines != 1 {
+			t.Fatalf("serialization panic touched sink: body=%q flushes=%d deadlines=%d", body, flushes, deadlines)
+		}
+		if err := writer.Send("after panic"); err != nil {
+			t.Fatalf("Send after serialization panic: %v", err)
+		}
+	}
+}
+
 func TestSSEEdgeSendSerializationFailureThenRecovery(t *testing.T) {
 	writer, sink := sseTestNewWriter(t, time.Second, nil, nil)
 	sseTestStart(t, writer, sink)

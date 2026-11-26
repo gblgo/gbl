@@ -779,6 +779,18 @@ func TestSSECallbackPanicIsolation(t *testing.T) {
 		}
 	})
 
+	t.Run("panicking logger cannot escape callback recovery", func(t *testing.T) {
+		writer, sink := sseTestNewWriter(t, time.Second, &logTestPanicLogger{}, nil)
+		sseTestStart(t, writer, sink)
+		panicReturned := make(chan struct{})
+		writer.OnComplete(func() {
+			defer close(panicReturned)
+			panic("completion callback panic")
+		})
+		writer.complete()
+		sseTestWait(t, panicReturned, "callback recovery with a panicking logger")
+	})
+
 	t.Run("error panic does not prevent completion", func(t *testing.T) {
 		logger := newSSETestLogger()
 		writer, sink := sseTestNewWriter(t, time.Second, logger, nil)
