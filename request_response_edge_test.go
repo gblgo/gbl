@@ -530,8 +530,10 @@ func TestRequestResponseEdgeParseInputErrors(t *testing.T) {
 			name         string
 			readErr      error
 			wantTooLarge bool
+			wantClient   bool
 		}{
 			{name: "I/O error", readErr: readFailure},
+			{name: "unexpected EOF", readErr: io.ErrUnexpectedEOF, wantClient: true},
 			{name: "MaxBytes error", readErr: maxBytes, wantTooLarge: true},
 		} {
 			t.Run(mediaType+"/"+tc.name, func(t *testing.T) {
@@ -544,6 +546,11 @@ func TestRequestResponseEdgeParseInputErrors(t *testing.T) {
 				if tc.wantTooLarge {
 					if !errors.Is(err, requestBodyTooLargeError) {
 						t.Fatalf("parse error = %v, want requestBodyTooLargeError", err)
+					}
+				} else if tc.wantClient {
+					var client *requestClientError
+					if !errors.As(err, &client) {
+						t.Fatalf("parse error = %v, want client read failure", err)
 					}
 				} else {
 					var internal *requestInternalError
@@ -571,6 +578,19 @@ func TestRequestResponseEdgeParseInputErrors(t *testing.T) {
 		form, _, _, _, err := rrEdgeRunParse(t, r)
 		if err != nil || form == nil || r.PostForm == nil || r.Form == nil || len(r.PostForm) != 0 {
 			t.Fatalf("nil form parse = (%#v, %#v, %#v, %v)", form, r.PostForm, r.Form, err)
+		}
+	})
+
+	t.Run("unsupported media unexpected EOF is a client error", func(t *testing.T) {
+		body := &rrEdgeReadCloser{steps: []rrEdgeReadStep{{err: io.ErrUnexpectedEOF}}}
+		r := httptest.NewRequest(http.MethodPost, "/", nil)
+		r.Body = body
+		r.ContentLength = -1
+		r.Header.Set(contentType, "text/plain")
+		_, _, _, _, err := rrEdgeRunParse(t, r)
+		var client *requestClientError
+		if !errors.As(err, &client) {
+			t.Fatalf("parse error = %v, want client read failure", err)
 		}
 	})
 
@@ -617,6 +637,7 @@ func TestRequestResponseEdgeMultipartBranches(t *testing.T) {
 		{name: "unexpected EOF is client error", steps: []rrEdgeReadStep{{err: io.ErrUnexpectedEOF}}, wantClient: true},
 		{name: "MaxBytes read error", steps: []rrEdgeReadStep{{err: maxBytes}}, wantTooLarge: true},
 		{name: "error after complete body", steps: []rrEdgeReadStep{{data: payload, err: readFailure}}},
+		{name: "unexpected EOF after complete body", steps: []rrEdgeReadStep{{data: payload, err: io.ErrUnexpectedEOF}}, wantClient: true},
 		{name: "MaxBytes after complete body", steps: []rrEdgeReadStep{{data: payload, err: maxBytes}}, wantTooLarge: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -950,21 +971,15 @@ func TestRequestResponseEdgeParamNamesAndSourcePresence(t *testing.T) {
 }
 
 func TestRequestResponseEdgeContextPendingAndSSE(t *testing.T) {
-	t.Run("pending deferred response", func(t *testing.T) {
+	t.Run("flush commits a staged response immediately", func(t *testing.T) {
 		sink := &rrEdgeFlushWriter{rrEdgeWriter: rrEdgeNewWriter()}
-		rw := &pooledResponseWriter{w: sink, deferFlush: true}
+		rw := &pooledResponseWriter{w: sink}
 		rw.WriteHeader(http.StatusAccepted)
 		rrEdgeRun(t, func(ctx context.Context) error { return rw.FlushError() })
-		if !rw.flushPending || rw.flushed() {
-			t.Fatalf("deferred flush state = (pending=%v, flushed=%v)", rw.flushPending, rw.flushed())
-		}
-		c := &Context{writer: rw}
-		rrEdgeRun(t, func(ctx context.Context) error { c.commitPendingResponse(); return nil })
-		rrEdgeRun(t, func(ctx context.Context) error { c.commitPendingResponse(); return nil })
 		_, statuses, _, _ := sink.snapshot()
 		flushes, _ := sink.flushSnapshot()
-		if rw.flushPending || !reflect.DeepEqual(statuses, []int{http.StatusAccepted}) || flushes != 1 {
-			t.Fatalf("committed deferred response = (pending=%v, statuses=%v, flushes=%d)", rw.flushPending, statuses, flushes)
+		if !rw.flushed() || !reflect.DeepEqual(statuses, []int{http.StatusAccepted}) || flushes != 1 {
+			t.Fatalf("flushed response = (flushed=%v, statuses=%v, flushes=%d)", rw.flushed(), statuses, flushes)
 		}
 	})
 
@@ -1072,33 +1087,21 @@ func TestRequestResponseEdgeResponseWriterCapabilities(t *testing.T) {
 		}
 	})
 
-	t.Run("deferred flush and ignored underlying error", func(t *testing.T) {
-		sink := &rrEdgeFlushWriter{rrEdgeWriter: rrEdgeNewWriter(), flushErr: errors.New("flush failed")}
-		rw := &pooledResponseWriter{w: sink, deferFlush: true}
+	t.Run("flush preserves the staged status and returns the underlying error", func(t *testing.T) {
+		flushErr := errors.New("flush failed")
+		sink := &rrEdgeFlushWriter{rrEdgeWriter: rrEdgeNewWriter(), flushErr: flushErr}
+		rw := &pooledResponseWriter{w: sink}
 		rw.WriteHeader(http.StatusCreated)
-		rrEdgeRun(t, func(ctx context.Context) error { return rw.FlushError() })
+		rrEdgeRun(t, func(ctx context.Context) error {
+			if err := rw.FlushError(); !errors.Is(err, flushErr) {
+				return fmt.Errorf("FlushError() = %v, want %v", err, flushErr)
+			}
+			return nil
+		})
 		_, statuses, _, _ := sink.snapshot()
 		flushes, _ := sink.flushSnapshot()
-		if !rw.flushPending || len(statuses) != 0 || flushes != 0 {
-			t.Fatalf("deferred state = (pending=%v, statuses=%v, flushes=%d)", rw.flushPending, statuses, flushes)
-		}
-		rrEdgeRun(t, func(ctx context.Context) error { rw.commitDeferredFlush(); return nil })
-		rrEdgeRun(t, func(ctx context.Context) error { rw.commitDeferredFlush(); return nil })
-		_, statuses, _, _ = sink.snapshot()
-		flushes, _ = sink.flushSnapshot()
-		if rw.flushPending || !reflect.DeepEqual(statuses, []int{http.StatusCreated}) || flushes != 1 {
-			t.Fatalf("committed state = (pending=%v, statuses=%v, flushes=%d)", rw.flushPending, statuses, flushes)
-		}
-	})
-
-	t.Run("pending flush discarded after hijack", func(t *testing.T) {
-		sink := &rrEdgeFlushWriter{rrEdgeWriter: rrEdgeNewWriter()}
-		rw := &pooledResponseWriter{w: sink, flushPending: true, hijackedStatus: true}
-		rrEdgeRun(t, func(ctx context.Context) error { rw.commitDeferredFlush(); return nil })
-		_, statuses, _, _ := sink.snapshot()
-		flushes, _ := sink.flushSnapshot()
-		if rw.flushPending || len(statuses) != 0 || flushes != 0 {
-			t.Fatalf("hijacked deferred flush = (pending=%v, statuses=%v, flushes=%d)", rw.flushPending, statuses, flushes)
+		if !rw.flushed() || !reflect.DeepEqual(statuses, []int{http.StatusCreated}) || flushes != 1 {
+			t.Fatalf("flushed state = (flushed=%v, statuses=%v, flushes=%d)", rw.flushed(), statuses, flushes)
 		}
 	})
 

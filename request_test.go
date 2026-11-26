@@ -106,7 +106,6 @@ func requestTestEngine(t *testing.T, method, path string, fn any, names []string
 	} else {
 		e.insertNode(segments, normalized, m, rh)
 	}
-	e.generated = true
 	return e
 }
 
@@ -304,9 +303,9 @@ func TestRequestMultipartFormAndPostForm(t *testing.T) {
 }
 
 func TestRequestFormMapsDoNotAliasWithoutQuery(t *testing.T) {
-	r := httptest.NewRequest(http.MethodPost, "/form", strings.NewReader("name=body"))
+	r := httptest.NewRequest(http.MethodPost, "/form", strings.NewReader("name=body&tag=a&tag=b"))
 	r.Header.Set(contentType, xWwwFormUrlencoded)
-	_, _, _, _, err := requestTestParse(t, r, []string{"name"})
+	_, _, _, _, err := requestTestParse(t, r, []string{"name", "tag"})
 	if err != nil {
 		t.Fatalf("parse urlencoded body: %v", err)
 	}
@@ -320,6 +319,14 @@ func TestRequestFormMapsDoNotAliasWithoutQuery(t *testing.T) {
 	r.PostForm.Set("postOnly", "value")
 	if got := r.Form.Get("postOnly"); got != "" {
 		t.Fatalf("mutating Request.PostForm changed Request.Form to %q; maps must not alias", got)
+	}
+	r.Form["tag"][0] = "form"
+	if got := r.PostForm["tag"][0]; got != "a" {
+		t.Fatalf("mutating Request.Form value slice changed Request.PostForm to %q", got)
+	}
+	r.PostForm["tag"][1] = "post"
+	if got := r.Form["tag"][1]; got != "b" {
+		t.Fatalf("mutating Request.PostForm value slice changed Request.Form to %q", got)
 	}
 }
 

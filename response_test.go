@@ -264,6 +264,10 @@ func (responseTestBadJSON) MarshalJSON() ([]byte, error) {
 	return nil, errors.New("ctxTest JSON secret")
 }
 
+type responseTestPanicJSON struct{}
+
+func (responseTestPanicJSON) MarshalJSON() ([]byte, error) { panic("payload marshal boom") }
+
 func responseTestNewEngine(t *testing.T) *engine {
 	t.Helper()
 	e := newEngine()
@@ -702,35 +706,25 @@ func TestResponsePipelineNoReturnPreservesContentType(t *testing.T) {
 	responseTestCheckResponse(t, rec, http.StatusCreated, "", "application/x-responseTest")
 }
 
-func TestResponsePipelineInterfaceResultFlushUsesRuntimeMediaType(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		value     any
-		body      string
-		mediaType string
-	}{
-		{name: "string", value: "plain", body: "plain", mediaType: textPlainCharset},
-		{name: "struct", value: responseTestPayload{Name: "alpha", Count: 2}, body: `{"name":"alpha","count":2}`, mediaType: applicationJsonCharset},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			e := responseTestNewEngine(t)
-			e.use(func(c *Context) {
-				c.Next()
-				if err := http.NewResponseController(c.writer).Flush(); err != nil {
-					panic(err)
-				}
-			})
-			e.register(methodGet, "/responseTest", func() any { return tc.value })
-			e.generateRoute()
-			rec, escaped := responseTestServe(t, e, http.MethodGet, "/responseTest", "", "")
-			if escaped != nil {
-				t.Fatalf("pipeline leaked a panic: %v", escaped)
-			}
-			responseTestCheckResponse(t, rec, http.StatusOK, tc.body, tc.mediaType)
-			if !rec.Flushed {
-				t.Fatal("response was not flushed")
-			}
-		})
+func TestResponsePipelineInterfaceResultFlushCommitsImmediately(t *testing.T) {
+	e := responseTestNewEngine(t)
+	sink := &responseTestFlushWriter{responseTestWriter: responseTestNewWriter()}
+	e.register(methodGet, "/responseTest", func(w http.ResponseWriter) any {
+		w.(http.Flusher).Flush()
+		if sink.flushCalls != 1 {
+			t.Errorf("Flush() did not commit before the handler returned: calls=%d", sink.flushCalls)
+		}
+		return "plain"
+	})
+	e.generateRoute()
+
+	req := httptest.NewRequest(http.MethodGet, "/responseTest", nil)
+	e.ServeHTTP(sink, req)
+	if sink.finalStatus != http.StatusOK || sink.body.String() != "plain" {
+		t.Fatalf("response = (%d, %q), want (200, plain)", sink.finalStatus, sink.body.String())
+	}
+	if got := sink.header.Get(contentType); got != applicationJsonCharset {
+		t.Fatalf("Content-Type after immediate flush = %q, want provisional %q", got, applicationJsonCharset)
 	}
 }
 
@@ -842,8 +836,8 @@ func TestResponseWriterForbiddenBodies(t *testing.T) {
 			if n != 0 || !errors.Is(err, http.ErrBodyNotAllowed) {
 				t.Fatalf("Write = (%d, %v), want (0, ErrBodyNotAllowed)", n, err)
 			}
-			if !rw.written() || !rw.flushed() || rw.size() != 0 || sink.body.Len() != 0 {
-				t.Fatalf("forbidden write state = (%v, %v, %d, %q)", rw.written(), rw.flushed(), rw.size(), sink.body.String())
+			if !rw.written() || !rw.flushed() || rw.size() != 0 || sink.body.Len() != 0 || sink.writeCalls != 0 {
+				t.Fatalf("forbidden write state = (%v, %v, %d, %q, calls=%d)", rw.written(), rw.flushed(), rw.size(), sink.body.String(), sink.writeCalls)
 			}
 			if rw.status() != status {
 				t.Fatalf("status = %d, want %d", rw.status(), status)
@@ -1446,6 +1440,74 @@ func TestResponseCatchRuntimePanicAfterCommitOnlyLogs(t *testing.T) {
 				t.Fatalf("log entries = %+v", entries)
 			}
 		})
+	}
+}
+
+func TestResponseRecoveredPanicSurvivesLoggerPanic(t *testing.T) {
+	e := responseTestNewEngine(t)
+	e.logger = &logTestPanicLogger{}
+	sink := responseTestNewWriter()
+	rw := &pooledResponseWriter{w: sink}
+	escaped := responseTestCatchPanic(e, rw, func() { panic("original panic") })
+	if escaped != nil {
+		t.Fatalf("recovery leaked a panic: %v", escaped)
+	}
+	if rw.status() != http.StatusInternalServerError || sink.body.String() != http.StatusText(http.StatusInternalServerError) {
+		t.Fatalf("response = (%d, %q), want generic 500", rw.status(), sink.body.String())
+	}
+}
+
+func TestResponsePanicProcessorPanicIsContained(t *testing.T) {
+	e := responseTestNewEngine(t)
+	e.setLogger(&responseTestLogger{})
+	e.setPanicProcessor(func(any) (any, HttpStatus) { panic("processor boom") })
+	sink := responseTestNewWriter()
+	rw := &pooledResponseWriter{w: sink}
+	escaped := responseTestCatchPanic(e, rw, func() { panic("original panic") })
+	if escaped != nil {
+		t.Fatalf("processor panic escaped: %v", escaped)
+	}
+	if rw.status() != http.StatusInternalServerError || sink.body.String() != http.StatusText(http.StatusInternalServerError) {
+		t.Fatalf("response = (%d, %q), want generic 500", rw.status(), sink.body.String())
+	}
+}
+
+func TestResponsePanicProcessorPayloadPanicIsContained(t *testing.T) {
+	e := responseTestNewEngine(t)
+	e.setLogger(&responseTestLogger{})
+	e.setPanicProcessor(func(any) (any, HttpStatus) {
+		return responseTestPanicJSON{}, HttpStatus(http.StatusBadRequest)
+	})
+	sink := responseTestNewWriter()
+	rw := &pooledResponseWriter{w: sink}
+	escaped := responseTestCatchPanic(e, rw, func() { panic("original panic") })
+	if escaped != nil {
+		t.Fatalf("payload rendering panic escaped: %v", escaped)
+	}
+	if rw.status() != http.StatusInternalServerError || sink.body.String() != http.StatusText(http.StatusInternalServerError) {
+		t.Fatalf("response = (%d, %q), want generic 500", rw.status(), sink.body.String())
+	}
+}
+
+func TestResponsePipelineAbortAfterNextSuppressesStagedResult(t *testing.T) {
+	e := responseTestNewEngine(t)
+	var result any
+	e.use(func(c *Context) {
+		c.Next()
+		result = c.Result()
+		c.Abort()
+	})
+	e.register(methodGet, "/responseTest", func() string { return "staged" })
+	e.generateRoute()
+	rec, escaped := responseTestServe(t, e, http.MethodGet, "/responseTest", "", "")
+	if escaped != nil {
+		t.Fatalf("pipeline leaked a panic: %v", escaped)
+	}
+	if result != "staged" {
+		t.Fatalf("Result() = %#v, want staged", result)
+	}
+	if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
+		t.Fatalf("response = (%d, %q), want empty 200", rec.Code, rec.Body.String())
 	}
 }
 

@@ -6,6 +6,7 @@ package gbl
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
 	"runtime/debug"
@@ -88,6 +89,8 @@ func errorWritebackDepth(err any, depth int) ([]byte, string) {
 			if value.IsNil() {
 				return []byte(empty), textPlainCharset
 			}
+		default:
+			// Other kinds cannot be nil.
 		}
 		return []byte(safeErrorMessage(e)), textPlainCharset
 	}
@@ -157,34 +160,21 @@ func (e *engine) writeResponseAbort(rw responseWriter, halt responseAbort) {
 	}
 }
 
-// catchRuntimePanic turns a recovered panic into the response. It implements
-// the strict leak-prevention policy: only framework-generated aborts and values
-// handed to a registered PanicProcessor reach the client verbatim; anything
-// else is an unexpected crash, logged server-side and answered with a generic
-// 500 so internal details never leak.
-func (e *engine) catchRuntimePanic(rw responseWriter) {
-	err := recover()
-	if err == nil {
+// writeGeneric500 emits the fixed fallback response unless rendering already
+// committed the response or transferred connection ownership.
+func writeGeneric500(rw responseWriter) {
+	if rw.hijacked() || rw.flushed() || rw.written() {
 		return
 	}
+	rw.Header().Set(contentType, textPlainCharset)
+	rw.replaceStatus(http.StatusInternalServerError)
+	rw.writeHeader()
+	_, _ = rw.Write([]byte(http.StatusText(http.StatusInternalServerError)))
+}
 
-	if rw.hijacked() || (rw.flushed() && !rw.written()) {
-		if _, ok := err.(responseAbort); !ok {
-			e.logRecoveredPanic(err)
-		}
-		return
-	}
-
-	// A committed body can no longer be rewritten; only the recorded status
-	// (or the default 200) can still be flushed.
-	if rw.written() {
-		if _, ok := err.(responseAbort); !ok {
-			e.logRecoveredPanic(err)
-		}
-		rw.writeHeader()
-		return
-	}
-
+// renderPanic owns all user-visible panic rendering. Its caller provides one
+// recovery boundary so a failing hook or payload cannot escape request handling.
+func (e *engine) renderPanic(rw responseWriter, err any) {
 	// Once a panic processor is registered it owns rendering entirely, for
 	// displayable aborts and genuine crashes alike.
 	if e.panicProcessor != nil {
@@ -215,10 +205,44 @@ func (e *engine) catchRuntimePanic(rw responseWriter) {
 	// Everything else is unexpected: log the full detail, hide it from the
 	// client behind a generic 500.
 	e.logRecoveredPanic(err)
-	rw.Header().Set(contentType, textPlainCharset)
-	rw.replaceStatus(http.StatusInternalServerError)
-	rw.writeHeader()
-	_, _ = rw.Write([]byte(http.StatusText(http.StatusInternalServerError)))
+	writeGeneric500(rw)
+}
+
+// catchRuntimePanic turns a recovered panic into the response. It implements
+// the strict leak-prevention policy: only framework-generated aborts and values
+// handed to a registered PanicProcessor reach the client verbatim; anything
+// else is an unexpected crash, logged server-side and answered with a generic
+// 500 so internal details never leak.
+func (e *engine) catchRuntimePanic(rw responseWriter) {
+	err := recover()
+	if err == nil {
+		return
+	}
+
+	if rw.hijacked() || (rw.flushed() && !rw.written()) {
+		if _, ok := err.(responseAbort); !ok {
+			e.logRecoveredPanic(err)
+		}
+		return
+	}
+
+	// A committed body can no longer be rewritten; only the recorded status
+	// (or the default 200) can still be flushed.
+	if rw.written() {
+		if _, ok := err.(responseAbort); !ok {
+			e.logRecoveredPanic(err)
+		}
+		rw.writeHeader()
+		return
+	}
+
+	defer func() {
+		if renderPanic := recover(); renderPanic != nil {
+			e.logRecoveredPanic(fmt.Errorf("panic rendering panicked: %v", renderPanic))
+			writeGeneric500(rw)
+		}
+	}()
+	e.renderPanic(rw, err)
 }
 
 // logRecoveredPanic records an unexpected panic without exposing it.
@@ -227,5 +251,5 @@ func (e *engine) catchRuntimePanic(rw responseWriter) {
 // recovered value and the goroutine stack are recorded as structured fields so a
 // leak-free 500 stays debuggable in any backend.
 func (e *engine) logRecoveredPanic(err any) {
-	e.logger.Error("recovered panic", "error", err, "stack", string(debug.Stack()))
+	safeLog(func() { e.logger.Error("recovered panic", "error", err, "stack", string(debug.Stack())) })
 }

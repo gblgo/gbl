@@ -267,20 +267,9 @@ func (c *Context) Result() any {
 	return c.result
 }
 
-// hasPendingFlush reports whether an interface-returning handler asked to flush
-// before its result could be serialized.
-func (c *Context) hasPendingFlush() bool {
-	rw, ok := c.writer.(*pooledResponseWriter)
-	return ok && rw.flushPending
-}
-
-// commitPendingResponse preserves a status or flush requested before an abort
-// without allowing the abort to replace it.
+// commitPendingResponse preserves a status recorded before an abort without
+// allowing the abort to replace it.
 func (c *Context) commitPendingResponse() {
-	if rw, ok := c.writer.(*pooledResponseWriter); ok && rw.flushPending {
-		rw.commitDeferredFlush()
-		return
-	}
 	if c.writer.headed() && !c.writer.flushed() && !c.writer.written() && !c.writer.hijacked() {
 		c.writer.writeHeader()
 	}
@@ -288,8 +277,7 @@ func (c *Context) commitPendingResponse() {
 
 // AbortWithStatusString denies the request with a plain-text body and stops the chain.
 func (c *Context) AbortWithStatusString(status int, body string) {
-	if c.writer.headed() || c.writer.flushed() || c.writer.written() ||
-		c.writer.hijacked() || c.hasPendingFlush() {
+	if c.writer.headed() || c.writer.flushed() || c.writer.written() || c.writer.hijacked() {
 		c.commitPendingResponse()
 		c.Abort()
 		return
@@ -307,8 +295,7 @@ func (c *Context) AbortWithStatusString(status int, body string) {
 // A marshaling failure is a server-side fault, so it aborts with a generic 500
 // rather than echoing detail.
 func (c *Context) AbortWithStatusJSON(status int, body any) {
-	if c.writer.headed() || c.writer.flushed() || c.writer.written() ||
-		c.writer.hijacked() || c.hasPendingFlush() {
+	if c.writer.headed() || c.writer.flushed() || c.writer.written() || c.writer.hijacked() {
 		c.commitPendingResponse()
 		c.Abort()
 		return
@@ -397,7 +384,7 @@ func (c *Context) invokeHandler() {
 			// Binding errors are assembled from reflection internals (parameter
 			// names, Go type strings, numeric parsing detail), so only a generic 400 is
 			// returned and the detail stays in the server log.
-			c.logger.Error("request binding failed", "error", err)
+			safeLog(func() { c.logger.Error("request binding failed", "error", err) })
 			abort(http.StatusBadRequest, http.StatusText(http.StatusBadRequest))
 			return
 		}
@@ -426,28 +413,13 @@ func (c *Context) invokeHandler() {
 		}
 		stopHeartbeat, err := c.startSSE()
 		if err != nil {
-			c.logger.Error("SSE startup failed", "error", err)
+			safeLog(func() { c.logger.Error("SSE startup failed", "error", err) })
 			if c.writer.flushed() {
 				return
 			}
 			abort(http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError))
 		}
 		defer stopHeartbeat()
-	}
-
-	// An interface return can change media type at runtime. Delay a handler's
-	// flush until serialization has selected that type; concrete returns and SSE
-	// keep their immediate flush behavior.
-	var flushWriter *pooledResponseWriter
-	if rh.t.NumOut() > 0 {
-		returnType, ok := derefType(rh.t.Out(0))
-		if ok && returnType.Kind() == reflect.Interface {
-			flushWriter, _ = c.writer.(*pooledResponseWriter)
-			if flushWriter != nil {
-				flushWriter.deferFlush = true
-				defer func() { flushWriter.deferFlush = false }()
-			}
-		}
 	}
 
 	out := rh.v.Call(in)
@@ -471,9 +443,6 @@ func (c *Context) invokeHandler() {
 		c.ret = out[0]
 	}
 	c.handled = true
-	if flushWriter != nil {
-		flushWriter.commitDeferredFlush()
-	}
 }
 
 // startSSE commits the stream and starts its heartbeat after binding succeeds.

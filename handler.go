@@ -129,7 +129,7 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// rw.WriteHeader is a no-op once a status is recorded, so the 200 here only
 	// applies as a default when nothing set one, and rw.Write flushes the recorded
 	// status before the body.
-	if c.handled && !c.skipWriteback && !rw.written() && !rw.hijacked() {
+	if c.handled && !c.Aborted() && !c.skipWriteback && !rw.written() && !rw.hijacked() {
 		if !bodyAllowedForStatus(rw.status()) {
 			rw.writeHeader()
 		} else {
@@ -191,7 +191,7 @@ func writeRequestError(err error, loggers ...Logger) {
 			logger = loggers[0]
 		}
 		if logger != nil {
-			logger.Error("request parsing failed", "error", err)
+			safeLog(func() { logger.Error("request parsing failed", "error", err) })
 		}
 	}
 	abort(status, body)

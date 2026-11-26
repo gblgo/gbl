@@ -9,10 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"mime"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -161,11 +161,25 @@ func requestErrorResponse(err error) (status int, body string) {
 	if errors.Is(err, requestBodyTooLargeError) {
 		return http.StatusRequestEntityTooLarge, http.StatusText(http.StatusRequestEntityTooLarge)
 	}
-	var clientError *requestClientError
-	if errors.As(err, &clientError) {
+	if clientError, ok := errors.AsType[*requestClientError](err); ok {
 		return http.StatusBadRequest, clientError.Error()
 	}
 	return http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError)
+}
+
+// classifyBodyReadError separates client truncation and size violations from
+// internal body I/O failures across every request parser.
+func classifyBodyReadError(err error) error {
+	if errors.Is(err, requestBodyTooLargeError) {
+		return requestBodyTooLargeError
+	}
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+		return requestBodyTooLargeError
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return &requestClientError{err: err}
+	}
+	return &requestInternalError{err: err}
 }
 
 // replayRequestBody restores a body after bounded buffering on the unsupported-
@@ -237,12 +251,16 @@ func prepareRequestBody(w http.ResponseWriter, r *http.Request) error {
 }
 
 // mergeFormBodyWins merges URL query values with parsed body values, letting the
-// body win on any key present in both. The returned map is always distinct from
-// body so Request.Form and Request.PostForm can be mutated independently.
+// body win on any key present in both. The returned map and value slices are
+// independent of both inputs.
 func mergeFormBodyWins(query, body url.Values) url.Values {
 	merged := make(url.Values, len(query)+len(body))
-	maps.Copy(merged, query)
-	maps.Copy(merged, body)
+	for key, values := range query {
+		merged[key] = slices.Clone(values)
+	}
+	for key, values := range body {
+		merged[key] = slices.Clone(values)
+	}
 	return merged
 }
 
@@ -394,10 +412,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 			}
 		}
 		if err != nil {
-			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
-				return nil, nil, nil, false, requestBodyTooLargeError
-			}
-			return nil, nil, nil, false, &requestInternalError{err: err}
+			return nil, nil, nil, false, classifyBodyReadError(err)
 		}
 		if bodyBuf != nil && !hasNonWhitespace(bodyBuf.Bytes()) {
 			releaseBodyBuffer(bodyBuf)
@@ -429,21 +444,13 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 				return nil, nil, nil, false, requestBodyTooLargeError
 			}
 			if tracker.err != nil {
-				if _, ok := errors.AsType[*http.MaxBytesError](tracker.err); ok {
-					return nil, nil, nil, false, requestBodyTooLargeError
-				}
-				if !errors.Is(tracker.err, io.ErrUnexpectedEOF) {
-					return nil, nil, nil, false, &requestInternalError{err: tracker.err}
-				}
+				return nil, nil, nil, false, classifyBodyReadError(tracker.err)
 			}
 			return nil, nil, nil, false, &requestClientError{err: err}
 		}
 		if tracker.err != nil {
 			cleanupParsedMultipart(r)
-			if _, ok := errors.AsType[*http.MaxBytesError](tracker.err); ok {
-				return nil, nil, nil, false, requestBodyTooLargeError
-			}
-			return nil, nil, nil, false, &requestInternalError{err: tracker.err}
+			return nil, nil, nil, false, classifyBodyReadError(tracker.err)
 		}
 		if r.PostForm == nil {
 			r.PostForm = make(url.Values)
@@ -481,10 +488,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 			}
 			if _, readErr := buf.ReadFrom(r.Body); readErr != nil {
 				releaseBodyBuffer(buf)
-				if _, ok := errors.AsType[*http.MaxBytesError](readErr); ok {
-					return nil, nil, nil, false, requestBodyTooLargeError
-				}
-				return nil, nil, nil, false, &requestInternalError{err: readErr}
+				return nil, nil, nil, false, classifyBodyReadError(readErr)
 			}
 			parsed, parseErr := url.ParseQuery(string(buf.Bytes()))
 			releaseBodyBuffer(buf)
@@ -540,10 +544,7 @@ func replayUnsupportedRequestBody(r *http.Request) error {
 	original := r.Body
 	data, err := io.ReadAll(original)
 	if err != nil {
-		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
-			return requestBodyTooLargeError
-		}
-		return &requestInternalError{err: err}
+		return classifyBodyReadError(err)
 	}
 	r.Body = &replayRequestBody{Reader: bytes.NewReader(data), closer: original}
 	r.ContentLength = int64(len(data))
