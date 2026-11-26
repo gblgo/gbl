@@ -46,11 +46,11 @@ const (
 func (e *engine) printBanner(cfg *Config, addr net.Addr) {
 	block := e.renderBanner(cfg, addr)
 	if bl, ok := e.logger.(BannerLogger); ok {
-		bl.Banner(block)
+		safeLog(func() { bl.Banner(block) })
 	} else {
-		e.logger.Info(block)
+		safeLog(func() { e.logger.Info(block) })
 	}
-	e.logger.Info(startupSuccessMessage)
+	safeLog(func() { e.logger.Info(startupSuccessMessage) })
 }
 
 // renderBanner assembles the display block: the logo, then an aligned status

@@ -530,6 +530,7 @@ func TestConsoleWriterUsesPlainFilesAndNoColor(t *testing.T) {
 
 func TestConsoleWriterTerminalSeam(t *testing.T) {
 	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "xterm")
 	original := isTerminal
 	isTerminal = func(*os.File) bool { return true }
 	t.Cleanup(func() { isTerminal = original })
@@ -543,6 +544,10 @@ func TestConsoleWriterTerminalSeam(t *testing.T) {
 	writer, ok := consoleWriter(file).(colorWriter)
 	if !ok || writer.w != file {
 		t.Fatalf("consoleWriter with terminal seam = %#v, want colorWriter over the original file", writer)
+	}
+	t.Setenv("TERM", "dumb")
+	if got := consoleWriter(file); got != file {
+		t.Fatalf("consoleWriter with TERM=dumb = %T, want the original *os.File", got)
 	}
 }
 

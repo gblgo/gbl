@@ -80,6 +80,12 @@ type logTestPanicFormatter struct{}
 
 func (*logTestPanicFormatter) Format(fmt.State, rune) { panic("formatter boom") }
 
+type logTestPanicLogger struct{}
+
+func (*logTestPanicLogger) Info(string, ...any)  { panic("info boom") }
+func (*logTestPanicLogger) Warn(string, ...any)  { panic("warn boom") }
+func (*logTestPanicLogger) Error(string, ...any) { panic("error boom") }
+
 func logTestPanicValue(fn func()) (recovered any) {
 	defer func() { recovered = recover() }()
 	fn()
@@ -92,6 +98,44 @@ func logTestAppend(value any) (line string, recovered any) {
 	b.WriteString("prefix:")
 	appendLogValue(&b, value)
 	return b.String(), nil
+}
+
+func TestSetLoggerRejectsNilValues(t *testing.T) {
+	e := newEngine()
+	t.Cleanup(e.cancelStreams)
+	original := &logTestCaptureLogger{}
+	e.logger = original
+	var typedNil *logTestCaptureLogger
+	for _, tc := range []struct {
+		name   string
+		logger Logger
+	}{
+		{name: "nil", logger: nil},
+		{name: "typed-nil pointer", logger: typedNil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if recovered := logTestPanicValue(func() { e.setLogger(tc.logger) }); recovered == nil {
+				t.Fatalf("SetLogger accepted %s", tc.name)
+			}
+			if e.logger != original {
+				t.Fatalf("SetLogger(%s) replaced the installed logger", tc.name)
+			}
+		})
+	}
+}
+
+func TestSafeLogContainsSinkPanic(t *testing.T) {
+	safeLog(func() { panic("logger boom") })
+}
+
+func TestFailStartupPreservesReasonWhenLoggerPanics(t *testing.T) {
+	e := newEngine()
+	t.Cleanup(e.cancelStreams)
+	e.logger = &logTestPanicLogger{}
+	reason := errors.New("original startup failure")
+	if recovered := logTestPanicValue(func() { e.failStartup(reason) }); recovered != reason {
+		t.Fatalf("failStartup panic = %v, want original reason %v", recovered, reason)
+	}
 }
 
 func TestLogLineFormatAndOddPairs(t *testing.T) {
@@ -320,13 +364,13 @@ func TestNewStdLoggerUsesPrivateSink(t *testing.T) {
 	}
 }
 
-func TestSetLoggerRoutesLevelsAndIgnoresNil(t *testing.T) {
+func TestSetLoggerRoutesLevelsAndRejectsNil(t *testing.T) {
 	previous := defaultEngine.logger
-	previousGenerated := defaultEngine.generated
-	defaultEngine.generated = false
+	previousRunState := defaultEngine.runState.Load()
+	defaultEngine.runState.Store(runStateIdle)
 	t.Cleanup(func() {
 		defaultEngine.logger = previous
-		defaultEngine.generated = previousGenerated
+		defaultEngine.runState.Store(previousRunState)
 	})
 
 	first := &logTestCaptureLogger{}
@@ -337,9 +381,11 @@ func TestSetLoggerRoutesLevelsAndIgnoresNil(t *testing.T) {
 	Info("info event", "key", 1)
 	Warn("warn event", "key", 2)
 	Error("error event", "key", 3)
-	SetLogger(nil)
+	if recovered := logTestPanicValue(func() { SetLogger(nil) }); recovered == nil {
+		t.Fatal("SetLogger(nil) did not panic")
+	}
 	if defaultEngine.logger != first {
-		t.Fatal("SetLogger(nil) replaced the working logger")
+		t.Fatal("rejected SetLogger(nil) replaced the working logger")
 	}
 
 	second := &logTestCaptureLogger{}
@@ -350,6 +396,7 @@ func TestSetLoggerRoutesLevelsAndIgnoresNil(t *testing.T) {
 		{level: "INFO", msg: "info event", kv: []any{"key", 1}},
 		{level: "WARN", msg: "warn event", kv: []any{"key", 2}},
 		{level: "ERROR", msg: "error event", kv: []any{"key", 3}},
+		{level: "ERROR", msg: "startup aborted", kv: []any{"reason", "gbl: SetLogger requires a non-nil Logger"}},
 	}
 	if len(first.records) != len(want) {
 		t.Fatalf("first logger received %d records, want %d", len(first.records), len(want))
@@ -364,13 +411,13 @@ func TestSetLoggerRoutesLevelsAndIgnoresNil(t *testing.T) {
 	}
 }
 
-func TestSetLoggerIsFrozenAfterGeneration(t *testing.T) {
+func TestSetLoggerIsFrozenAfterRunClaim(t *testing.T) {
 	previous := defaultEngine.logger
-	previousGenerated := defaultEngine.generated
-	defaultEngine.generated = true
+	previousRunState := defaultEngine.runState.Load()
+	defaultEngine.runState.Store(runStateRunning)
 	t.Cleanup(func() {
 		defaultEngine.logger = previous
-		defaultEngine.generated = previousGenerated
+		defaultEngine.runState.Store(previousRunState)
 	})
 
 	recovered := logTestPanicValue(func() { SetLogger(&logTestCaptureLogger{}) })
@@ -382,13 +429,15 @@ func TestSetLoggerIsFrozenAfterGeneration(t *testing.T) {
 	}
 }
 
-func TestEngineSetLoggerNilAndFailStartup(t *testing.T) {
+func TestEngineSetLoggerRejectsNilAndFailStartup(t *testing.T) {
 	e := newEngine()
 	defer e.cancelStreams()
 	initial := e.logger
-	e.setLogger(nil)
+	if recovered := logTestPanicValue(func() { e.setLogger(nil) }); recovered == nil {
+		t.Fatal("engine.setLogger(nil) did not panic")
+	}
 	if e.logger != initial {
-		t.Fatal("engine.setLogger(nil) replaced the logger")
+		t.Fatal("rejected engine.setLogger(nil) replaced the logger")
 	}
 
 	capture := &logTestCaptureLogger{}

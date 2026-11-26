@@ -9,5 +9,5 @@ package gbl
 import "os"
 
 // enableConsoleVT is a no-op off Windows: POSIX terminals interpret ANSI escape
-// sequences natively, so a TTY is always color-capable.
+// sequences natively. consoleWriter separately honors NO_COLOR and TERM=dumb.
 func enableConsoleVT(*os.File) bool { return true }

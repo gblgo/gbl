@@ -12,15 +12,15 @@ import (
 	"unsafe"
 )
 
-// detectTerminal reports whether f is a terminal by querying its termios settings.
+// detectTerminal reports whether f is a terminal by querying its terminal settings.
 // The ioctl fails with ENOTTY for regular files, pipes and devices such as
 // /dev/null, unlike a ModeCharDevice check.
 func detectTerminal(f *os.File) bool {
 	if f == nil {
 		return false
 	}
-	var termios syscall.Termios
+	var termState syscall.Termios
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCGETA),
-		uintptr(unsafe.Pointer(&termios)))
+		uintptr(unsafe.Pointer(&termState)))
 	return errno == 0
 }

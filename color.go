@@ -145,7 +145,7 @@ var isTerminal = detectTerminal
 // development aid for the framework default console, not an offered entry
 // point: users who integrate a logging component take that library coloring.
 func consoleWriter(f *os.File) io.Writer {
-	if noColorRequested() || !isTerminal(f) {
+	if noColorRequested() || os.Getenv("TERM") == "dumb" || !isTerminal(f) {
 		return f
 	}
 	return colorWriter{w: f, enabled: enableConsoleVT(f)}

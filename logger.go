@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 )
@@ -155,15 +156,16 @@ func appendLogValue(b *strings.Builder, value any) {
 	case float64:
 		b.Write(strconv.AppendFloat(number[:0], v, 'g', -1, 64))
 	default:
-		// fmt handles typed nils and recovers panics from Error, String and
+		// fmt handles typed-nil values and recovers panics from Error, String and
 		// Format methods while preserving their normal formatting precedence.
 		b.WriteString(fmt.Sprint(value))
 	}
 }
 
-// SetLogger installs a Logger on the default engine. Passing nil is ignored, so
-// the framework always keeps a working logger. Until it is called the default
-// engine logs through the console helper described above: that console logger
+// SetLogger installs a Logger on the default engine. Passing nil or a typed-nil
+// pointer panics instead of silently keeping a different logger. Until it is
+// called the default engine logs through the console helper described above:
+// that console logger
 // is a development aid, and integrating a real logging component simply means
 // plugging its adapter in here.
 func SetLogger(l Logger) { defaultEngine.setLogger(l) }
@@ -183,15 +185,26 @@ func Warn(msg string, keysAndValues ...any) { defaultEngine.logger.Warn(msg, key
 func Error(msg string, keysAndValues ...any) { defaultEngine.logger.Error(msg, keysAndValues...) }
 
 // setLogger installs a Logger on this engine. It is safe to call at any point
-// during assembling, before or after routes and middleware are registered;
-// passing nil leaves the current logger untouched. Once the engine runs the
-// logger is frozen like every other assembling input, and calling this again
-// panics.
+// during assembling, before or after routes and middleware are registered; nil
+// and typed-nil pointers are rejected. Once the engine runs the logger is frozen
+// like every other assembling input, and calling this again panics.
 func (e *engine) setLogger(l Logger) {
 	e.assertAssembling("SetLogger")
-	if l != nil {
-		e.logger = l
+	if l == nil {
+		e.failStartup("gbl: SetLogger requires a non-nil Logger")
 	}
+	value := reflect.ValueOf(l)
+	if value.Kind() == reflect.Pointer && value.IsNil() {
+		e.failStartup(fmt.Errorf("gbl: SetLogger received a typed-nil %T", l))
+	}
+	e.logger = l
+}
+
+// safeLog keeps a failing logging sink from replacing the framework error or
+// response that was being handled when the sink was called.
+func safeLog(fn func()) {
+	defer func() { _ = recover() }()
+	fn()
 }
 
 // failStartup records a startup, configuration or registration failure through
@@ -202,6 +215,6 @@ func (e *engine) setLogger(l Logger) {
 // have without the logging. It is deliberately not used for the request-time
 // responseAbort control flow, which is a normal answer rather than a failure.
 func (e *engine) failStartup(reason any) {
-	e.logger.Error("startup aborted", "reason", reason)
+	safeLog(func() { e.logger.Error("startup aborted", "reason", reason) })
 	panic(reason)
 }
