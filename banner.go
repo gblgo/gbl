@@ -32,16 +32,17 @@ const (
 	// reading the version out of embedded build info, also when the library
 	// is only a dependency of the consumer binary
 	modulePath = "github.com/gblgo/gbl"
-	// version stand-in when build info carries no tag: a local or replaced checkout
+	// version stand-in for an untagged main module or local replacement
 	versionDevel = "(devel)"
 )
 
 // printBanner emits the startup banner through the engine Logger so a
 // redirected or structured sink captures startup like any other event. The whole
 // block (logo plus status table) goes out verbatim: through BannerLogger when
-// present, otherwise as a single Info record, so no timestamp or level label
-// crowds the art. A one-line startupSuccessMessage Info record follows the block,
-// and that line does carry the Logger timestamp and level like any event.
+// present, otherwise as a single Info record. The fallback preserves the block,
+// but the Logger may add its normal level label, timestamp or structured fields.
+// A one-line startupSuccessMessage Info record follows the block and carries the
+// Logger metadata like any other event.
 func (e *engine) printBanner(cfg *Config, addr net.Addr) {
 	block := e.renderBanner(cfg, addr)
 	if bl, ok := e.logger.(BannerLogger); ok {
@@ -77,10 +78,14 @@ func (e *engine) renderBanner(cfg *Config, addr net.Addr) string {
 	return strings.TrimRight(bannerArt, "\n") + "\n\n" + strings.Join(lines, "\n") + "\n"
 }
 
+// readBuildInfo is a test seam for the standard library's unavailable-build-info
+// path. Production keeps the default implementation.
+var readBuildInfo = debug.ReadBuildInfo
+
 // bannerVersion reports the framework version embedded in the running binary.
 // It reads build info, so no version constant has to be maintained in source.
 func bannerVersion() string {
-	info, ok := debug.ReadBuildInfo()
+	info, ok := readBuildInfo()
 	if !ok {
 		return versionDevel
 	}
@@ -88,24 +93,35 @@ func bannerVersion() string {
 }
 
 // frameworkVersion extracts the version of gbl from build info. When gbl is the
-// main module (its own examples and tests), it reads Main.Version. When gbl is a
-// dependency of the consumer app, it reads the gbl entry in Deps, which carries
-// the tagged version that app requires. A local or replaced build has no tag,
-// so it yields "(devel)".
+// main module (its own examples and tests), it reads Main; when gbl is a
+// dependency of the consumer app, it reads the gbl entry in Deps. A replacement
+// supplies the version actually built: an untagged local replacement yields
+// "(devel)", while a versioned replacement reports its own tag.
 func frameworkVersion(info *debug.BuildInfo) string {
+	if info == nil {
+		return versionDevel
+	}
 	if info.Main.Path == modulePath {
-		if info.Main.Version != empty {
-			return info.Main.Version
+		return buildModuleVersion(info.Main)
+	}
+	for _, dep := range info.Deps {
+		if dep != nil && dep.Path == modulePath {
+			return buildModuleVersion(*dep)
+		}
+	}
+	return versionDevel
+}
+
+// buildModuleVersion resolves a module version through its replacement, if any.
+func buildModuleVersion(module debug.Module) string {
+	if module.Replace != nil {
+		if module.Replace.Version != empty {
+			return module.Replace.Version
 		}
 		return versionDevel
 	}
-	for _, dep := range info.Deps {
-		if dep.Path == modulePath {
-			if dep.Version != empty {
-				return dep.Version
-			}
-			break
-		}
+	if module.Version != empty {
+		return module.Version
 	}
 	return versionDevel
 }
@@ -147,7 +163,8 @@ func countRouteNodes(node *routeNode) int {
 
 // displayHost turns a wildcard bind address into a browsable one: 0.0.0.0, ::
 // or an empty host all mean "every interface", which is best shown to a human as
-// localhost. A concrete host is kept as given. The port always carries through.
+// localhost. A concrete host is kept as given, and JoinHostPort preserves the
+// brackets required around IPv6 addresses and zones.
 func displayHost(addr net.Addr) string {
 	if addr == nil {
 		return "?"
@@ -160,7 +177,7 @@ func displayHost(addr net.Addr) string {
 	case empty, "0.0.0.0", "::":
 		host = "localhost"
 	}
-	return host + colon + port
+	return net.JoinHostPort(host, port)
 }
 
 // yesNo renders a boolean feature state as a word for the status block.

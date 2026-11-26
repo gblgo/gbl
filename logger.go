@@ -117,7 +117,8 @@ func logLine(level, msg string, kv []any) string {
 }
 
 // appendLogValue avoids interface formatting allocations for common scalar
-// values while preserving the default fmt.Sprint behavior for other types.
+// values and delegates other types to fmt.Sprint, including its typed-nil and
+// panic-recovery behavior.
 func appendLogValue(b *strings.Builder, value any) {
 	var number [64]byte
 	switch v := value.(type) {
@@ -153,14 +154,10 @@ func appendLogValue(b *strings.Builder, value any) {
 		b.Write(strconv.AppendFloat(number[:0], float64(v), 'g', -1, 32))
 	case float64:
 		b.Write(strconv.AppendFloat(number[:0], v, 'g', -1, 64))
-	case fmt.Formatter:
-		b.WriteString(fmt.Sprint(v))
-	case error:
-		b.WriteString(v.Error())
-	case fmt.Stringer:
-		b.WriteString(v.String())
 	default:
-		b.WriteString(fmt.Sprint(v))
+		// fmt handles typed nils and recovers panics from Error, String and
+		// Format methods while preserving their normal formatting precedence.
+		b.WriteString(fmt.Sprint(value))
 	}
 }
 
@@ -174,7 +171,7 @@ func SetLogger(l Logger) { defaultEngine.setLogger(l) }
 // Info logs at info level through the Logger installed on the default engine.
 // The three package-level log functions are the ergonomic entry for business
 // code: once a logger is injected with SetLogger it is the framework sink,
-// and calling it through the framework own API is the intended use — no need
+// and calling it through the framework API is the intended use — no need
 // to keep or fetch a reference. msg describes the event, followed by
 // alternating key/value pairs (see Logger).
 func Info(msg string, keysAndValues ...any) { defaultEngine.logger.Info(msg, keysAndValues...) }
