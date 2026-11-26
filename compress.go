@@ -55,9 +55,10 @@ const (
 //  3. The response body is at least minCompressSize bytes
 //
 // Compression happens after c.Next() returns, so the handler has already
-// produced its result. The middleware replaces c.bytes with the compressed
-// data and sets Content-Encoding: gzip. Every response passing through also
-// gains Vary: Accept-Encoding, whether compressed or not: whether a cached
+// produced its result. The middleware replaces c.bytes only when the compressed
+// data is smaller and sets Content-Encoding: gzip. NoCompression explicitly
+// requests store-only gzip and keeps that behavior. Every response passing through
+// also gains Vary: Accept-Encoding, whether compressed or not: whether a cached
 // representation fits depends on the client encoding, so caches must key
 // on it. An invalid level yields a middleware that never compresses.
 //
@@ -142,6 +143,12 @@ func Compress(level int) HandlerFunc {
 			return
 		}
 
+		compressed := buf.Bytes()
+		if level != NoCompression && len(compressed) >= len(c.bytes) {
+			releaseResponseBuffer(buf)
+			return
+		}
+
 		// The compressed buffer takes over the pooled slot, so Context recycle
 		// releases it once the response is written; the staged body is done.
 		if c.responseBuf != nil {
@@ -151,6 +158,9 @@ func Compress(level int) HandlerFunc {
 		c.responseBuf = buf
 		c.writer.Header().Set(contentEncoding, encodingGzip)
 		c.writer.Header().Del("Content-Length")
+		if etag := c.writer.Header().Get("Etag"); strings.HasPrefix(etag, `"`) {
+			c.writer.Header().Set("Etag", "W/"+etag)
+		}
 	}
 }
 

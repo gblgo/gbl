@@ -199,6 +199,32 @@ func TestCompressThreshold(t *testing.T) {
 	}
 }
 
+func TestCompressSkipsLargerOutput(t *testing.T) {
+	body := make([]byte, 4096)
+	state := uint32(1)
+	for i := range body {
+		state = state*1664525 + 1013904223
+		body[i] = byte(state >> 24)
+	}
+	e := mwTestNewEngine(t, func() string { return string(body) }, Compress(DefaultCompression))
+	rec := mwTestGzipResponse(e, "gzip")
+	mwTestRequirePlainBody(t, rec, body)
+	mwTestRequireVary(t, rec.Header(), acceptEncoding)
+}
+
+func TestCompressWeakensStrongETag(t *testing.T) {
+	body := []byte(strings.Repeat("etag payload\n", 100))
+	e := mwTestNewEngine(t, func(w http.ResponseWriter) string {
+		w.Header().Set("ETag", `"strong"`)
+		return string(body)
+	}, Compress(DefaultCompression))
+	rec := mwTestGzipResponse(e, "gzip")
+	mwTestRequireGzipBody(t, rec, body)
+	if got := rec.Header().Get("ETag"); got != `W/"strong"` {
+		t.Fatalf("ETag = %q, want weak gzip variant", got)
+	}
+}
+
 func TestCompressMIME(t *testing.T) {
 	body := bytes.Repeat([]byte("mime payload"), 100)
 	tests := []struct {
