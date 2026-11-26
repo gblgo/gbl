@@ -1010,6 +1010,22 @@ func TestRouteGenerationRejectsInvalidHandlers(t *testing.T) {
 	}
 }
 
+func TestRouteGenerationRejectsExplosiveFormPointerTree(t *testing.T) {
+	typ := reflect.TypeFor[struct{}]()
+	for range 16 {
+		typ = reflect.StructOf([]reflect.StructField{
+			{Name: "Left", Type: reflect.PointerTo(typ)},
+			{Name: "Right", Type: reflect.PointerTo(typ)},
+		})
+	}
+	e := routeTestNewEngine(t)
+	e.register(methodGet, "/wide", routeTestHandlerForParameterType(typ))
+	panicValue := routeTestRequirePanicMessage(t, "invalid handler parameter type", e.generateRoute)
+	if message := fmt.Sprint(panicValue); !strings.Contains(message, "form pointer expansion") {
+		t.Fatalf("startup panic = %v, want pointer expansion rejection", panicValue)
+	}
+}
+
 // TestRouteGenerationRejectsAmbiguousStructFields proves binding validation fails
 // during startup, before a route can be frozen or serve a request.
 func TestRouteGenerationRejectsAmbiguousStructFields(t *testing.T) {

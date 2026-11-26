@@ -430,6 +430,12 @@ func TestRequestJSONMediaTypesAndEmptyBody(t *testing.T) {
 	}
 }
 
+func TestClassifyBodyReadErrorPreservesSizeSentinel(t *testing.T) {
+	if got := classifyBodyReadError(requestBodyTooLargeError); !errors.Is(got, requestBodyTooLargeError) {
+		t.Fatalf("classifyBodyReadError(sentinel) = %v", got)
+	}
+}
+
 func TestRequestBodyLimit(t *testing.T) {
 	const limit = 64
 	requestTestLimits(t, limit, 8, limit)

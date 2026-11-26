@@ -193,7 +193,6 @@ const maxFormPointerExpansion = 4096
 // allocate lazily and therefore contribute no eager expansion here.
 func validateFormPointerExpansion(t reflect.Type) error {
 	memo := make(map[reflect.Type]int)
-	active := make(map[reflect.Type]bool)
 	var expansion func(reflect.Type) int
 	expansion = func(current reflect.Type) int {
 		pointers := 0
@@ -207,24 +206,15 @@ func validateFormPointerExpansion(t reflect.Type) error {
 		if count, ok := memo[current]; ok {
 			return count
 		}
-		if active[current] {
-			return 0
-		}
-		active[current] = true
 		total := pointers
-		if total > maxFormPointerExpansion {
-			total = maxFormPointerExpansion + 1
-		} else {
-			for _, field := range structFieldsOf(current) {
-				count := expansion(field.typ)
-				if count > maxFormPointerExpansion || total > maxFormPointerExpansion-count {
-					total = maxFormPointerExpansion + 1
-					break
-				}
-				total += count
+		for _, field := range structFieldsOf(current) {
+			count := expansion(field.typ)
+			if count > maxFormPointerExpansion || total > maxFormPointerExpansion-count {
+				total = maxFormPointerExpansion + 1
+				break
 			}
+			total += count
 		}
-		delete(active, current)
 		memo[current] = total
 		return total
 	}
@@ -565,11 +555,6 @@ func resolvePromotedBindFields(t reflect.Type, candidates []bindFieldCandidate) 
 	}
 	for _, group := range grouped {
 		shallowest := group[0].depth
-		for _, candidate := range group[1:] {
-			if candidate.depth < shallowest {
-				shallowest = candidate.depth
-			}
-		}
 		contenders := make([]bindFieldCandidate, 0, len(group))
 		for _, candidate := range group {
 			if candidate.depth == shallowest {

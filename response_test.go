@@ -1489,6 +1489,30 @@ func TestResponsePanicProcessorPayloadPanicIsContained(t *testing.T) {
 	}
 }
 
+func TestWriteGeneric500DoesNotRewriteCommittedResponse(t *testing.T) {
+	for _, state := range []string{"written", "flushed", "hijacked"} {
+		t.Run(state, func(t *testing.T) {
+			sink := responseTestNewWriter()
+			rw := &pooledResponseWriter{w: sink}
+			switch state {
+			case "written":
+				_, _ = rw.Write([]byte("partial"))
+			case "flushed":
+				rw.WriteHeader(http.StatusNoContent)
+				rw.writeHeader()
+			case "hijacked":
+				rw.hijackedStatus = true
+			}
+			statuses := append([]int(nil), sink.statuses...)
+			body := sink.body.String()
+			writeGeneric500(rw)
+			if !reflect.DeepEqual(sink.statuses, statuses) || sink.body.String() != body {
+				t.Fatalf("committed response changed: statuses=%v body=%q", sink.statuses, sink.body.String())
+			}
+		})
+	}
+}
+
 func TestResponsePipelineAbortAfterNextSuppressesStagedResult(t *testing.T) {
 	e := responseTestNewEngine(t)
 	var result any
