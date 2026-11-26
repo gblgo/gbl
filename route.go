@@ -5,6 +5,7 @@
 package gbl
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
 	"go/ast"
@@ -12,17 +13,20 @@ import (
 	"go/token"
 	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 )
 
-// isGoIdentifier reports whether s is a valid Go identifier: a letter or
-// underscore first, then letters, digits or underscores. Path parameter names
-// bind handler arguments by name, so anything else could never match.
+// isGoIdentifier reports whether s is a valid, non-keyword Go identifier: a
+// letter or underscore first, then letters, digits or underscores. Path
+// parameter names bind handler arguments by name, so anything else could never
+// match. Go keywords are lexically identifier-shaped but cannot be parameter
+// names, so they are rejected here as well.
 func isGoIdentifier(s string) bool {
-	if s == empty {
+	if s == empty || token.Lookup(s).IsKeyword() {
 		return false
 	}
 	for i, r := range s {
@@ -77,29 +81,57 @@ var methodNames = [methodCount]string{
 }
 
 // methodOf resolves an HTTP method name, reporting false when GBL does not
-// implement that verb at all.
-//
-// The upper-casing keeps the lenient behavior GBL has always had, so a
-// lowercase "get" is still treated as "GET".
+// implement that verb at all. HTTP methods are ASCII tokens, so an ASCII fold
+// preserves the lenient lowercase behavior without allocating an upper-cased
+// copy on every request.
 func methodOf(name string) (httpMethod, bool) {
-	switch strings.ToUpper(name) {
-	case nameMethodGet:
-		return methodGet, true
-	case nameMethodHead:
-		return methodHead, true
-	case nameMethodPost:
-		return methodPost, true
-	case nameMethodPut:
-		return methodPut, true
-	case nameMethodPatch:
-		return methodPatch, true
-	case nameMethodDelete:
-		return methodDelete, true
-	case nameMethodOptions:
-		return methodOptions, true
-	default:
-		return 0, false
+	switch len(name) {
+	case len(nameMethodGet):
+		if equalMethodName(name, nameMethodGet) {
+			return methodGet, true
+		}
+		if equalMethodName(name, nameMethodPut) {
+			return methodPut, true
+		}
+	case len(nameMethodHead):
+		if equalMethodName(name, nameMethodHead) {
+			return methodHead, true
+		}
+		if equalMethodName(name, nameMethodPost) {
+			return methodPost, true
+		}
+	case len(nameMethodPatch):
+		if equalMethodName(name, nameMethodPatch) {
+			return methodPatch, true
+		}
+	case len(nameMethodDelete):
+		if equalMethodName(name, nameMethodDelete) {
+			return methodDelete, true
+		}
+	case len(nameMethodOptions):
+		if equalMethodName(name, nameMethodOptions) {
+			return methodOptions, true
+		}
 	}
+	return 0, false
+}
+
+// equalMethodName compares an ASCII HTTP token case-insensitively without
+// allocating. Non-ASCII bytes cannot match a supported method name.
+func equalMethodName(name, upper string) bool {
+	if len(name) != len(upper) {
+		return false
+	}
+	for i := range len(name) {
+		c := name[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != upper[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // isBodyMethod reports whether GBL parses a request body for this method.
@@ -120,13 +152,18 @@ type routeHandler struct {
 	v reflect.Value
 	// paramNames is parallel to the handler parameter list
 	paramNames []string
+	// pathParams records each dynamic segment position and its route-specific
+	// name, allowing structurally shared variable nodes to bind different names
+	pathParams []pathParam
 	// this route frozen request chain: the engine global middleware,
 	// then the route group, then the terminal routeEndpoint. It is
 	// assembled once at startup and reused verbatim by every request.
 	handlers []HandlerFunc
 
+	// plan is the immutable parameter-binding blueprint.
 	plan bindPlan
 
+	// contentType is the provisional media type derived from the return type.
 	contentType string
 	// t is the reflected handler function type
 	t reflect.Type
@@ -141,15 +178,14 @@ type routeHandler struct {
 // Grammar: a path is '/'-separated segments. A segment is either a literal or a
 // variable written as ":name" or "{name}" — both forms bind identically. The
 // marker must lead the segment and appear exactly once: no nesting ("::", "{{"),
-// no marker in the middle ("a:b", "a{b"), no empty name (":", "{}"), and a "{"
-// must be closed by a "}". Any
-// violation aborts startup; the reason is logged through the engine before the
-// panic, so a bad registration stays explainable after deploy. In the error
+// no marker in the middle ("a:b", "a{b"), no empty name (":", "{}"), and braces
+// must be paired. Variable names must be non-keyword Go identifiers and unique
+// within the path, because one params map key cannot represent two positions.
+// Any violation aborts startup; the reason is logged through the engine before
+// the panic, so a bad registration stays explainable after deploy. In the error
 // texts `***` stands for any offending characters.
 func (e *engine) dealPath(path string) ([]segmentMeta, string) {
-
 	path = strings.TrimSpace(path)
-
 	if path == empty {
 		e.failStartup("when registering a route, the path cannot be empty")
 	}
@@ -157,38 +193,28 @@ func (e *engine) dealPath(path string) ([]segmentMeta, string) {
 	parts := strings.Split(path, slash)
 	segmentMetas := make([]segmentMeta, 0, len(parts))
 	segments := make([]string, 0, len(parts))
+	var paramNames map[string]struct{}
 
 	for _, part := range parts {
 		if part == empty {
 			continue
 		}
-		meta := segmentMeta{segment: part, isVar: false}
-		if strings.Contains(part, colon) {
-			if len(part) == 1 || strings.LastIndex(part, colon) != 0 {
+		meta := segmentMeta{segment: part}
+		switch {
+		case strings.Contains(part, colon):
+			if len(part) == 1 || part[0] != ':' ||
+				strings.ContainsAny(part[1:], colon+leftCurlyBrace+rightCurlyBrace) {
 				e.failStartup("when registering a route, the path cannot be '/:' " +
 					"or '/:***:***:' or '/::', etc")
 			}
 			meta.isVar = true
 			meta.paramName = part[1:]
-		}
-
-		if strings.Contains(part, leftCurlyBrace) &&
-			(len(part) == 1 || strings.LastIndex(part, leftCurlyBrace) != 0 ||
-				!strings.HasSuffix(part, rightCurlyBrace)) {
-			e.failStartup("when registering a route, the path cannot be '/{' or '/{***{***{' " +
-				"or '/{{' or an unclosed '/{id', etc")
-		}
-
-		if strings.Contains(part, rightCurlyBrace) &&
-			(len(part) == 1 || strings.Index(part, rightCurlyBrace)+1 != len(part)) {
-			e.failStartup("when registering a route, the path cannot be '/}' or '/}***}***}' or '/}}', etc")
-		}
-
-		if strings.TrimSuffix(strings.TrimPrefix(part, leftCurlyBrace), rightCurlyBrace) == empty {
-			e.failStartup("when registering a route, the path cannot be '/{}'")
-		}
-
-		if strings.Contains(part, leftCurlyBrace) {
+		case strings.ContainsAny(part, leftCurlyBrace+rightCurlyBrace):
+			if len(part) < 3 || part[0] != '{' || part[len(part)-1] != '}' ||
+				strings.ContainsAny(part[1:len(part)-1], leftCurlyBrace+rightCurlyBrace) {
+				e.failStartup("when registering a route, the path cannot be '/{' or '/{***{***{' " +
+					"or '/{{', an unclosed '/{id', or an unpaired '}', etc")
+			}
 			meta.isVar = true
 			meta.paramName = part[1 : len(part)-1]
 		}
@@ -196,9 +222,19 @@ func (e *engine) dealPath(path string) ([]segmentMeta, string) {
 		// The name has to be usable as a Go parameter name, or it could never
 		// match any handler argument: a stray character (":id}") would register
 		// silently and bind the zero value on every request.
-		if meta.isVar && !isGoIdentifier(meta.paramName) {
-			e.failStartup("when registering a route, the parameter name in '/" + part +
-				"' must be a valid Go identifier, like ':id' or '{id}'")
+		if meta.isVar {
+			if !isGoIdentifier(meta.paramName) {
+				e.failStartup("when registering a route, the parameter name in '/" + part +
+					"' must be a valid Go identifier, like ':id' or '{id}'; Go keywords are not allowed")
+			}
+			if paramNames == nil {
+				paramNames = make(map[string]struct{})
+			}
+			if _, exists := paramNames[meta.paramName]; exists {
+				e.failStartup("when registering a route, the parameter name '" + meta.paramName +
+					"' appears more than once; each path position needs a distinct name")
+			}
+			paramNames[meta.paramName] = struct{}{}
 		}
 
 		segmentMetas = append(segmentMetas, meta)
@@ -227,8 +263,25 @@ const (
 // bind plan and recovers parameter names (aborting at startup if name-based
 // binding would be unreliable), freezes the request middleware chain, and
 // inserts the route into the method tree. It runs once, at startup, then
-// releases the registration queue and AST cache.
+// releases the registration queue and source-name caches.
 func (e *engine) generateRoute() {
+	// Collect every handler position before name resolution. The DWARF fallback
+	// can then index only these file:line keys instead of the whole binary.
+	e.dwarfTargets = make(map[string]struct{}, len(e.routeMetaSlice))
+	for _, meta := range e.routeMetaSlice {
+		v := reflect.ValueOf(meta.fn)
+		if !v.IsValid() || v.Kind() != reflect.Func || v.IsNil() {
+			continue
+		}
+		pc := v.Pointer()
+		if fun := runtime.FuncForPC(pc); fun != nil {
+			file, line := fun.FileLine(pc)
+			if file != empty && line > 0 {
+				e.dwarfTargets[file+colon+strconv.Itoa(line)] = struct{}{}
+			}
+		}
+	}
+
 	for _, meta := range e.routeMetaSlice {
 		segmentMetas, path := e.dealPath(meta.path)
 		method := meta.method
@@ -287,7 +340,8 @@ func (e *engine) generateRoute() {
 		if t.NumOut() > 0 {
 			out, ok := derefType(t.Out(0))
 			if !ok {
-				e.failStartup(fmt.Sprintf("recursive pointer return type for %s %s: %s", methodName, meta.path, t.Out(0)))
+				e.failStartup(fmt.Sprintf("recursive pointer return type for %s %s: %s",
+					methodName, meta.path, t.Out(0)))
 			}
 			switch out.Kind() {
 			case reflect.Struct, reflect.Interface, reflect.Map, reflect.Array:
@@ -307,7 +361,8 @@ func (e *engine) generateRoute() {
 		if t.NumIn() > 0 {
 			plan, err := buildBindPlan(t)
 			if err != nil {
-				e.failStartup(fmt.Sprintf("invalid handler parameter type for %s %s: %v", methodName, meta.path, err))
+				e.failStartup(fmt.Sprintf("invalid handler parameter type for %s %s: %v",
+					methodName, meta.path, err))
 			}
 			handler.plan = plan
 			for i, class := range handler.plan.classes {
@@ -336,6 +391,7 @@ func (e *engine) generateRoute() {
 				// Disk wins when both exist so a dev edit is never shadowed by the
 				// DWARF baked into an older binary.
 				names, resolved, ambiguous := e.resolveParamNames(handler.v)
+				nameSource := "source"
 				if ambiguous != empty {
 					e.failStartup(fmt.Sprintf("gbl: handler for %s %s has ambiguous parameter names at %s; "+
 						"put each handler on its own line or bind through a struct",
@@ -343,11 +399,21 @@ func (e *engine) generateRoute() {
 				}
 				if !resolved {
 					names, resolved, ambiguous = e.lookupParamNamesDWARF(handler.v)
+					nameSource = "DWARF"
 					if ambiguous != empty {
 						e.failStartup(fmt.Sprintf("gbl: handler for %s %s has ambiguous parameter names at %s; "+
 							"put each handler on its own line or bind through a struct",
 							methodName, meta.path, ambiguous))
 					}
+				}
+				// Both recovery paths preserve one slot per input, including
+				// unnamed parameters. A different count means the entry belongs
+				// to another signature and must not be padded or truncated into
+				// a plausible but wrong binding plan.
+				if resolved && len(names) != t.NumIn() {
+					e.failStartup(fmt.Sprintf("gbl: handler for %s %s has a %s input parameter count mismatch: "+
+						"got %d names for %d handler parameters; rebuild with matching source or debug information",
+						methodName, meta.path, nameSource, len(names), t.NumIn()))
 				}
 				handler.paramNames = normalizeParamNames(names, t.NumIn())
 				if !resolved {
@@ -403,7 +469,9 @@ func (e *engine) generateRoute() {
 	}
 	e.astFileMap = nil
 	e.astSpans = nil
+	e.astSpanIndex = nil
 	e.dwarfIndex = nil
+	e.dwarfTargets = nil
 	e.routeMetaSlice = nil
 	e.generated = true
 }
@@ -420,7 +488,13 @@ func isMethodExpression(v reflect.Value, t reflect.Type) bool {
 	if fun == nil {
 		return false
 	}
-	name := fun.Name()
+	return isMethodExpressionName(fun.Name(), t.In(0))
+}
+
+// isMethodExpressionName parses a runtime function name independently of its
+// reflected value. Unqualified names, such as a builtin's spelling, have no
+// receiver and therefore cannot be method expressions.
+func isMethodExpressionName(name string, receiverType reflect.Type) bool {
 	lastDot := strings.LastIndex(name, ".")
 	if lastDot < 0 {
 		return false
@@ -430,7 +504,7 @@ func isMethodExpression(v reflect.Value, t reflect.Type) bool {
 	if receiverDot < 0 {
 		return false
 	}
-	receiver, ok := derefType(t.In(0))
+	receiver, ok := derefType(receiverType)
 	if !ok {
 		return false
 	}
@@ -443,9 +517,8 @@ func isMethodExpression(v reflect.Value, t reflect.Type) bool {
 
 // resolveParamNames recovers handler parameter names from the source file.
 //
-// The reflection package reports a function parameter types but never its
-// parameter names, and
-// GBL binds request values by name, so the source recorded in the binary is parsed
+// The reflection package reports function parameter types but never their
+// names. GBL binds request values by name, so the source recorded in the binary is parsed
 // once per file at startup. The handler is located by SOURCE POSITION, the line
 // the runtime reports for its entry point, not by symbol name. A runtime symbol
 // is a full module-qualified path ("github.com/you/pkg.Handler"). The AST records
@@ -491,8 +564,14 @@ func (e *engine) resolveParamNames(v reflect.Value) ([]string, bool, string) {
 		return nil, false, empty
 	}
 
-	var paramNames []string
+	paramNames := make([]string, 0, len(funcType.Params.List))
 	for _, param := range funcType.Params.List {
+		if len(param.Names) == 0 {
+			// An unnamed field still occupies one input slot. Keeping an empty
+			// placeholder prevents a later named parameter from shifting left.
+			paramNames = append(paramNames, empty)
+			continue
+		}
 		for _, name := range param.Names {
 			paramNames = append(paramNames, name.Name)
 		}
@@ -510,13 +589,15 @@ func (e *engine) resolveParamNames(v reflect.Value) ([]string, bool, string) {
 // source position the runtime reports — "<file>:<line>" — so lookup needs no
 // symbol name and resolves closures and func literals exactly as the disk path
 // does. Position keys are also immune to Go 1.27 merging and renaming of
-// identical function literals, which makes symbol-keyed lookups unsafe.
+// identical function literals, which makes symbol-keyed lookups unsafe. During
+// route generation the index is restricted to the precollected handler positions;
+// direct callers without targets retain the full-index fallback.
 //
 // The second return reports whether DWARF yielded real names. The third return
 // marks duplicate file:line entries whose handler identity is ambiguous.
 func (e *engine) lookupParamNamesDWARF(v reflect.Value) ([]string, bool, string) {
 	if e.dwarfIndex == nil {
-		index := buildDWARFIndex()
+		index := buildDWARFIndexFor(e.dwarfTargets)
 		if index == nil {
 			// No readable DWARF: cache an empty map so later handlers do not reparse
 			// a binary that will never yield names.
@@ -585,16 +666,156 @@ func collectFuncSpans(fSet *token.FileSet, file *ast.File) []funcSpan {
 	return spans
 }
 
+// funcSpanIndex is a sweep-line index over function spans. Between consecutive
+// start/end events the innermost enclosing signature is constant, so a lookup
+// is one binary search rather than a scan of every handler in the file.
+type funcSpanIndex struct {
+	// lines holds event boundaries for binary search.
+	lines []int
+	// funcTypes is parallel to lines with the innermost active signature.
+	funcTypes []*ast.FuncType
+	// ambiguous is parallel to lines and marks equal-sized active spans.
+	ambiguous []bool
+	// starts counts declarations beginning on each source line.
+	starts map[int]int
+}
+
+// funcSpanEvent is one start or end boundary in the sweep-line index.
+type funcSpanEvent struct {
+	// line is the event source line.
+	line int
+	// index identifies the source span.
+	index int
+	// add distinguishes a start event from an end event.
+	add bool
+}
+
+// funcSpanHeap keeps the shortest active span at the top.
+type funcSpanHeap struct {
+	// spans is the shared source span table.
+	spans []funcSpan
+	// ids holds the heap indexes into spans.
+	ids []int
+}
+
+// Len returns the number of active heap entries.
+func (h *funcSpanHeap) Len() int { return len(h.ids) }
+
+// Less orders shorter spans first and breaks ties by source order.
+func (h *funcSpanHeap) Less(i, j int) bool {
+	left := h.spans[h.ids[i]]
+	right := h.spans[h.ids[j]]
+	leftLen, rightLen := left.end-left.start, right.end-right.start
+	if leftLen == rightLen {
+		return h.ids[i] < h.ids[j]
+	}
+	return leftLen < rightLen
+}
+
+// Swap exchanges two heap entries.
+func (h *funcSpanHeap) Swap(i, j int) { h.ids[i], h.ids[j] = h.ids[j], h.ids[i] }
+
+// Push adds a span index to the heap.
+func (h *funcSpanHeap) Push(value any) {
+	h.ids = append(h.ids, value.(int))
+}
+
+// Pop removes and returns the shortest active span index.
+func (h *funcSpanHeap) Pop() any {
+	last := len(h.ids) - 1
+	id := h.ids[last]
+	h.ids = h.ids[:last]
+	return id
+}
+
+// newFuncSpanIndex builds the index in O(H log H), where H is the number of
+// functions in the file, regardless of how many handlers later query it.
+func newFuncSpanIndex(spans []funcSpan) *funcSpanIndex {
+	if len(spans) == 0 {
+		return &funcSpanIndex{starts: make(map[int]int)}
+	}
+	events := make([]funcSpanEvent, 0, len(spans)*2)
+	starts := make(map[int]int, len(spans))
+	for i, span := range spans {
+		events = append(events,
+			funcSpanEvent{line: span.start, index: i, add: true},
+			funcSpanEvent{line: span.end + 1, index: i},
+		)
+		starts[span.start]++
+	}
+	sort.Slice(events, func(i, j int) bool { return events[i].line < events[j].line })
+
+	index := &funcSpanIndex{starts: starts}
+	active := make([]bool, len(spans))
+	lengthCounts := make(map[int]int, len(spans))
+	queue := &funcSpanHeap{spans: spans}
+
+	for pos := 0; pos < len(events); {
+		line := events[pos].line
+		for pos < len(events) && events[pos].line == line {
+			event := events[pos]
+			length := spans[event.index].end - spans[event.index].start
+			if event.add {
+				active[event.index] = true
+				lengthCounts[length]++
+				heap.Push(queue, event.index)
+			} else if active[event.index] {
+				active[event.index] = false
+				if lengthCounts[length] == 1 {
+					delete(lengthCounts, length)
+				} else {
+					lengthCounts[length]--
+				}
+			}
+			pos++
+		}
+		for queue.Len() > 0 && !active[queue.ids[0]] {
+			heap.Pop(queue)
+		}
+
+		index.lines = append(index.lines, line)
+		if queue.Len() == 0 {
+			index.funcTypes = append(index.funcTypes, nil)
+			index.ambiguous = append(index.ambiguous, false)
+			continue
+		}
+		best := queue.ids[0]
+		length := spans[best].end - spans[best].start
+		index.funcTypes = append(index.funcTypes, spans[best].funcType)
+		index.ambiguous = append(index.ambiguous, lengthCounts[length] > 1)
+	}
+	return index
+}
+
+// at returns the innermost signature for line and whether the position is ambiguous.
+func (index *funcSpanIndex) at(line int) (*ast.FuncType, bool) {
+	if index == nil || len(index.lines) == 0 || line < index.lines[0] {
+		return nil, false
+	}
+	// Multiple declarations beginning on one line are ambiguous even when one
+	// span is strictly smaller, matching findFuncTypeAt's historical contract.
+	if index.starts[line] > 1 {
+		return nil, true
+	}
+	pos := sort.Search(len(index.lines), func(i int) bool { return index.lines[i] > line }) - 1
+	return index.funcTypes[pos], index.ambiguous[pos]
+}
+
 // funcTypeAt returns the spans of a parsed file, collecting them on first use,
-// and resolves the line against them. Equal-sized candidates share the same
-// source line and cannot be distinguished without column information.
+// and resolves the line through a per-file index. Building the index once keeps
+// H handler lookups in one file at O(H log H), not O(H^2).
 func (e *engine) funcTypeAt(file *ast.File, line int) (*ast.FuncType, string) {
 	spans, ok := e.astSpans[file]
 	if !ok {
 		spans = collectFuncSpans(e.fest, file)
 		e.astSpans[file] = spans
 	}
-	funcType, ambiguous := findFuncTypeAt(spans, line)
+	index := e.astSpanIndex[file]
+	if index == nil {
+		index = newFuncSpanIndex(spans)
+		e.astSpanIndex[file] = index
+	}
+	funcType, ambiguous := index.at(line)
 	if ambiguous {
 		pos := e.fest.Position(file.Pos())
 		return nil, pos.Filename + colon + strconv.Itoa(line)
@@ -636,11 +857,12 @@ func findFuncTypeAt(spans []funcSpan, line int) (*ast.FuncType, bool) {
 
 // normalizeParamNames pads names to exactly count entries, one per parameter.
 //
-// Unnamed parameters contribute nothing to the recovered list, so it can arrive
-// short or empty. Every gap gets a positional placeholder ("arg0", "arg1", ...),
-// keeping binding deterministic and avoiding a later index-out-of-range panic.
-// The placeholder is an ordinary string, so a request key literally named "arg0"
-// could still match it; name your parameters to avoid that.
+// Position-aware recovery preserves unnamed inputs as empty slots; callers that
+// have no positional information may still supply a short or empty list. Every
+// gap gets a positional placeholder ("arg0", "arg1", ...), keeping binding
+// deterministic and avoiding a later index-out-of-range panic. The placeholder
+// is an ordinary string, so a request key literally named "arg0" could still
+// match it; name your parameters to avoid that.
 func normalizeParamNames(names []string, count int) []string {
 	normalized := make([]string, count)
 
