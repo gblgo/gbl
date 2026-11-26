@@ -13,8 +13,8 @@ import (
 
 // This file is the core request dispatch: match a route, run its frozen
 // middleware chain whose terminal endpoint invokes the business handler, then
-// write the staged result. Parameter binding lives in binding.go, request
-// parsing in request.go, and result serialization in response.go.
+// write the staged result. Parameter binding lives in a_binding.go, request
+// parsing in a_request.go, and result serialization in a_response.go.
 
 // Per-request scratch reused across the whole process. The wrapper holds only
 // plain fields and the map only strings, so both reset cheaply and carry no

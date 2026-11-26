@@ -323,7 +323,7 @@ func TestFindLevel(t *testing.T) {
 		{name: "warn", line: "WARN slow", level: "WARN", found: true},
 		{name: "error", line: "ERROR failed", level: "ERROR", found: true},
 		{name: "timestamp prefix", line: "2026/11/26 12:34:56 INFO ready", level: "INFO", found: true},
-		{name: "file prefix", line: "2026/11/26 12:34:56 logger.go:95 INFO ready", level: "INFO", found: true},
+		{name: "file prefix", line: "2026/11/26 12:34:56 a_logger.go:95 INFO ready", level: "INFO", found: true},
 		{name: "level without trailing whitespace", line: "ERROR", level: "ERROR", found: true},
 		{name: "first known level wins", line: "INFO WARN ERROR", level: "INFO", found: true},
 		{name: "message level after label", line: "INFO request ERROR failed", level: "INFO", found: true},

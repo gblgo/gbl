@@ -20,7 +20,7 @@ import (
 
 // This file holds request parsing: turning the inbound request into bindable
 // form values, uploaded files and a JSON body buffer, plus the size limits that
-// guard it. The binders that consume these inputs live in binding.go.
+// guard it. The binders that consume these inputs live in a_binding.go.
 
 // ByteSize is a human-readable byte count used by the size setters: the
 // exported type name tells a caller, at the signature, that the value is bytes.
