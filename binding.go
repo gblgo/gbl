@@ -44,7 +44,7 @@ type (
 	// structField is one settable (exported) field of a struct parameter,
 	// cached so bindStruct can skip reflection-based field introspection per
 	// request. name is the exact bind key: the non-empty JSON tag name when
-	// present, else the Go field name with its first letter lowercased. Thus a
+	// present, else the Go field name with its first letter lowercased. Thus, a
 	// lowercase request key binds to an exported PascalCase field without a tag.
 	structField struct {
 		// index is the field position in the reflected struct
@@ -184,6 +184,56 @@ func releaseParams(bufPool *[]reflect.Value, params []reflect.Value) {
 // maxTypePointerDepth bounds walks through recursive named pointer types.
 const maxTypePointerDepth = 64
 
+// maxFormPointerExpansion bounds the nodes a non-recursive struct pointer tree
+// can allocate for an empty form request.
+const maxFormPointerExpansion = 4096
+
+// validateFormPointerExpansion rejects acyclic pointer-to-struct trees whose
+// empty-form allocation would grow exponentially. Recursive pointers already
+// allocate lazily and therefore contribute no eager expansion here.
+func validateFormPointerExpansion(t reflect.Type) error {
+	memo := make(map[reflect.Type]int)
+	active := make(map[reflect.Type]bool)
+	var expansion func(reflect.Type) int
+	expansion = func(current reflect.Type) int {
+		pointers := 0
+		for current.Kind() == reflect.Pointer {
+			pointers++
+			current = current.Elem()
+		}
+		if current.Kind() != reflect.Struct || isRecursiveStruct(current) {
+			return 0
+		}
+		if count, ok := memo[current]; ok {
+			return count
+		}
+		if active[current] {
+			return 0
+		}
+		active[current] = true
+		total := pointers
+		if total > maxFormPointerExpansion {
+			total = maxFormPointerExpansion + 1
+		} else {
+			for _, field := range structFieldsOf(current) {
+				count := expansion(field.typ)
+				if count > maxFormPointerExpansion || total > maxFormPointerExpansion-count {
+					total = maxFormPointerExpansion + 1
+					break
+				}
+				total += count
+			}
+		}
+		delete(active, current)
+		memo[current] = total
+		return total
+	}
+	if count := expansion(t); count > maxFormPointerExpansion {
+		return fmt.Errorf("form pointer expansion for %s exceeds %d nodes", t, maxFormPointerExpansion)
+	}
+	return nil
+}
+
 // derefType strips pointer chains and rejects chains deeper than the binding
 // depth limit. Struct recursion is tracked separately by isRecursiveStruct.
 func derefType(t reflect.Type) (reflect.Type, bool) {
@@ -255,6 +305,9 @@ func buildBindPlan(rt reflect.Type) (bindPlan, error) {
 			}
 			plan.businessIndexes = append(plan.businessIndexes, i)
 			plan.needsParse = true
+			if err := validateFormPointerExpansion(t); err != nil {
+				return plan, err
+			}
 			if err := prewarmNestedStructs(t, visited); err != nil {
 				return plan, err
 			}
@@ -392,14 +445,15 @@ func prewarmNestedStructs(t reflect.Type, visited map[reflect.Type]bool) error {
 			}
 			_ = isRecursiveStruct(current)
 			_ = jsonStructFieldsOf(current)
-			for i := range current.NumField() {
-				field := current.Field(i)
+			for field := range current.Fields() {
 				if bindableStructField(field) {
 					pending = append(pending, field.Type)
 				}
 			}
 		case reflect.Array, reflect.Slice, reflect.Map:
 			pending = append(pending, current.Elem())
+		default:
+			// Other kinds cannot contain statically known nested structs.
 		}
 	}
 	return nil
@@ -456,8 +510,7 @@ func collectPromotedBindFields(t reflect.Type) []bindFieldCandidate {
 	var candidates []bindFieldCandidate
 	for head := 0; head < len(queue); head++ {
 		embedded := queue[head]
-		for i := range embedded.typ.NumField() {
-			field := embedded.typ.Field(i)
+		for field := range embedded.typ.Fields() {
 			if !bindableStructField(field) {
 				continue
 			}
@@ -574,7 +627,7 @@ func bindFieldConflictError(t reflect.Type, candidates []bindFieldCandidate) err
 	)
 }
 
-// foldBindName returns a deterministic key for unicode.SimpleFold equivalence.
+// foldBindName returns a deterministic key for Unicode simple case folding.
 // Each rune is represented by the smallest member of its complete fold cycle.
 func foldBindName(name string) string {
 	var folded strings.Builder
@@ -716,7 +769,7 @@ func computeJSONStructFields(t reflect.Type) map[string]reflect.Type {
 		index []int
 	}
 
-	current := []jsonEmbeddedType{}
+	var current []jsonEmbeddedType
 	next := []jsonEmbeddedType{{typ: t}}
 	var count, nextCount map[reflect.Type]int
 	visited := make(map[reflect.Type]bool)
@@ -1227,12 +1280,7 @@ type formBindState struct {
 
 // contains reports whether t is already active on the current branch.
 func (s *formBindState) contains(t reflect.Type) bool {
-	for _, active := range s.active[:s.size] {
-		if active == t {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(s.active[:s.size], t)
 }
 
 // push adds t to the active branch and rejects excessive nesting.

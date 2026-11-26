@@ -150,7 +150,6 @@ func bindTestEngine(t *testing.T, method, path string, fn any, names []string) *
 	} else {
 		e.insertNode(segments, normalized, m, rh)
 	}
-	e.generated = true
 	return e
 }
 
@@ -406,6 +405,22 @@ func TestBindStructRejectsWrongCaseKeys(t *testing.T) {
 	value := bindTestInterface(t, got).(bindTestFormStruct)
 	if value.Name != "" || value.ID != "" || value.Nested.Count != 0 || value.Nested.Exact != "" {
 		t.Fatalf("wrong-case keys bound unexpectedly: %#v", value)
+	}
+}
+
+func TestValidateFormPointerExpansionRejectsWideAcyclicTree(t *testing.T) {
+	leaf := reflect.TypeFor[struct{}]()
+	for range 16 {
+		leaf = reflect.StructOf([]reflect.StructField{
+			{Name: "Left", Type: reflect.PointerTo(leaf)},
+			{Name: "Right", Type: reflect.PointerTo(leaf)},
+		})
+	}
+	if err := validateFormPointerExpansion(leaf); err == nil {
+		t.Fatal("wide acyclic pointer tree was accepted")
+	}
+	if err := validateFormPointerExpansion(reflect.TypeFor[bindTestNested]()); err != nil {
+		t.Fatalf("ordinary struct pointer expansion: %v", err)
 	}
 }
 
