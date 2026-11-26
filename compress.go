@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,7 +20,7 @@ import (
 const (
 	// NoCompression store-only: framing bytes, no deflate work
 	NoCompression = gzip.NoCompression
-	// BestSpeed level 1: fastest, smallest ratio
+	// BestSpeed level 1: favors compression speed over compression ratio
 	BestSpeed = gzip.BestSpeed
 	// BestCompression level 9: slowest, best ratio
 	BestCompression = gzip.BestCompression
@@ -31,7 +32,8 @@ const (
 
 // minCompressSize is the threshold below which compression is skipped. Small
 // responses gain little from compression and the CPU cost is not worth it. The
-// rest are the wire fragments this middleware negotiates with clients.
+// related constants name the wire headers and encoding tokens used to negotiate
+// compression with clients.
 const (
 	// smallest body worth deflating, in bytes
 	minCompressSize = 1024
@@ -86,9 +88,13 @@ func Compress(level int) HandlerFunc {
 	}
 
 	return func(c *Context) {
-		c.writer.Header().Add(vary, acceptEncoding)
+		// Mark direct writes too, then restore the marker after middleware or the
+		// handler has had a chance to replace the Vary field.
+		ensureVaryAcceptEncoding(c.writer.Header())
 
 		c.Next()
+
+		ensureVaryAcceptEncoding(c.writer.Header())
 
 		// Only compress if the handler produced a result and nothing wrote yet
 		if !c.handled || c.writer.written() || c.writer.flushed() ||
@@ -102,13 +108,15 @@ func Compress(level int) HandlerFunc {
 			return
 		}
 
-		// Check if client accepts gzip
-		if !acceptsGzip(c.Request.Header.Get(acceptEncoding)) {
+		// Header.Values preserves repeated field lines; joining them keeps the
+		// second and later lines in the same negotiation as the first.
+		if !acceptsGzip(strings.Join(c.Request.Header.Values(acceptEncoding), comma)) {
 			return
 		}
 
-		// Check if content type is compressible
-		if !isCompressible(c.contentType) {
+		// The handler may have replaced the provisional Content-Type, so the
+		// response header rather than Context.contentType decides eligibility.
+		if !isCompressible(c.writer.Header().Get(contentType)) {
 			return
 		}
 
@@ -125,10 +133,9 @@ func Compress(level int) HandlerFunc {
 		gw := writerPool.Get().(*gzip.Writer)
 		gw.Reset(buf)
 
-		_, writeErr := gw.Write(c.bytes)
-		// Close flushes the deflate footer; a writer returns to the pool
-		// either way since Reset discards its state on the next use.
-		closeErr := gw.Close()
+		writeErr, closeErr := gzipWriteAndClose(gw, c.bytes)
+		// A writer returns to the pool either way since Reset discards its state
+		// on the next use.
 		writerPool.Put(gw)
 		if writeErr != nil || closeErr != nil {
 			releaseResponseBuffer(buf)
@@ -145,6 +152,30 @@ func Compress(level int) HandlerFunc {
 		c.writer.Header().Set(contentEncoding, encodingGzip)
 		c.writer.Header().Del("Content-Length")
 	}
+}
+
+// writeGzipAndClose always closes gw, even when Write fails, and returns both
+// errors independently so callers preserve the original failure semantics.
+func writeGzipAndClose(gw io.WriteCloser, data []byte) (error, error) {
+	_, writeErr := gw.Write(data)
+	closeErr := gw.Close()
+	return writeErr, closeErr
+}
+
+// gzipWriteAndClose lets serial fault-injection tests exercise middleware cleanup.
+var gzipWriteAndClose = writeGzipAndClose
+
+// ensureVaryAcceptEncoding adds the cache-key field once, preserving any other
+// Vary tokens and recognizing combined or repeated field lines.
+func ensureVaryAcceptEncoding(header http.Header) {
+	for _, value := range header.Values(vary) {
+		for token := range strings.SplitSeq(value, comma) {
+			if strings.EqualFold(strings.TrimSpace(token), acceptEncoding) {
+				return
+			}
+		}
+	}
+	header.Add(vary, acceptEncoding)
 }
 
 // acceptsGzip reports whether an Accept-Encoding header permits gzip. Explicit
@@ -169,8 +200,8 @@ func acceptsGzip(header string) bool {
 	return wildcard
 }
 
-// hasZeroWeight reports whether a media range parameters pin its quality
-// value to zero, the RFC way of explicitly refusing an encoding.
+// hasZeroWeight reports whether coding parameters pin the quality value to
+// zero, the RFC way of explicitly refusing an encoding.
 func hasZeroWeight(params string) bool {
 	for param := range strings.SplitSeq(params, ";") {
 		key, value, ok := strings.Cut(param, "=")

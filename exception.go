@@ -57,7 +57,7 @@ func abort(status int, body string) {
 }
 
 // typeRecognitionError is the fixed fallback body written when errorWriteback
-// meets a reflected value of an unhandled kind.
+// cannot safely render a value, including a panicking Error method.
 var typeRecognitionError = []byte("Reflection Type Identification Exception")
 
 // errorWriteback renders a panic payload as response bytes, choosing the form by
@@ -81,7 +81,15 @@ func errorWritebackDepth(err any, depth int) ([]byte, string) {
 	// an empty "{}" with no information at all. Keeping the message plain also
 	// matches the 404, 405 and 501 replies the framework generates itself.
 	if e, ok := err.(error); ok {
-		return []byte(e.Error()), textPlainCharset
+		value := reflect.ValueOf(e)
+		switch value.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+			reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+			if value.IsNil() {
+				return []byte(empty), textPlainCharset
+			}
+		}
+		return []byte(safeErrorMessage(e)), textPlainCharset
 	}
 
 	val := reflect.ValueOf(err)
@@ -118,6 +126,17 @@ func errorWritebackDepth(err any, depth int) ([]byte, string) {
 	default:
 		return typeRecognitionError, textPlainCharset
 	}
+}
+
+// safeErrorMessage keeps user-defined Error methods from escaping a panic during
+// response rendering. The fallback is fixed and contains no recovered detail.
+func safeErrorMessage(err error) (message string) {
+	defer func() {
+		if recover() != nil {
+			message = string(typeRecognitionError)
+		}
+	}()
+	return err.Error()
 }
 
 // writeResponseAbort renders a framework-controlled halt during request-level

@@ -15,7 +15,7 @@ import (
 
 // This file holds response serialization: rendering a handler return value
 // into the bytes the pipeline writes. The pooled writer itself lives in
-// responseWriter.go; the dispatch that stages this result lives in handler.go.
+// responseWriter.go; the dispatch that stages this result lives in context.go.
 
 // responseBufferPool recycles the buffer used to serialize handler return values,
 // so a request reuses one backing array instead of allocating fresh bytes every time.

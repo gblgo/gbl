@@ -38,10 +38,10 @@ type responseWriter interface {
 	size() int
 }
 
-// pooledResponseWriter is the pooled wrapper the engine hands down. It buffers the
-// status and byte count so a panic or post-handler middleware can still flush the
-// right status, and mirrors net/http rule that the first body write commits
-// whatever status was set beforehand.
+// pooledResponseWriter is the pooled wrapper the engine hands down. It records
+// the status and byte count so a panic or post-handler middleware can still flush
+// the right status, and mirrors the net/http rule that the first body write
+// commits whatever status was set beforehand.
 type pooledResponseWriter struct {
 	// wrapped sink, reset per request; never retained across requests
 	w http.ResponseWriter
@@ -61,6 +61,10 @@ type pooledResponseWriter struct {
 	flushedStatus bool
 	// connection ownership has been transferred by Hijack
 	hijackedStatus bool
+	// interface-return handlers delay flush until their result selects a media type
+	deferFlush bool
+	// a delayed flush is waiting for the serialized handler result
+	flushPending bool
 }
 
 // hijackRegistry tracks connections removed from net/http by a successful Hijack.
@@ -244,13 +248,16 @@ func (rw *pooledResponseWriter) replaceStatus(code int) {
 }
 
 // Flush commits the current status and forwards to the underlying flusher when
-// the sink supports streaming.
+// the sink supports streaming. Interface-return handlers defer this commit until
+// their result has selected the final media type.
 func (rw *pooledResponseWriter) Flush() {
 	_ = rw.FlushError()
 }
 
 // FlushError lets http.ResponseController distinguish a sink that cannot flush
-// from one whose flush succeeded.
+// from one whose flush succeeded. A deferred flush cannot report a later
+// underlying failure to the handler that already returned, so it is best-effort
+// like Flush; concrete returns and SSE never defer it.
 func (rw *pooledResponseWriter) FlushError() error {
 	if rw.hijackedStatus {
 		return http.ErrHijacked
@@ -258,8 +265,27 @@ func (rw *pooledResponseWriter) FlushError() error {
 	if !supportsFlush(rw.w) {
 		return http.ErrNotSupported
 	}
+	if rw.deferFlush && !rw.flushedStatus {
+		rw.flushPending = true
+		return nil
+	}
+	rw.flushPending = false
 	rw.writeHeader()
 	return http.NewResponseController(rw.w).Flush()
+}
+
+// commitDeferredFlush performs the flush requested during an interface-returning
+// handler after its result has been serialized and its headers updated.
+func (rw *pooledResponseWriter) commitDeferredFlush() {
+	if !rw.flushPending {
+		return
+	}
+	rw.flushPending = false
+	if rw.hijackedStatus {
+		return
+	}
+	rw.writeHeader()
+	_ = http.NewResponseController(rw.w).Flush()
 }
 
 // supportsFlush reports whether the Unwrap chain exposes FlushError or Flusher.

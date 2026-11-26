@@ -55,14 +55,18 @@ type Context struct {
 	// handlers own the response by declaring an http.ResponseWriter parameter,
 	// and it must never be stored beyond the request.
 	writer responseWriter
-	// result content type chosen at registration
+	// runtime media type chosen after the handler result is serialized
 	contentType string
 	// memoized boxed ret, filled only once Result is called
 	result any
 	// engine log sink, so middleware logging honors SetLogger
 	logger Logger
 
+	// Request is the active request visible to middleware and handlers.
 	Request *http.Request
+	// originalRequest retains the request whose body the framework parsed, even
+	// when middleware replaces the public Request pointer.
+	originalRequest *http.Request
 	// cursor into handlers; abortIndex means "stopped"
 	index int
 	// params holds matched path parameters for this request
@@ -76,6 +80,7 @@ type Context struct {
 	// sse is non-nil while an SSE handler is binding or running.
 	sse *sseWriter
 
+	// method is the normalized HTTP method used for routing and body policy.
 	method httpMethod
 	// the handler actually ran
 	handled bool
@@ -101,6 +106,7 @@ func newContext(w *pooledResponseWriter,
 	c.writer = w
 	c.sse = nil
 	c.Request = r
+	c.originalRequest = r
 	c.handlers = rh.handlers
 	c.index = -1
 	c.params = params
@@ -123,10 +129,11 @@ func newContext(w *pooledResponseWriter,
 // pool, so a pooled Context never pins a finished request writer, body or
 // middleware-set values.
 func (c *Context) recycle() {
-	cleanupMultipart(c.Request)
+	cleanupMultipart(c.originalRequest)
 	c.writer = nil
 	c.sse = nil
 	c.Request = nil
+	c.originalRequest = nil
 	c.handlers = nil
 	c.params = nil
 	c.rh = nil
@@ -177,9 +184,9 @@ func (c *Context) IsWritten() bool { return c.writer.written() }
 
 // StatusCode reports the status that will be, or was, sent for this response:
 // the recorded one once anything has set it, otherwise net/http 200 default.
-// Because the staged body is committed only after the whole chain unwinds, this
-// prediction is what lets an access-log or metrics middleware read the effective
-// status from c.Next() return point.
+// Because the staged body is committed only after the whole chain unwinds (even
+// when a handler flushes its headers earlier), this prediction lets an access-log
+// or metrics middleware read the effective status from c.Next() return point.
 func (c *Context) StatusCode() int { return c.writer.status() }
 
 // Size reports the effective response body length: the bytes already written,
@@ -260,9 +267,20 @@ func (c *Context) Result() any {
 	return c.result
 }
 
-// commitPendingResponse preserves a status recorded before an abort without
-// allowing the abort to replace it.
+// hasPendingFlush reports whether an interface-returning handler asked to flush
+// before its result could be serialized.
+func (c *Context) hasPendingFlush() bool {
+	rw, ok := c.writer.(*pooledResponseWriter)
+	return ok && rw.flushPending
+}
+
+// commitPendingResponse preserves a status or flush requested before an abort
+// without allowing the abort to replace it.
 func (c *Context) commitPendingResponse() {
+	if rw, ok := c.writer.(*pooledResponseWriter); ok && rw.flushPending {
+		rw.commitDeferredFlush()
+		return
+	}
 	if c.writer.headed() && !c.writer.flushed() && !c.writer.written() && !c.writer.hijacked() {
 		c.writer.writeHeader()
 	}
@@ -270,7 +288,8 @@ func (c *Context) commitPendingResponse() {
 
 // AbortWithStatusString denies the request with a plain-text body and stops the chain.
 func (c *Context) AbortWithStatusString(status int, body string) {
-	if c.writer.headed() || c.writer.flushed() || c.writer.written() || c.writer.hijacked() {
+	if c.writer.headed() || c.writer.flushed() || c.writer.written() ||
+		c.writer.hijacked() || c.hasPendingFlush() {
 		c.commitPendingResponse()
 		c.Abort()
 		return
@@ -288,13 +307,15 @@ func (c *Context) AbortWithStatusString(status int, body string) {
 // A marshaling failure is a server-side fault, so it aborts with a generic 500
 // rather than echoing detail.
 func (c *Context) AbortWithStatusJSON(status int, body any) {
-	if c.writer.headed() || c.writer.flushed() || c.writer.written() || c.writer.hijacked() {
+	if c.writer.headed() || c.writer.flushed() || c.writer.written() ||
+		c.writer.hijacked() || c.hasPendingFlush() {
 		c.commitPendingResponse()
 		c.Abort()
 		return
 	}
 	data, err := json.Marshal(body)
 	if err != nil {
+		c.Abort()
 		abort(http.StatusInternalServerError, responseSerializationFailed)
 		return
 	}
@@ -341,11 +362,14 @@ func (c *Context) invokeHandler() {
 		err     error
 	)
 	if rh.plan.needsParse {
+		// Anchor cleanup to the request actually being parsed, not a pointer that
+		// post-handler middleware may later replace.
+		c.originalRequest = c.Request
 		form, files, bodyBuf, isJSON, err = parseRequestParameters(
 			c.writer, c.Request, c.method, rh.plan.queryKeys,
 		)
 		if err != nil {
-			writeRequestError(err)
+			writeRequestError(err, c.logger)
 			return
 		}
 	}
@@ -411,6 +435,21 @@ func (c *Context) invokeHandler() {
 		defer stopHeartbeat()
 	}
 
+	// An interface return can change media type at runtime. Delay a handler's
+	// flush until serialization has selected that type; concrete returns and SSE
+	// keep their immediate flush behavior.
+	var flushWriter *pooledResponseWriter
+	if rh.t.NumOut() > 0 {
+		returnType, ok := derefType(rh.t.Out(0))
+		if ok && returnType.Kind() == reflect.Interface {
+			flushWriter, _ = c.writer.(*pooledResponseWriter)
+			if flushWriter != nil {
+				flushWriter.deferFlush = true
+				defer func() { flushWriter.deferFlush = false }()
+			}
+		}
+	}
+
 	out := rh.v.Call(in)
 	if len(out) > 0 {
 		buf := responseBufferPool.Get().(*bytes.Buffer)
@@ -423,12 +462,18 @@ func (c *Context) invokeHandler() {
 			return
 		}
 		c.contentType = mediaType
+		if !c.writer.flushed() && !c.writer.hijacked() {
+			c.writer.Header().Set(contentType, mediaType)
+		}
 		c.bytes = buf.Bytes()
 		c.responseBuf = buf
 		// Retain the raw return; Result boxes it only if a middleware asks.
 		c.ret = out[0]
 	}
 	c.handled = true
+	if flushWriter != nil {
+		flushWriter.commitDeferredFlush()
+	}
 }
 
 // startSSE commits the stream and starts its heartbeat after binding succeeds.
