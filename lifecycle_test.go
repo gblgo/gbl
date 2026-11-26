@@ -248,16 +248,13 @@ func routeTestRequireFailedStartupState(t *testing.T, e *engine) {
 	}
 }
 
-func TestLifecycleRunAfterGenerationPanics(t *testing.T) {
+func TestLifecycleAssemblingRejectedAfterRunClaim(t *testing.T) {
 	e := routeTestNewEngine(t)
-	e.register(methodGet, "/generated", func() string { return "ok" })
-	e.generateRoute()
-
-	panicValue := routeTestRequirePanic(t, e.run)
-	if panicValue != "gbl.Run called twice; the engine serves only once" {
-		t.Fatalf("Run after generateRoute panic = %#v", panicValue)
+	e.runState.Store(runStateStarting)
+	panicValue := routeTestRequirePanic(t, func() { e.assertAssembling("Configure") })
+	if panicValue != "gbl.Configure must be called before Run; the engine is read-only while serving" {
+		t.Fatalf("assertAssembling panic = %#v", panicValue)
 	}
-	routeTestRequireFailedStartupState(t, e)
 }
 
 func TestLifecycleShutdownDuringStartupHonorsContext(t *testing.T) {
@@ -651,6 +648,26 @@ func TestLifecycleShutdownTimeoutCanBeRetried(t *testing.T) {
 	routeTestWaitDone(t, server.done, "Run after retried Shutdown")
 	if server.panicValue != nil {
 		t.Fatalf("Run panicked after retried Shutdown: %v", server.panicValue)
+	}
+}
+
+func TestLifecycleShutdownLockWaitHonorsContext(t *testing.T) {
+	e := routeTestNewEngine(t)
+	e.runState.Store(runStateRunning)
+	e.server = &http.Server{}
+	e.shutdownMu <- struct{}{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := e.shutdown(ctx)
+	elapsed := time.Since(started)
+	<-e.shutdownMu
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown while another drain holds the lock = %v, want context deadline exceeded", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("Shutdown ignored context while waiting for the lock: %s", elapsed)
 	}
 }
 

@@ -473,7 +473,6 @@ func (e *engine) generateRoute() {
 	e.dwarfIndex = nil
 	e.dwarfTargets = nil
 	e.routeMetaSlice = nil
-	e.generated = true
 }
 
 // isMethodExpression reports whether v is a method expression such as T.M. Its
@@ -701,7 +700,7 @@ type funcSpanHeap struct {
 // Len returns the number of active heap entries.
 func (h *funcSpanHeap) Len() int { return len(h.ids) }
 
-// Less orders shorter spans first and breaks ties by source order.
+// Less indicates whether the left span sorts first, preferring shorter spans and source order for ties.
 func (h *funcSpanHeap) Less(i, j int) bool {
 	left := h.spans[h.ids[i]]
 	right := h.spans[h.ids[j]]

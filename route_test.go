@@ -1003,8 +1003,8 @@ func TestRouteGenerationRejectsInvalidHandlers(t *testing.T) {
 			e := routeTestNewEngine(t)
 			e.register(methodGet, "/invalid", tt.fn)
 			routeTestRequirePanicMessage(t, tt.want, e.generateRoute)
-			if e.generated {
-				t.Fatal("invalid handler froze the route set")
+			if e.routeMetaSlice == nil {
+				t.Fatal("invalid handler cleared the registration queue")
 			}
 		})
 	}
@@ -1050,8 +1050,8 @@ func TestRouteGenerationRejectsAmbiguousStructFields(t *testing.T) {
 					t.Errorf("startup panic = %v, want substring %q", panicValue, want)
 				}
 			}
-			if e.generated {
-				t.Fatal("ambiguous handler froze the route set")
+			if e.routeMetaSlice == nil {
+				t.Fatal("ambiguous handler cleared the registration queue")
 			}
 		})
 	}
@@ -1064,8 +1064,8 @@ func TestRouteGenerationAllowsShallowStructDominance(t *testing.T) {
 	e.register(methodGet, "/shallow",
 		routeTestHandlerForParameterType(reflect.TypeFor[CorrectnessShallow]()))
 	e.generateRoute()
-	if !e.generated {
-		t.Fatal("shallow-dominant struct did not freeze the route set")
+	if e.routeMetaSlice != nil {
+		t.Fatal("successful generation did not release the registration queue")
 	}
 }
 

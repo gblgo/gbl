@@ -300,7 +300,7 @@ func TestPublicNilConfigurationAndPanicProcessor(t *testing.T) {
 	}
 }
 
-func TestPublicAssemblingAPIsFreezeAfterGeneration(t *testing.T) {
+func TestPublicAssemblingAPIsFreezeAfterRunClaim(t *testing.T) {
 	e := publicTestUseDefaultEngine(t)
 	e.logger = routeTestDiscardLogger{}
 	oldBodyLimit := maxBodySize.Load()
@@ -320,6 +320,7 @@ func TestPublicAssemblingAPIsFreezeAfterGeneration(t *testing.T) {
 	})
 	Get("/frozen", func() string { return "ok" })
 	e.generateRoute()
+	e.runState.Store(runStateRunning)
 	beforeConfig := e.cfg
 	beforeMiddleware := len(e.middlewares)
 	beforeGroupMiddleware := len(group.(*routeGroup).middlewares)

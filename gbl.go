@@ -73,14 +73,12 @@ type engine struct {
 	// guards server publication only; net.Listen deliberately runs outside this lock
 	startMu sync.Mutex
 	// serializes shutdown attempts so Run can wait for an in-progress drain
-	shutdownMu sync.Mutex
+	shutdownMu chan struct{}
 
 	// runState makes the single-use claim atomic, independently of route generation
 	runState atomic.Uint32
 	// closed when Run publishes its server or aborts startup, unblocking an early Shutdown
 	startDone chan struct{}
-	// routes frozen into trees; also gates the read-only-after-Run contract
-	generated bool
 	// the server has been drained successfully; later Shutdown calls are no-ops
 	shutdownDone atomic.Bool
 }
@@ -119,6 +117,7 @@ func newEngine() *engine {
 		streamCtx:     streamCtx,
 		cancelStreams: cancelStreams,
 		startDone:     make(chan struct{}),
+		shutdownMu:    make(chan struct{}, 1),
 	}
 }
 
@@ -135,8 +134,8 @@ func Run() { defaultEngine.run() }
 // requests until ctx expires. A successful shutdown also closes connections
 // previously hijacked by handlers. It is safe to call more than once and from
 // another goroutine than Run; a failed attempt can be retried for the remaining
-// active connections. Calling it before Run returns "http: Server closed". A
-// call during startup waits for server publication, then drains that server.
+// active connections. Calling it before Run starts returns "http: Server closed".
+// A call during startup waits for server publication, then drains that server.
 func Shutdown(ctx context.Context) error { return defaultEngine.shutdown(ctx) }
 
 // Package-level seams for Run's process and network boundaries. Tests replace
@@ -155,9 +154,9 @@ var (
 
 // run is the instance-level counterpart of the package-level Run.
 func (e *engine) run() {
-	// Claim the engine before any startup work. Route generation is not a usable
-	// guard here: concurrent callers can all observe generated == false and race
-	// into net.Listen, producing port errors instead of the single-use diagnostic.
+	// Claim the engine before any startup work so concurrent callers cannot race
+	// into route generation or net.Listen and produce a port error instead of the
+	// single-use diagnostic.
 	if !e.runState.CompareAndSwap(runStateIdle, runStateStarting) {
 		panic("gbl.Run called twice; the engine serves only once")
 	}
@@ -179,12 +178,6 @@ func (e *engine) run() {
 			<-watcherDone
 		}
 	}()
-
-	// Preserve the original frozen-route guard for callers that generate routes
-	// manually; the atomic claim above is what makes concurrent Run calls safe.
-	if e.generated {
-		panic("gbl.Run called twice; the engine serves only once")
-	}
 
 	// The configuration is whatever Configure left on the engine, defaults
 	// included. The kernel reads no file; an integration layer resolves its
@@ -240,8 +233,9 @@ func (e *engine) run() {
 			ctx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
 			defer cancel()
 			if err := e.shutdown(ctx); err != nil {
-				e.logger.Warn("graceful shutdown failed; forcing connections closed",
-					"error", err)
+				safeLog(func() {
+					e.logger.Warn("graceful shutdown failed; forcing connections closed", "error", err)
+				})
 				_ = server.Close()
 				e.hijacks.closeAll()
 			}
@@ -274,8 +268,8 @@ func (e *engine) run() {
 	// release shutdownMu before returning as well. Signal-watcher cleanup itself
 	// is deferred above so startup panics cannot leave a registered watcher behind.
 	if errors.Is(serveErr, http.ErrServerClosed) {
-		e.shutdownMu.Lock()
-		e.shutdownMu.Unlock()
+		e.shutdownMu <- struct{}{}
+		<-e.shutdownMu
 	}
 
 	// ErrServerClosed is the expected result of a graceful shutdown, not a
@@ -306,8 +300,12 @@ func (e *engine) shutdown(ctx context.Context) error {
 		}
 	}
 
-	e.shutdownMu.Lock()
-	defer e.shutdownMu.Unlock()
+	select {
+	case e.shutdownMu <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-e.shutdownMu }()
 
 	// Only a completed drain latches: an expired grace period or an interrupted
 	// wait keeps remaining non-SSE connections alive, so the same call can be
@@ -347,18 +345,17 @@ func (e *engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	e.serveHTTP(w, r)
 }
 
-// assertAssembling is the engine read-only-after-Run contract: route
+// assertAssembling is the engine read-only-after-Run-claim contract: route
 // registration, middleware, loggers, CORS, configuration, panic renderers and
 // size limits are all assembling-time decisions, merged into frozen structures
-// by generateRoute. Calling one of those setters afterward cannot take effect
-// (the chains are built, the handler is wired, the config is copied), so
-// instead of silently swallowing the call the engine fails fast: a wrong
-// registration ORDER is a programming error exactly like a wrong registration
-// CONTENT, and deserves the same loud treatment. The panic is raised without
-// the failStartup log because the process is past startup: the caller is a
-// running program holding a stack trace that names its own mistake.
+// by generateRoute. Once Run is claimed, calling one of those setters cannot take
+// effect, so instead of silently swallowing the call the engine fails fast: a
+// wrong registration ORDER is a programming error exactly like a wrong
+// registration CONTENT. The panic is raised without the failStartup log because
+// startup may already be in progress and the caller's stack trace names the
+// mistake directly.
 func (e *engine) assertAssembling(op string) {
-	if e.generated {
+	if e.runState.Load() != runStateIdle {
 		panic("gbl." + op + " must be called before Run; the engine is read-only while serving")
 	}
 }

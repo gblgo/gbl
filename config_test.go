@@ -208,11 +208,11 @@ func TestEngineConfigureCanClearTLS(t *testing.T) {
 
 func TestConfigureUsesDefaultEngine(t *testing.T) {
 	previous := defaultEngine.cfg
-	previousGenerated := defaultEngine.generated
-	defaultEngine.generated = false
+	previousRunState := defaultEngine.runState.Load()
+	defaultEngine.runState.Store(runStateIdle)
 	t.Cleanup(func() {
 		defaultEngine.cfg = previous
-		defaultEngine.generated = previousGenerated
+		defaultEngine.runState.Store(previousRunState)
 	})
 
 	Configure(func(c *Config) {
@@ -228,13 +228,13 @@ func TestConfigureUsesDefaultEngine(t *testing.T) {
 	}
 }
 
-func TestConfigureIsFrozenAfterGeneration(t *testing.T) {
+func TestConfigureIsFrozenAfterRunClaim(t *testing.T) {
 	previous := defaultEngine.cfg
-	previousGenerated := defaultEngine.generated
-	defaultEngine.generated = true
+	previousRunState := defaultEngine.runState.Load()
+	defaultEngine.runState.Store(runStateRunning)
 	t.Cleanup(func() {
 		defaultEngine.cfg = previous
-		defaultEngine.generated = previousGenerated
+		defaultEngine.runState.Store(previousRunState)
 	})
 
 	recovered := configTestPanicValue(func() { Configure(func(*Config) {}) })
