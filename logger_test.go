@@ -432,7 +432,8 @@ func TestSetLoggerIsFrozenAfterRunClaim(t *testing.T) {
 func TestEngineSetLoggerRejectsNilAndFailStartup(t *testing.T) {
 	e := newEngine()
 	defer e.cancelStreams()
-	initial := e.logger
+	initial := &logTestCaptureLogger{}
+	e.logger = initial
 	if recovered := logTestPanicValue(func() { e.setLogger(nil) }); recovered == nil {
 		t.Fatal("engine.setLogger(nil) did not panic")
 	}
