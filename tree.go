@@ -14,11 +14,11 @@ import (
 // walking segments from the root; the node where the last segment lands either
 // terminates in a handler (exist) or is only a waypoint on a longer route.
 type routeNode struct {
-	// raw segment text this node was created for
+	// raw segment text of the first registration at this node
 	segment string
 	// full route path, set only on a terminal node
 	path string
-	// binding name when segment is a variable, e.g. "id" for ":id"
+	// first registration name when segment is a variable; retained for diagnostics
 	paramName string
 	// true when a handler is registered at this node
 	exist bool
@@ -26,8 +26,18 @@ type routeNode struct {
 	handler *routeHandler
 	// literal children, keyed by exact segment text
 	staticNode map[string]*routeNode
-	// wildcard children, matched against any segment
+	// structural wildcard child, matched against any segment. The slice is kept
+	// for existing tree walkers, but a generated node has at most one entry:
+	// marker spelling and parameter names do not create distinct branches.
 	varNode []*routeNode
+}
+
+// pathParam binds one dynamic segment position to a route-specific name.
+type pathParam struct {
+	// name is the route-specific request binding key.
+	name string
+	// index is the matched path segment position.
+	index int
 }
 
 // segmentMeta is one parsed segment of a registration path: its text, whether
@@ -57,11 +67,14 @@ func findOverlappingRoute(node *routeNode, segments []segmentMeta, index int) (b
 				return true, path
 			}
 		}
-	} else if found, path := findOverlappingRoute(node.staticNode[meta.segment], segments, index+1); found {
+	} else if found, path := findOverlappingRoute(
+		node.staticNode[meta.segment], segments, index+1); found {
 		return true, path
 	}
-	for _, child := range node.varNode {
-		if found, path := findOverlappingRoute(child, segments, index+1); found {
+	// Generated trees have one structural wildcard child. Keeping this as a
+	// direct probe avoids the name-dependent linear scan of the old slice.
+	if len(node.varNode) > 0 {
+		if found, path := findOverlappingRoute(node.varNode[0], segments, index+1); found {
 			return true, path
 		}
 	}
@@ -82,13 +95,12 @@ func newNode(segment string) *routeNode {
 // insertNode walks segmentMetas down the tree for method, creating static and
 // variable nodes as needed and attaching handler at the terminal node. Duplicate
 // concrete routes and structurally equivalent variable routes abort startup with
-// a panic, since both would leave matching ambiguous.
+// a panic, since both would leave matching ambiguous. All wildcard segments at
+// one position share a node regardless of marker or parameter name; the terminal
+// handler owns the names used to bind that matched route.
 func (e *engine) insertNode(segmentMetas []segmentMeta, path string,
 	method httpMethod, handler *routeHandler) {
-
-	// Get the root node of the corresponding method
 	root := e.roots[method]
-	// Check if the root node is nil
 	if root == nil {
 		root = newNode(slash)
 		e.roots[method] = root
@@ -96,30 +108,30 @@ func (e *engine) insertNode(segmentMetas []segmentMeta, path string,
 	if found, existingPath := findOverlappingRoute(root, segmentMetas, 0); found {
 		e.failStartup(fmt.Errorf("variable route conflicts: [%s %s]", path, existingPath))
 	}
-	// Insert route segments
+
+	handler.pathParams = handler.pathParams[:0]
+	for i, meta := range segmentMetas {
+		if meta.isVar {
+			handler.pathParams = append(handler.pathParams, pathParam{name: meta.paramName, index: i})
+		}
+	}
+
+	// Insert route segments.
 	for i, meta := range segmentMetas {
 		isLast := i == len(segmentMetas)-1
 		if meta.isVar {
 			var node *routeNode
-			// First, find the dynamic node with the same name
-			for _, vn := range root.varNode {
-				if vn.segment == meta.segment {
-					node = vn
-					break
-				}
-			}
-
-			if node == nil {
+			if len(root.varNode) > 0 {
+				node = root.varNode[0]
+			} else {
 				node = newNode(meta.segment)
+				// Retained for diagnostics and compatibility with existing tree
+				// inspectors; request binding uses handler.pathParams instead.
 				node.paramName = meta.paramName
 				root.varNode = append(root.varNode, node)
 			}
 
 			if isLast {
-				if node.exist {
-					e.failStartup(fmt.Errorf("variable route already exists: [%s %s]", path, node.path))
-				}
-
 				node.exist = true
 				node.handler = handler
 				node.path = path
@@ -129,20 +141,14 @@ func (e *engine) insertNode(segmentMetas []segmentMeta, path string,
 			continue
 		}
 
-		// Find or create a static node
+		// Find or create a static node.
 		node := root.staticNode[meta.segment]
-
 		if node == nil {
 			node = newNode(meta.segment)
 			root.staticNode[meta.segment] = node
 		}
 
-		// Handle terminal node
 		if isLast {
-			if node.exist {
-				e.failStartup(fmt.Errorf("static route already exists: [%s %s]", path, node.path))
-			}
-
 			node.exist = true
 			node.handler = handler
 			node.path = path
@@ -221,7 +227,7 @@ func (e *engine) matchNode(
 		}
 	}
 
-	// Slow path: fall back to radix tree for dynamic routes (O(path length))
+	// Slow path: fall back to the segment trie for dynamic routes
 	root := e.roots[method]
 	if root == nil {
 		return nil, params
@@ -266,10 +272,18 @@ func (e *engine) allowFor(path string) []string {
 		}
 	}
 
-	// HEAD is served by the GET route even when it was never registered, so the
-	// advertised method list has to match what serveHTTP really accepts.
+	// HEAD is served by the GET route even when it was never registered, and
+	// OPTIONS is answered automatically for every reachable path. The advertised
+	// list therefore includes both implicit verbs, without duplicating an
+	// explicitly registered OPTIONS handler.
 	if reachable[methodGet] {
 		reachable[methodHead] = true
+	}
+	for _, ok := range reachable {
+		if ok {
+			reachable[methodOptions] = true
+			break
+		}
 	}
 
 	var allowed []string
@@ -283,53 +297,35 @@ func (e *engine) allowFor(path string) []string {
 }
 
 // searchNode recursively matches segments[index:] starting at root, preferring
-// a static child over a variable one at every level. When it commits to a
-// variable branch it records the segment under that node parameter name and,
-// if the branch later proves dead, deletes it again so a failed search leaves
-// no stray params behind.
+// a static child over the single structural variable child at every level.
+// Parameters are bound only after a terminal handler is found, using that
+// handler route-specific names; failed branches therefore leave no stray keys
+// and shared wildcard nodes need no backtracking cleanup.
 func searchNode(root *routeNode, segments []string, index int,
 	params map[string]string) *routeHandler {
-
 	if root == nil {
 		return nil
 	}
-
-	// All path segments have matched successfully
 	if index == len(segments) {
-		if root.exist {
-			return root.handler
+		if !root.exist {
+			return nil
 		}
-		return nil
+		for _, param := range root.handler.pathParams {
+			params[param.name] = segments[param.index]
+		}
+		return root.handler
 	}
 
 	segment := segments[index]
-
-	// Priority matching for static nodes
-	staticNode := root.staticNode[segment]
-
-	if staticNode != nil {
-		handler := searchNode(staticNode, segments, index+1, params)
-
-		if handler != nil {
+	if staticNode := root.staticNode[segment]; staticNode != nil {
+		if handler := searchNode(staticNode, segments, index+1, params); handler != nil {
 			return handler
 		}
 	}
-
-	// Static node matching failed, attempting dynamic node
-	for _, vn := range root.varNode {
-
-		// Record the current dynamic parameters
-		params[vn.paramName] = segment
-
-		handler := searchNode(vn, segments, index+1, params)
-
-		if handler != nil {
+	if len(root.varNode) > 0 {
+		if handler := searchNode(root.varNode[0], segments, index+1, params); handler != nil {
 			return handler
 		}
-
-		// The current branch matching failed, delete the parameters just recorded
-		delete(params, vn.paramName)
 	}
-
 	return nil
 }

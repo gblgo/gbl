@@ -92,8 +92,8 @@ func (cc *CorsConfig) validate() error {
 // The engine keeps a private deep copy, so later edits to the caller struct
 // can neither race the serving goroutines nor switch policy mid-flight.
 // A configuration rejected by this security policy (see validate) aborts
-// startup here, before Run. Like every assembling API it panics once the
-// engine is serving: the handler chain has already been built.
+// startup here, before Run. Like every assembling API it panics once Run is
+// claimed: the handler chain is no longer editable.
 func SetCorsConfig(cc *CorsConfig) {
 	defaultEngine.useCors(cc)
 }
@@ -213,9 +213,14 @@ func containsFold(values []string, target string) bool {
 }
 
 // containsInMap reports whether target matches a large precomputed allow-list
-// map, using stack storage for the ASCII tokens HTTP methods and headers require.
+// map. Already-normalized keys need no copy; short ASCII keys are lowered in a
+// small stack buffer, while longer or non-ASCII keys use Unicode-aware lowering.
 func containsInMap(m map[string]struct{}, target string) bool {
-	var lowered [256]byte
+	if _, ok := m[target]; ok {
+		return true
+	}
+
+	var lowered [64]byte
 	if len(target) > len(lowered) {
 		_, ok := m[strings.ToLower(target)]
 		return ok
@@ -258,7 +263,8 @@ func (ch *corsHandler) matchOrigin(origin string) (string, bool) {
 	return empty, false
 }
 
-// handlePreflight answers a CORS preflight request.
+// handlePreflight answers a CORS preflight request. ServeHTTP has already added
+// the request-method and request-header Vary fields before any rejection branch.
 func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	header := w.Header()
 	requestMethod := r.Header.Get(accessControlRequestMethod)
@@ -305,8 +311,6 @@ func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	if ch.maxAge != empty {
 		header.Set(accessControlMaxAge, ch.maxAge)
 	}
-	header.Add(vary, accessControlRequestMethod)
-	header.Add(vary, accessControlRequestHeaders)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -314,11 +318,18 @@ func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 // disallowed-but-safe ones pass through to the engine unchanged, allowed
 // requests gain the CORS response headers, and a preflight is answered directly.
 func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-
 	origin := strings.TrimSpace(r.Header.Get(headerOrigin))
 	header := w.Header()
 	if !ch.wildcard || ch.config.AllowCredentials {
 		header.Add(vary, headerOrigin)
+	}
+
+	// Mark every preflight response before any origin, method or header check
+	// can reject it, so caches never reuse a denial for different inputs.
+	preflight := isPreflightRequest(r)
+	if preflight {
+		header.Add(vary, accessControlRequestMethod)
+		header.Add(vary, accessControlRequestHeaders)
 	}
 
 	// Non-cross-origin request
@@ -332,7 +343,7 @@ func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Not allowed origin
 	if !allowed {
-		if isPreflightRequest(r) {
+		if preflight {
 			http.Error(w, corsOriginNotAllowed, http.StatusForbidden)
 			return
 		}
@@ -352,7 +363,7 @@ func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Handle preflight request
-	if isPreflightRequest(r) {
+	if preflight {
 		ch.handlePreflight(w, r)
 		return
 	}

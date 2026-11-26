@@ -1,0 +1,81 @@
+name: Test and Coverage
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests with coverage
+        run: |
+          go test ./... \
+            -count=1 \
+            -timeout=10m \
+            -coverprofile=coverage-${{ matrix.os }}.out
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests with race
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race ./... -count=1 -timeout=10m
+
+      - name: Run fuzz smoke tests
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          for target in \
+            FuzzFilterExactJSONValueNoPanic \
+            FuzzWriteSSEDataNoPanic \
+            FuzzSplitPathIntoNoPanic
+          do
+            go test -run='^$' -fuzz="^${target}$" -fuzztime=5s
+          done
+
+      - name: Coverage summary
+        run: |
+          go tool cover -func=coverage-${{ matrix.os }}.out | grep '^total:'
+          go tool cover -func=coverage-${{ matrix.os }}.out | grep '^total:' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}
+          path: coverage-${{ matrix.os }}.out
+          if-no-files-found: error
+          retention-days: 14

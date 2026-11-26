@@ -12,8 +12,8 @@ import "time"
 // (YAML, environment, profiles, config centers) belongs to an integration
 // layer that resolves its sources and calls Configure like any other caller.
 //
-// useTLS is derived, not set directly: it turns on when both CertFile and
-// KeyFile are present.
+// useTLS is derived, not set directly: CertFile and KeyFile must both be set
+// or both be empty.
 type Config struct {
 	// listen port, without the leading colon
 	Port string
@@ -47,8 +47,8 @@ func defaultConfig() *Config {
 }
 
 // Configure overlays the default engine configuration in code. The function
-// receives the live Config already filled with defaults, so it only assigns
-// the fields it cares about:
+// receives a copy of the current configuration snapshot, already filled with
+// defaults, so it only assigns the fields it cares about:
 //
 //	gbl.Configure(func(c *gbl.Config) {
 //	    c.Port = "8080"
@@ -60,9 +60,8 @@ func Configure(fn func(*Config)) { defaultEngine.configure(fn) }
 
 // configure overlays this engine configuration. After fn returns, useTLS is
 // re-derived from the certificate and key paths, so setting or clearing either
-// path takes effect without a separate switch. Once the engine runs its
-// configuration snapshot is in effect on the live server and re-Configure
-// panics: it could no longer change what is already serving.
+// path takes effect without a separate switch. Once Run is claimed the
+// configuration is frozen and re-Configure panics.
 func (e *engine) configure(fn func(*Config)) {
 	e.assertAssembling("Configure")
 	next := *e.cfg

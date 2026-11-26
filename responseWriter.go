@@ -38,10 +38,10 @@ type responseWriter interface {
 	size() int
 }
 
-// pooledResponseWriter is the pooled wrapper the engine hands down. It buffers the
-// status and byte count so a panic or post-handler middleware can still flush the
-// right status, and mirrors net/http rule that the first body write commits
-// whatever status was set beforehand.
+// pooledResponseWriter is the pooled wrapper the engine hands down. It records
+// the status and byte count so a panic or post-handler middleware can still flush
+// the right status, and mirrors the net/http rule that the first body write
+// commits whatever status was set beforehand.
 type pooledResponseWriter struct {
 	// wrapped sink, reset per request; never retained across requests
 	w http.ResponseWriter
@@ -168,13 +168,16 @@ func (rw *pooledResponseWriter) Header() http.Header {
 
 // Write flushes any recorded status before the body, so a status set earlier
 // (for example by a middleware) is not silently downgraded to 200 once the
-// first byte commits the response.
+// first byte commits the response. Bodyless statuses reject non-empty writes.
 func (rw *pooledResponseWriter) Write(data []byte) (int, error) {
 	if rw.hijackedStatus {
 		return 0, http.ErrHijacked
 	}
 	rw.writtenStatus = true
 	rw.writeHeader()
+	if len(data) > 0 && !bodyAllowedForStatus(rw.status()) {
+		return 0, http.ErrBodyNotAllowed
+	}
 	n, err := rw.w.Write(data)
 	rw.bytesWritten += n
 	return n, err

@@ -55,14 +55,18 @@ type Context struct {
 	// handlers own the response by declaring an http.ResponseWriter parameter,
 	// and it must never be stored beyond the request.
 	writer responseWriter
-	// result content type chosen at registration
+	// runtime media type chosen after the handler result is serialized
 	contentType string
 	// memoized boxed ret, filled only once Result is called
 	result any
 	// engine log sink, so middleware logging honors SetLogger
 	logger Logger
 
+	// Request is the active request visible to middleware and handlers.
 	Request *http.Request
+	// originalRequest retains the request whose body the framework parsed, even
+	// when middleware replaces the public Request pointer.
+	originalRequest *http.Request
 	// cursor into handlers; abortIndex means "stopped"
 	index int
 	// params holds matched path parameters for this request
@@ -76,6 +80,7 @@ type Context struct {
 	// sse is non-nil while an SSE handler is binding or running.
 	sse *sseWriter
 
+	// method is the normalized HTTP method used for routing and body policy.
 	method httpMethod
 	// the handler actually ran
 	handled bool
@@ -101,6 +106,7 @@ func newContext(w *pooledResponseWriter,
 	c.writer = w
 	c.sse = nil
 	c.Request = r
+	c.originalRequest = r
 	c.handlers = rh.handlers
 	c.index = -1
 	c.params = params
@@ -123,10 +129,11 @@ func newContext(w *pooledResponseWriter,
 // pool, so a pooled Context never pins a finished request writer, body or
 // middleware-set values.
 func (c *Context) recycle() {
-	cleanupMultipart(c.Request)
+	cleanupMultipart(c.originalRequest)
 	c.writer = nil
 	c.sse = nil
 	c.Request = nil
+	c.originalRequest = nil
 	c.handlers = nil
 	c.params = nil
 	c.rh = nil
@@ -162,8 +169,8 @@ func (c *Context) Next() {
 	}
 }
 
-// Abort stops the chain without writing anything. Any remaining links, the
-// handler included, are skipped.
+// Abort stops the chain and suppresses automatic result writeback. Any remaining
+// links, the handler included, are skipped.
 func (c *Context) Abort() {
 	c.index = abortIndex
 }
@@ -177,15 +184,14 @@ func (c *Context) IsWritten() bool { return c.writer.written() }
 
 // StatusCode reports the status that will be, or was, sent for this response:
 // the recorded one once anything has set it, otherwise net/http 200 default.
-// Because the staged body is committed only after the whole chain unwinds, this
-// prediction is what lets an access-log or metrics middleware read the effective
-// status from c.Next() return point.
+// Because the staged body is committed only after the whole chain unwinds (even
+// when a handler flushes its headers earlier), this prediction lets an access-log
+// or metrics middleware read the effective status from c.Next() return point.
 func (c *Context) StatusCode() int { return c.writer.status() }
 
-// Size reports the effective response body length: the bytes already written,
-// or — while the staged result has not been committed yet — the length of that
-// staged body. It matches what the pipeline will actually send, so a middleware
-// observing the response after c.Next() sees the true size.
+// Size reports the logical response size: bytes already written or, while the
+// staged result is pending, its length. HEAD can report a non-zero logical size
+// even though net/http suppresses the body on the wire.
 func (c *Context) Size() int {
 	if n := c.writer.size(); n > 0 {
 		return n
@@ -295,6 +301,7 @@ func (c *Context) AbortWithStatusJSON(status int, body any) {
 	}
 	data, err := json.Marshal(body)
 	if err != nil {
+		c.Abort()
 		abort(http.StatusInternalServerError, responseSerializationFailed)
 		return
 	}
@@ -313,7 +320,7 @@ func Use(middleware ...HandlerFunc) { defaultEngine.use(middleware...) }
 // use appends middleware that run for every route on this engine. They are
 // combined with each route group middleware at route-generation time, the
 // engine running outermost. Register all middleware before Run; calling Use
-// afterward panics, because every route chain is already frozen.
+// after Run is claimed panics, because route chains are no longer editable.
 func (e *engine) use(middleware ...HandlerFunc) {
 	e.assertAssembling("Use")
 	e.middlewares = append(e.middlewares, middleware...)
@@ -341,11 +348,14 @@ func (c *Context) invokeHandler() {
 		err     error
 	)
 	if rh.plan.needsParse {
+		// Anchor cleanup to the request actually being parsed, not a pointer that
+		// post-handler middleware may later replace.
+		c.originalRequest = c.Request
 		form, files, bodyBuf, isJSON, err = parseRequestParameters(
 			c.writer, c.Request, c.method, rh.plan.queryKeys,
 		)
 		if err != nil {
-			writeRequestError(err)
+			writeRequestError(err, c.logger)
 			return
 		}
 	}
@@ -373,7 +383,7 @@ func (c *Context) invokeHandler() {
 			// Binding errors are assembled from reflection internals (parameter
 			// names, Go type strings, numeric parsing detail), so only a generic 400 is
 			// returned and the detail stays in the server log.
-			c.logger.Error("request binding failed", "error", err)
+			safeLog(func() { c.logger.Error("request binding failed", "error", err) })
 			abort(http.StatusBadRequest, http.StatusText(http.StatusBadRequest))
 			return
 		}
@@ -402,7 +412,7 @@ func (c *Context) invokeHandler() {
 		}
 		stopHeartbeat, err := c.startSSE()
 		if err != nil {
-			c.logger.Error("SSE startup failed", "error", err)
+			safeLog(func() { c.logger.Error("SSE startup failed", "error", err) })
 			if c.writer.flushed() {
 				return
 			}
@@ -423,6 +433,9 @@ func (c *Context) invokeHandler() {
 			return
 		}
 		c.contentType = mediaType
+		if !c.writer.flushed() && !c.writer.hijacked() {
+			c.writer.Header().Set(contentType, mediaType)
+		}
 		c.bytes = buf.Bytes()
 		c.responseBuf = buf
 		// Retain the raw return; Result boxes it only if a middleware asks.
