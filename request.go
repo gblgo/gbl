@@ -8,11 +8,11 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"mime"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,7 +31,8 @@ var (
 	requestBodyTooLargeError = errors.New("request body too large")
 	// live total request body cap, read per request
 	maxBodySize atomic.Int64
-	// live multipart file-content memory threshold, read per request
+	// live multipart file-content memory threshold, read per request and capped by
+	// the per-file upload limit before parsing
 	maxFileMemory atomic.Int64
 	// live per-file upload cap, read per file
 	maxUploadFileSize atomic.Int64
@@ -65,10 +66,10 @@ func init() {
 	maxUploadFileSize.Store(defaultMaxUploadFileSize)
 }
 
-// bodyBufferPool recycles the buffer used to read a JSON request body, so a
-// small-body request reuses one backing array instead of allocating a fresh
-// read buffer every time. sync.Pool drops its contents at GC, so an oversized
-// body buffer is not pinned indefinitely.
+// bodyBufferPool recycles the buffer used to read JSON and URL-encoded request
+// bodies, so a small-body request reuses one backing array instead of allocating
+// a fresh read buffer every time. sync.Pool drops its contents at GC, so an
+// oversized body buffer is not pinned indefinitely.
 var bodyBufferPool = sync.Pool{
 	New: func() any { return new(bytes.Buffer) },
 }
@@ -85,10 +86,12 @@ func releaseBodyBuffer(buf *bytes.Buffer) {
 }
 
 // SetMaxBodySize sets the hard limit on the total request body size, applied
-// to every body method (POST, PUT, PATCH), multipart uploads included. A body
-// over the limit is rejected with 413. Panics on a non-positive size, and
-// once the default engine is serving: the limits are assembling input like
-// everything else the frozen request pipeline reads.
+// to every body method (POST, PUT, PATCH), multipart uploads included. Known
+// oversized bodies are rejected with 413 before the handler. Unknown-length
+// bodies are bounded while they are read: parameter parsing returns 413, while
+// a raw handler observes http.MaxBytesError itself. Panics on a non-positive
+// size, and once the default engine is serving: the limits are assembling input
+// like everything else the frozen request pipeline reads.
 func SetMaxBodySize(size ByteSize) {
 	defaultEngine.assertAssembling("SetMaxBodySize")
 	if size <= 0 {
@@ -97,10 +100,11 @@ func SetMaxBodySize(size ByteSize) {
 	maxBodySize.Store(int64(size))
 }
 
-// SetMaxFileSize sets the multipart in-memory threshold for file content in
-// aggregate: file content up to size stays in memory, and excess spills to
-// temporary files. It does not limit the total upload size; see SetMaxBodySize
-// for that. Panics on a non-positive size, and once the default engine is serving.
+// SetMaxFileSize sets the multipart in-memory spill threshold for file content:
+// file content up to size stays in memory, and excess spills to temporary files.
+// The parser also reserves memory for non-file form fields. This does not limit
+// the total upload size; see SetMaxBodySize for that. Panics on a non-positive
+// size, and once the default engine is serving.
 func SetMaxFileSize(size ByteSize) {
 	defaultEngine.assertAssembling("SetMaxFileSize")
 	if size <= 0 {
@@ -124,18 +128,118 @@ func SetMaxUploadFileSize(size ByteSize) {
 	maxUploadFileSize.Store(int64(size))
 }
 
+// requestClientError marks malformed client input whose message may be returned
+// with HTTP 400. requestInternalError marks a body-read failure; its details are
+// for server logs only and must be answered with a generic HTTP 500.
+type requestClientError struct {
+	// err is the client-safe parse failure.
+	err error
+}
+
+// Error returns the client-safe parse message.
+func (e *requestClientError) Error() string { return e.err.Error() }
+
+// Unwrap exposes the underlying parse error for errors.Is and errors.As.
+func (e *requestClientError) Unwrap() error { return e.err }
+
+// requestInternalError marks a server-side body read or storage failure.
+type requestInternalError struct {
+	// err is retained for server logs and hidden from the client.
+	err error
+}
+
+// Error returns the internal failure detail for server-side logging.
+func (e *requestInternalError) Error() string { return e.err.Error() }
+
+// Unwrap exposes the underlying failure for errors.Is and errors.As.
+func (e *requestInternalError) Unwrap() error { return e.err }
+
+// requestErrorResponse is the handler boundary for parse failures. It preserves
+// the established 413 and client-safe 400 messages while ensuring internal I/O
+// details never reach the client.
+func requestErrorResponse(err error) (status int, body string) {
+	if errors.Is(err, requestBodyTooLargeError) {
+		return http.StatusRequestEntityTooLarge, http.StatusText(http.StatusRequestEntityTooLarge)
+	}
+	var clientError *requestClientError
+	if errors.As(err, &clientError) {
+		return http.StatusBadRequest, clientError.Error()
+	}
+	return http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError)
+}
+
+// replayRequestBody restores a body after bounded buffering on the unsupported-
+// media parameter-parsing path and retains the original closer so replacing Body
+// does not change its lifecycle. Raw handlers keep the streaming body instead.
+type replayRequestBody struct {
+	// Reader replays the bounded body bytes.
+	*bytes.Reader
+	// closer owns the original request body lifecycle.
+	closer io.Closer
+}
+
+// Close closes the original request body.
+func (b *replayRequestBody) Close() error {
+	if b.closer == nil {
+		return nil
+	}
+	return b.closer.Close()
+}
+
+// requestReadTracker remembers a body-read error even when a parser such as
+// multipart.ReadForm wraps it with format-specific context.
+type requestReadTracker struct {
+	// ReadCloser is the request body being observed.
+	io.ReadCloser
+	// err retains the first non-EOF read failure.
+	err error
+}
+
+// Read records body failures that a multipart parser may wrap.
+func (r *requestReadTracker) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if err != nil && err != io.EOF {
+		r.err = err
+	}
+	return n, err
+}
+
+// prepareRequestBody applies the total body cap before media-type parsing. A
+// known oversized length is rejected without reading; net/http already bounds a
+// server body to its declared length. Unknown lengths are wrapped without being
+// consumed, so raw handlers can stream them and observe MaxBytesError only when
+// a read crosses the limit.
+func prepareRequestBody(w http.ResponseWriter, r *http.Request) error {
+	method, known := methodOf(r.Method)
+	if !known || !method.isBodyMethod() {
+		return nil
+	}
+
+	limit := maxBodySize.Load()
+	if limit <= 0 {
+		limit = defaultMaxBodySize
+	}
+	if r.ContentLength > limit {
+		return requestBodyTooLargeError
+	}
+	if r.Body == nil {
+		return nil
+	}
+
+	unknownLength := r.ContentLength < 0 ||
+		(r.ContentLength == 0 && r.Body != http.NoBody)
+	if !unknownLength {
+		return nil
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	return nil
+}
+
 // mergeFormBodyWins merges URL query values with parsed body values, letting the
-// body win on any key present in both: a POST/PUT/PATCH form field overrides a
-// query parameter of the same name. Query-only keys remain available. When either
-// side is empty the other is returned as-is, so the common query-less POST adds
-// no allocation.
+// body win on any key present in both. The returned map is always distinct from
+// body so Request.Form and Request.PostForm can be mutated independently.
 func mergeFormBodyWins(query, body url.Values) url.Values {
-	if len(query) == 0 {
-		return body
-	}
-	if len(body) == 0 {
-		return query
-	}
 	merged := make(url.Values, len(query)+len(body))
 	maps.Copy(merged, query)
 	maps.Copy(merged, body)
@@ -157,6 +261,13 @@ func queryValues(r *http.Request) url.Values {
 // percent decoding, repeated values and the standard treatment of malformed
 // pairs while avoiding a map entry for every unrelated query key.
 func queryValuesFor(r *http.Request, keys []string) url.Values {
+	return queryValuesForSet(r, newRequestKeySet(keys))
+}
+
+// queryValuesForSet is the request-path variant. Route handlers pass the lookup
+// built by bindPlan.prepareKeys, avoiding both a key slice and a linear scan of
+// that slice for every query pair.
+func queryValuesForSet(r *http.Request, keys requestKeySet) url.Values {
 	if len(keys) == 0 || r.URL.RawQuery == empty {
 		return nil
 	}
@@ -175,7 +286,10 @@ func queryValuesFor(r *http.Request, keys []string) url.Values {
 			continue
 		}
 		key, err := url.QueryUnescape(rawKey)
-		if err != nil || !slices.Contains(keys, key) {
+		if err != nil {
+			continue
+		}
+		if _, ok := keys[key]; !ok {
 			continue
 		}
 		value, err := url.QueryUnescape(rawValue)
@@ -190,36 +304,52 @@ func queryValuesFor(r *http.Request, keys []string) url.Values {
 	return values
 }
 
+// requestKeySource accepts the startup-prepared set used by route handlers and
+// a plain slice used by direct parser callers.
+func requestKeySource(source any) (int, requestKeySet) {
+	switch keys := source.(type) {
+	case requestKeySet:
+		return len(keys), keys
+	case []string:
+		return len(keys), newRequestKeySet(keys)
+	default:
+		return 0, nil
+	}
+}
+
 // parseRequestParameters collects handler-bindable inputs for the request:
 // form values, uploaded files, the JSON body buffer and whether a JSON body
-// with actual content is present. queryKeys limits query parsing where the full
-// query does not need to be exposed through Request.Form. The body buffer is
-// pooled; the caller must release it with releaseBodyBuffer once binding is done,
-// since the decoded parameters are independent copies. The returned flag already
-// folds in the non-empty check, so a whitespace-only JSON body fails here and a
-// body that passed is never scanned again downstream.
+// with actual content is present. queryKeys may be the startup-prepared set from
+// a bind plan or a plain slice for direct callers. Selective query parsing avoids
+// adding unrelated keys to the binding inputs. The body buffer is pooled; the
+// caller must release it once binding is done. The returned flag already folds
+// in the non-empty check, so a whitespace-only JSON body fails here and a body
+// that passes is never scanned again downstream.
 func parseRequestParameters(w http.ResponseWriter, r *http.Request,
-	method httpMethod, queryKeys []string) (url.Values, filesMap, *bytes.Buffer, bool, error) {
+	method httpMethod, queryKeys any) (url.Values, filesMap, *bytes.Buffer, bool, error) {
+	keyCount, keySet := requestKeySource(queryKeys)
+
 	// GBL deliberately applies a strict parameter-source policy by HTTP method.
 	// GET, HEAD, DELETE and OPTIONS may read only URL path parameters (matched by
-	// the router) and URL query parameters. Their request bodies are never parsed
-	// or read, regardless of Content-Type.
+	// the router) and URL query parameters. Their request bodies are never prepared,
+	// parsed or read, regardless of Content-Type.
 	//
 	// Only POST, PUT and PATCH may carry a body GBL reads; every other method
 	// exposes query parameters and leaves the body untouched.
 	if !method.isBodyMethod() {
-		// Only path and query parameters bind for these methods; the body is never
-		// read. A single query pair uses the standard parser directly, while a
-		// larger query can restrict parsing to bindable names.
 		var form url.Values
-		if len(queryKeys) > 0 {
+		if keyCount > 0 {
 			if strings.Contains(r.URL.RawQuery, "&") {
-				form = queryValuesFor(r, queryKeys)
+				form = queryValuesForSet(r, keySet)
 			} else {
 				form = queryValues(r)
 			}
 		}
 		return form, nil, nil, false, nil
+	}
+
+	if err := prepareRequestBody(w, r); err != nil {
+		return nil, nil, nil, false, err
 	}
 
 	var (
@@ -228,19 +358,6 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 		bodyBuf   *bytes.Buffer
 		mediaType string
 	)
-
-	// Apply one hard limit to the entire request body, including multipart files.
-	// The fallback re-applies the default if the stored value was corrupted.
-	limit := maxBodySize.Load()
-	if limit <= 0 {
-		limit = defaultMaxBodySize
-	}
-	// A known body within the limit cannot exceed it, so avoid allocating a
-	// MaxBytesReader. Unknown lengths and oversized known bodies still need the
-	// wrapper to preserve the 413 path.
-	if r.Body != nil && (r.ContentLength < 0 || r.ContentLength > limit) {
-		r.Body = http.MaxBytesReader(w, r.Body, limit)
-	}
 
 	contentTypeHeader := r.Header.Get(contentType)
 	if contentTypeHeader != empty {
@@ -256,7 +373,9 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 			var err error
 			mediaType, _, err = mime.ParseMediaType(contentTypeHeader)
 			if err != nil {
-				return nil, nil, nil, false, fmt.Errorf("invalid Content-Type: %w", err)
+				return nil, nil, nil, false, &requestClientError{
+					err: fmt.Errorf("invalid Content-Type: %w", err),
+				}
 			}
 		}
 	}
@@ -278,39 +397,71 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 				return nil, nil, nil, false, requestBodyTooLargeError
 			}
-			return nil, nil, nil, false, err
+			return nil, nil, nil, false, &requestInternalError{err: err}
 		}
 		if bodyBuf != nil && !hasNonWhitespace(bodyBuf.Bytes()) {
 			releaseBodyBuffer(bodyBuf)
-			return nil, nil, nil, false, errors.New("JSON body is empty")
+			return nil, nil, nil, false, &requestClientError{err: errors.New("JSON body is empty")}
 		}
 
 	case mediaType == multipartFormData:
-		memory := maxFileMemory.Load()
-		if memory <= 0 {
-			memory = defaultMaxFileMemory
-		}
-		if err := r.ParseMultipartForm(memory); err != nil {
-			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
-				return nil, nil, nil, false, requestBodyTooLargeError
-			}
-			return nil, nil, nil, false, err
-		}
-		// Body text fields win over query on shared keys; query-only keys survive.
-		form = mergeFormBodyWins(queryValues(r), r.PostForm)
-		if r.MultipartForm != nil {
-			files = r.MultipartForm.File
-		}
-		// Per-file hard cap: any uploaded part larger than the configured
-		// threshold aborts the request before the handler runs. Re-applied
-		// defensively if the stored value has been corrupted to a non-positive one.
 		maxUpload := maxUploadFileSize.Load()
 		if maxUpload <= 0 {
 			maxUpload = defaultMaxUploadFileSize
 		}
+		memory := maxFileMemory.Load()
+		if memory <= 0 {
+			memory = defaultMaxFileMemory
+		}
+		// A file that will exceed the per-file cap must not first spill a much
+		// larger amount to disk merely because the aggregate threshold is higher.
+		memory = min(memory, maxUpload)
+
+		body := r.Body
+		if body == nil {
+			body = http.NoBody
+		}
+		tracker := &requestReadTracker{ReadCloser: body}
+		r.Body = tracker
+		if err := r.ParseMultipartForm(memory); err != nil {
+			cleanupParsedMultipart(r)
+			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+				return nil, nil, nil, false, requestBodyTooLargeError
+			}
+			if tracker.err != nil {
+				if _, ok := errors.AsType[*http.MaxBytesError](tracker.err); ok {
+					return nil, nil, nil, false, requestBodyTooLargeError
+				}
+				if !errors.Is(tracker.err, io.ErrUnexpectedEOF) {
+					return nil, nil, nil, false, &requestInternalError{err: tracker.err}
+				}
+			}
+			return nil, nil, nil, false, &requestClientError{err: err}
+		}
+		if tracker.err != nil {
+			cleanupParsedMultipart(r)
+			if _, ok := errors.AsType[*http.MaxBytesError](tracker.err); ok {
+				return nil, nil, nil, false, requestBodyTooLargeError
+			}
+			return nil, nil, nil, false, &requestInternalError{err: tracker.err}
+		}
+		if r.PostForm == nil {
+			r.PostForm = make(url.Values)
+		}
+		// ReadForm combines query and body values with query first. Binding uses
+		// body-wins precedence, so publish that same merged view on Request.Form.
+		form = mergeFormBodyWins(queryValues(r), r.PostForm)
+		r.Form = form
+		if r.MultipartForm != nil {
+			files = r.MultipartForm.File
+		}
+		// Per-file hard cap: any uploaded part larger than the configured
+		// threshold aborts the request before the handler runs. All parsed
+		// temporary files are removed if any file exceeds the cap.
 		for _, headers := range files {
 			for _, hdr := range headers {
 				if hdr != nil && hdr.Size > maxUpload {
+					cleanupParsedMultipart(r)
 					return nil, nil, nil, false, requestBodyTooLargeError
 				}
 			}
@@ -319,13 +470,13 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 	case mediaType == xWwwFormUrlencoded || mediaType == empty:
 		// The body is decoded directly rather than through r.ParseForm because
 		// ParseForm would parse the URL query a second time: queryValues below
-		// owns that single parse. When installed above, MaxBytesReader still caps
-		// the read and surfaces its error identically.
+		// owns that single parse. prepareRequestBody rejects known oversized
+		// lengths early and bounds unknown-length streams with MaxBytesReader.
 		var bodyValues url.Values
 		if r.Body != nil {
 			buf := bodyBufferPool.Get().(*bytes.Buffer)
 			buf.Reset()
-			if r.ContentLength > int64(buf.Cap()) && r.ContentLength <= limit {
+			if r.ContentLength > int64(buf.Cap()) {
 				buf.Grow(int(r.ContentLength))
 			}
 			if _, readErr := buf.ReadFrom(r.Body); readErr != nil {
@@ -333,28 +484,36 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 				if _, ok := errors.AsType[*http.MaxBytesError](readErr); ok {
 					return nil, nil, nil, false, requestBodyTooLargeError
 				}
-				return nil, nil, nil, false, readErr
+				return nil, nil, nil, false, &requestInternalError{err: readErr}
 			}
 			parsed, parseErr := url.ParseQuery(string(buf.Bytes()))
 			releaseBodyBuffer(buf)
 			if parseErr != nil {
-				return nil, nil, nil, false, parseErr
+				return nil, nil, nil, false, &requestClientError{err: parseErr}
 			}
 			bodyValues = parsed
 		}
+		if bodyValues == nil {
+			bodyValues = make(url.Values)
+		}
 		// Body fields win over query on shared keys; query-only keys survive.
 		form = mergeFormBodyWins(queryValues(r), bodyValues)
-		// Keep the fields r.ParseForm would have filled, so application code
-		// reading them directly sees the same state as before.
+		// Keep the fields r.ParseForm would have filled, but do not alias the two
+		// maps when no query keys are present.
 		r.PostForm = bodyValues
 		r.Form = form
 
 	default:
 		// Unsupported body media types are not interpreted as parameters.
-		// Query parameters are still valid for POST and PUT.
-		if len(queryKeys) > 0 {
+		// Query parameters are still valid for POST, PUT and PATCH. This parsing
+		// path buffers the already bounded body so an oversized stream is rejected
+		// before the handler and replays it otherwise.
+		if err := replayUnsupportedRequestBody(r); err != nil {
+			return nil, nil, nil, false, err
+		}
+		if keyCount > 0 {
 			if strings.Contains(r.URL.RawQuery, "&") {
-				form = queryValuesFor(r, queryKeys)
+				form = queryValuesForSet(r, keySet)
 			} else {
 				form = queryValues(r)
 			}
@@ -362,4 +521,40 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 	}
 
 	return form, files, bodyBuf, jsonMedia && bodyBuf != nil, nil
+}
+
+// replayUnsupportedRequestBody buffers an unknown-length body after
+// prepareRequestBody has installed MaxBytesReader. The bound keeps pre-reading
+// finite; a successful read is replayed for application code, while a read
+// failure is classified before any handler can observe the partial body.
+func replayUnsupportedRequestBody(r *http.Request) error {
+	if r.Body == nil {
+		return nil
+	}
+	unknownLength := r.ContentLength < 0 ||
+		(r.ContentLength == 0 && r.Body != http.NoBody)
+	if !unknownLength {
+		return nil
+	}
+
+	original := r.Body
+	data, err := io.ReadAll(original)
+	if err != nil {
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+			return requestBodyTooLargeError
+		}
+		return &requestInternalError{err: err}
+	}
+	r.Body = &replayRequestBody{Reader: bytes.NewReader(data), closer: original}
+	r.ContentLength = int64(len(data))
+	return nil
+}
+
+// cleanupParsedMultipart removes all files left by a complete or partial
+// multipart parse. ParseMultipartForm performs its own cleanup on read errors;
+// calling this again also covers errors discovered after a successful parse.
+func cleanupParsedMultipart(r *http.Request) {
+	if r.MultipartForm != nil {
+		_ = r.MultipartForm.RemoveAll()
+	}
 }

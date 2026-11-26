@@ -48,10 +48,10 @@ func releasePathParams(params map[string]string) {
 }
 
 // serveHTTP is the full request pipeline: method check, route match, HEAD
-// fallback to GET, then the frozen route middleware chain, whose terminal
-// endpoint runs the business handler; finally the staged result is written.
-// Any panic raised below is recovered and rendered by the deferred
-// catchRuntimePanic.
+// fallback to GET, raw-body limit preparation, then the frozen route middleware
+// chain, whose terminal endpoint runs the business handler; finally the staged
+// result is written. Any panic raised below is recovered and rendered by the
+// deferred catchRuntimePanic.
 //
 // The response wrapper and Context are drawn from pools and returned on every
 // exit path. Dynamic routes also borrow a path-parameter map, while static hits
@@ -89,18 +89,28 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Raw handlers do not enter parameter parsing. Reject a known oversized body
+	// before application code runs, but leave an unknown-length body unread and
+	// wrap it with MaxBytesReader so the handler can stream up to the same cap.
+	if method.isBodyMethod() && !rh.plan.needsParse {
+		if err := prepareRequestBody(w, r); err != nil {
+			writeRequestError(err, e.logger)
+			return
+		}
+	}
+
 	c := newContext(rw, r, pathParams, rh, method, e.logger)
 	defer c.recycle()
 
-	// Return-value handlers commit a provisional media type before middleware or
-	// the handler can flush. Runtime serialization may still refine it before the
-	// automatic write when the response has not been flushed.
+	// Return-value handlers expose a provisional media type before middleware or
+	// the handler can flush. Serialization replaces it immediately after staging;
+	// interface returns defer an in-handler flush until that replacement is known.
 	if rh.t.NumOut() > 0 {
 		rw.Header().Set(contentType, rh.contentType)
 	}
 
-	// Multipart temp files are removed by Context.recycle, which sees the final
-	// request pointer even if middleware replaced c.Request.
+	// Multipart temp files are removed by Context.recycle using the original
+	// request pointer, even if middleware later replaces c.Request.
 
 	c.Next()
 
@@ -110,7 +120,9 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// The chain has fully unwound. If the handler produced a result and nothing
 	// wrote a response — the handler directly or a post-handler middleware —
-	// render the staged body with the content type chosen at registration.
+	// render the staged body. Its runtime Content-Type was set just after
+	// serialization; a no-return handler keeps an explicit header or gets the
+	// plain-text default when none was supplied.
 	//
 	// Write through rw, not the raw w: middleware (or the framework) may have
 	// already recorded a status via rw.WriteHeader, and that choice must survive.
@@ -121,7 +133,7 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if !bodyAllowedForStatus(rw.status()) {
 			rw.writeHeader()
 		} else {
-			if rh.t.NumOut() == 0 || c.contentType != rh.contentType {
+			if rh.t.NumOut() == 0 && rw.Header().Get(contentType) == empty {
 				rw.Header().Set(contentType, c.contentType)
 			}
 			if !rw.headed() {
@@ -132,10 +144,9 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// cleanupMultipart releases any temporary files a parsed multipart request left
-// behind. It is deferred once per request and is a no-op unless the body was
-// actually parsed as multipart, so removing files is not actionable here: the
-// response is already decided and removal failures are silently dropped.
+// cleanupMultipart releases temporary files from the original parsed request.
+// Cleanup is best-effort: the response has already been decided, so removal
+// failures cannot change it and are intentionally ignored.
 func cleanupMultipart(r *http.Request) {
 	if r != nil && r.MultipartForm != nil {
 		_ = r.MultipartForm.RemoveAll()
@@ -163,13 +174,25 @@ func (e *engine) abortUnmatched(rw *pooledResponseWriter, method httpMethod, pat
 	abort(http.StatusMethodNotAllowed, http.StatusText(http.StatusMethodNotAllowed))
 }
 
-// writeRequestError maps a request-parsing failure to its status code and
-// aborts the pipeline. Every error reaching here describes the client own
-// malformed request (bad Content-Type, unparseable body, oversize payload), so
-// its message is safe to send back.
-func writeRequestError(err error) {
-	if errors.Is(err, requestBodyTooLargeError) {
+// writeRequestError maps a request failure to a client-safe response. Explicit
+// client parse failures retain their useful 400 message, while internal failures
+// are logged through the supplied engine logger (or the default) and hidden
+// behind a fixed 500.
+func writeRequestError(err error, loggers ...Logger) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.Is(err, requestBodyTooLargeError) || errors.As(err, &maxBytesErr) {
 		abort(http.StatusRequestEntityTooLarge, http.StatusText(http.StatusRequestEntityTooLarge))
+		return
 	}
-	abort(http.StatusBadRequest, err.Error())
+	status, body := requestErrorResponse(err)
+	if status == http.StatusInternalServerError {
+		logger := defaultEngine.logger
+		if len(loggers) > 0 && loggers[0] != nil {
+			logger = loggers[0]
+		}
+		if logger != nil {
+			logger.Error("request parsing failed", "error", err)
+		}
+	}
+	abort(status, body)
 }
