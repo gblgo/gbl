@@ -42,11 +42,6 @@ func TestLoggerBannerEdgeReadBuildInfoFallbackDocumented(t *testing.T) {
 	if got := bannerVersion(); got != want {
 		t.Fatalf("bannerVersion() = %q, want %q", got, want)
 	}
-	// The downstream nil-info guard is independently reachable even though the
-	// standard library's ReadBuildInfo failure branch is not.
-	if got := frameworkVersion(nil); got != versionDevel {
-		t.Fatalf("frameworkVersion(nil) = %q, want %q", got, versionDevel)
-	}
 }
 
 func TestLoggerBannerEdgeSinkErrorsAreIgnored(t *testing.T) {

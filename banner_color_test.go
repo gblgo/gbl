@@ -105,6 +105,11 @@ func TestFrameworkVersion(t *testing.T) {
 			info: &debug.BuildInfo{Path: "example.com/app", Deps: []*debug.Module{{Path: "example.com/other", Version: "v9.9.9"}}},
 			want: versionDevel,
 		},
+		{
+			name: "nil build info",
+			info: nil,
+			want: versionDevel,
+		},
 	}
 
 	for _, tt := range tests {
@@ -520,6 +525,24 @@ func TestConsoleWriterUsesPlainFilesAndNoColor(t *testing.T) {
 	defer devNull.Close()
 	if got := consoleWriter(devNull); got != devNull {
 		t.Fatalf("consoleWriter with NO_COLOR for a character device = %T, want the original *os.File", got)
+	}
+}
+
+func TestConsoleWriterTerminalSeam(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	original := isTerminal
+	isTerminal = func(*os.File) bool { return true }
+	t.Cleanup(func() { isTerminal = original })
+
+	file, err := os.CreateTemp(t.TempDir(), "gbl-color-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	writer, ok := consoleWriter(file).(colorWriter)
+	if !ok || writer.w != file {
+		t.Fatalf("consoleWriter with terminal seam = %#v, want colorWriter over the original file", writer)
 	}
 }
 

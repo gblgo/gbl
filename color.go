@@ -135,6 +135,9 @@ func noColorRequested() bool {
 	return os.Getenv("NO_COLOR") != empty
 }
 
+// isTerminal is a serial test seam for the platform terminal detector.
+var isTerminal = detectTerminal
+
 // consoleWriter returns f wrapped in a colorWriter when f is a terminal that can
 // render ANSI, and f itself otherwise. On Windows the VT-processing mode must be
 // switched on first; if that fails the writer stays plain rather than leaking

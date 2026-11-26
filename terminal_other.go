@@ -8,7 +8,7 @@ package gbl
 
 import "os"
 
-// isTerminal uses a conservative fallback on platforms without a standard
+// detectTerminal uses a conservative fallback on platforms without a standard
 // library terminal ioctl. Character devices are not necessarily consoles, so
 // disabling color is safer than emitting escape sequences to an unknown sink.
-func isTerminal(*os.File) bool { return false }
+func detectTerminal(*os.File) bool { return false }

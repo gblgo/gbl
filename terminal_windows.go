@@ -12,9 +12,9 @@ import (
 	"unsafe"
 )
 
-// isTerminal reports whether f is attached to a Windows console. GetConsoleMode
+// detectTerminal reports whether f is attached to a Windows console. GetConsoleMode
 // rejects regular files, pipes and non-console character devices such as NUL.
-func isTerminal(f *os.File) bool {
+func detectTerminal(f *os.File) bool {
 	if f == nil {
 		return false
 	}

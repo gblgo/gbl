@@ -12,10 +12,10 @@ import (
 	"unsafe"
 )
 
-// isTerminal reports whether f is a terminal by querying its termios settings.
+// detectTerminal reports whether f is a terminal by querying its termios settings.
 // The ioctl fails with ENOTTY for regular files, pipes and devices such as
 // /dev/null, unlike a ModeCharDevice check.
-func isTerminal(f *os.File) bool {
+func detectTerminal(f *os.File) bool {
 	if f == nil {
 		return false
 	}
