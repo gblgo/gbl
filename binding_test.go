@@ -69,6 +69,18 @@ type bindTestJSONStruct struct {
 	Optional *bool              `json:"optional"`
 }
 
+type bindTestJSONNoTagNested struct {
+	Value int
+}
+
+type bindTestJSONNoTag struct {
+	Name     string
+	Count    int
+	Nested   bindTestJSONNoTagNested
+	Tags     []string
+	Optional *bool
+}
+
 type bindTestRecursiveNode struct {
 	Value int                    `json:"value"`
 	Next  *bindTestRecursiveNode `json:"next"`
@@ -484,6 +496,55 @@ func TestBindJSONSingleStruct(t *testing.T) {
 	}
 	if got := bindTestInterface(t, values[0]); !reflect.DeepEqual(got, bindTestPointer(want)) {
 		t.Fatalf("JSON struct pointer = %#v, want %#v", got, bindTestPointer(want))
+	}
+}
+
+func TestBindJSONWithoutTags(t *testing.T) {
+	body := []byte(`{"name":"alice","count":3,"nested":{"value":4},"tags":["go","http"],"optional":true}`)
+	values, err := bindTestInject(t, func(payload bindTestJSONNoTag) {}, []string{"payload"}, nameSources{}, body, true)
+	if err != nil {
+		t.Fatalf("inject untagged JSON struct: %v", err)
+	}
+	want := bindTestJSONNoTag{
+		Name:     "alice",
+		Count:    3,
+		Nested:   bindTestJSONNoTagNested{Value: 4},
+		Tags:     []string{"go", "http"},
+		Optional: bindTestPointer(true),
+	}
+	if got := bindTestInterface(t, values[0]); !reflect.DeepEqual(got, want) {
+		t.Fatalf("untagged JSON struct = %#v, want %#v", got, want)
+	}
+
+	values, err = bindTestInject(t, func(payload *bindTestJSONNoTag) {}, []string{"payload"}, nameSources{}, body, true)
+	if err != nil {
+		t.Fatalf("inject untagged JSON struct pointer: %v", err)
+	}
+	if got := bindTestInterface(t, values[0]); !reflect.DeepEqual(got, bindTestPointer(want)) {
+		t.Fatalf("untagged JSON struct pointer = %#v, want %#v", got, bindTestPointer(want))
+	}
+
+	values, err = bindTestInject(t, func(payload bindTestJSONNoTag) {}, []string{"payload"}, nameSources{},
+		[]byte(`{"Name":"alice","Count":3,"Nested":{"Value":4}}`), true)
+	if err != nil {
+		t.Fatalf("inject wrong-case untagged JSON struct: %v", err)
+	}
+	if got := bindTestInterface(t, values[0]); !reflect.DeepEqual(got, bindTestJSONNoTag{}) {
+		t.Fatalf("wrong-case untagged JSON struct = %#v, want zero value", got)
+	}
+
+	values, err = bindTestInject(t,
+		func(first bindTestJSONNoTagNested, second bindTestJSONNoTagNested) {},
+		[]string{"first", "second"}, nameSources{},
+		[]byte(`{"first":{"value":1},"second":{"value":2}}`), true)
+	if err != nil {
+		t.Fatalf("inject multiple untagged JSON structs: %v", err)
+	}
+	if got := bindTestInterface(t, values[0]); got != (bindTestJSONNoTagNested{Value: 1}) {
+		t.Fatalf("first untagged JSON struct = %#v", got)
+	}
+	if got := bindTestInterface(t, values[1]); got != (bindTestJSONNoTagNested{Value: 2}) {
+		t.Fatalf("second untagged JSON struct = %#v", got)
 	}
 }
 
