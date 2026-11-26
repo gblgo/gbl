@@ -5,45 +5,68 @@
 package gbl
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
 
-func BenchmarkContainsFold(b *testing.B) {
-	values := []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"}
-	for _, target := range []string{"post", "CONNECT"} {
-		b.Run(target, func(b *testing.B) {
-			want := target == "post"
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				if got := containsFold(values, target); got != want {
-					b.Fatalf("containsFold(%q) = %v, want %v", target, got, want)
+// middlewareBenchContains keeps benchmark lookup results observable.
+var middlewareBenchContains bool
+
+// BenchmarkCORSContains times scan and map lookups separately against the same
+// allow-list, target, and last-element hit position. Sizes straddle the production
+// scan threshold; even size 8 is mapped here for comparison. Each iteration
+// performs exactly one lookup.
+func BenchmarkCORSContains(b *testing.B) {
+	for _, size := range []int{8, 9, 64} {
+		values := make([]string, size)
+		for i := range values {
+			values[i] = fmt.Sprintf("X-ALLOWED-%02d", i)
+		}
+		allowedMap := make(map[string]struct{}, len(values))
+		for _, value := range values {
+			allowedMap[strings.ToLower(value)] = struct{}{}
+		}
+		targets := []struct {
+			name  string
+			value string
+			want  bool
+		}{
+			{name: "hit", value: values[size-1], want: true},
+			{name: "miss", value: "X-MISSING", want: false},
+		}
+		for _, target := range targets {
+			b.Run(fmt.Sprintf("size=%d/%s/scan", size, target.name), func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					middlewareBenchContains = containsFold(values, target.value)
 				}
-			}
-		})
+				b.StopTimer()
+				if middlewareBenchContains != target.want {
+					b.Fatalf("containsFold(%q) = %v, want %v", target.value,
+						middlewareBenchContains, target.want)
+				}
+			})
+			b.Run(fmt.Sprintf("size=%d/%s/map", size, target.name), func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					middlewareBenchContains = containsInMap(allowedMap, target.value)
+				}
+				b.StopTimer()
+				if middlewareBenchContains != target.want {
+					b.Fatalf("containsInMap(%q) = %v, want %v", target.value,
+						middlewareBenchContains, target.want)
+				}
+			})
+		}
 	}
 }
 
-func BenchmarkContainsInMap(b *testing.B) {
-	values := make(map[string]struct{}, corsLinearScanLimit+1)
-	for _, method := range []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT"} {
-		values[strings.ToLower(method)] = struct{}{}
-	}
-	for _, target := range []string{"post", "PROPFIND"} {
-		b.Run(target, func(b *testing.B) {
-			_, want := values[strings.ToLower(target)]
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				if got := containsInMap(values, target); got != want {
-					b.Fatalf("containsInMap(%q) = %v, want %v", target, got, want)
-				}
-			}
-		})
-	}
-}
-
+// BenchmarkCompressGzip measures complete compressed responses at each level.
 func BenchmarkCompressGzip(b *testing.B) {
 	body := strings.Repeat("compressible benchmark payload\n", 80)
 	levels := []struct {
