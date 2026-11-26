@@ -186,7 +186,7 @@ func Error(msg string, keysAndValues ...any) { defaultEngine.logger.Error(msg, k
 
 // setLogger installs a Logger on this engine. It is safe to call at any point
 // during assembling, before or after routes and middleware are registered; nil
-// and typed-nil pointers are rejected. Once the engine runs the logger is frozen
+// and typed-nil pointers are rejected. Once Run is claimed the logger is frozen
 // like every other assembling input, and calling this again panics.
 func (e *engine) setLogger(l Logger) {
 	e.assertAssembling("SetLogger")

@@ -463,7 +463,7 @@ func (e *engine) generateRoute() {
 			}
 			statics[path] = handler
 		} else {
-			// Dynamic route: insert into radix tree
+			// Dynamic route: insert into the segment trie
 			e.insertNode(segmentMetas, path, method, handler)
 		}
 	}

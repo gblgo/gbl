@@ -227,7 +227,7 @@ func (e *engine) matchNode(
 		}
 	}
 
-	// Slow path: fall back to radix tree for dynamic routes (O(path length))
+	// Slow path: fall back to the segment trie for dynamic routes
 	root := e.roots[method]
 	if root == nil {
 		return nil, params

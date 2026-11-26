@@ -53,7 +53,7 @@ func (e *engine) group(group string) RouteGroup {
 
 // GroupUse appends middleware scoped to this group. It runs after engine global
 // middleware and only for routes registered through this group. Like every
-// assembling API, it panics once the engine has run.
+// assembling API, it panics once Run is claimed.
 func (rg *routeGroup) GroupUse(middleware ...HandlerFunc) RouteGroup {
 	rg.engine.assertAssembling("GroupUse")
 	rg.middlewares = append(rg.middlewares, middleware...)

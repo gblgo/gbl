@@ -28,7 +28,7 @@ type PanicProcessor func(err any) (any, HttpStatus)
 // soon as one is registered it owns the rendering of every recovered value,
 // including unexpected crashes, so the caller takes on the responsibility of
 // not echoing internal errors. It is an assembling decision and panics once
-// the engine is serving.
+// Run is claimed.
 func RegisterPanicProcessor(p PanicProcessor) {
 	defaultEngine.setPanicProcessor(p)
 }

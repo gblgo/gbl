@@ -57,8 +57,8 @@ const (
 // Compression happens after c.Next() returns, so the handler has already
 // produced its result. The middleware replaces c.bytes only when the compressed
 // data is smaller and sets Content-Encoding: gzip. NoCompression explicitly
-// requests store-only gzip and keeps that behavior. Every response passing through
-// also gains Vary: Accept-Encoding, whether compressed or not: whether a cached
+// requests store-only gzip and keeps that behavior. Every response passing
+// through also gains Vary: Accept-Encoding, whether compressed or not: whether a cached
 // representation fits depends on the client encoding, so caches must key
 // on it. An invalid level yields a middleware that never compresses.
 //

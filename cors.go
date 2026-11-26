@@ -92,8 +92,8 @@ func (cc *CorsConfig) validate() error {
 // The engine keeps a private deep copy, so later edits to the caller struct
 // can neither race the serving goroutines nor switch policy mid-flight.
 // A configuration rejected by this security policy (see validate) aborts
-// startup here, before Run. Like every assembling API it panics once the
-// engine is serving: the handler chain has already been built.
+// startup here, before Run. Like every assembling API it panics once Run is
+// claimed: the handler chain is no longer editable.
 func SetCorsConfig(cc *CorsConfig) {
 	defaultEngine.useCors(cc)
 }

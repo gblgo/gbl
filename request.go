@@ -90,8 +90,8 @@ func releaseBodyBuffer(buf *bytes.Buffer) {
 // oversized bodies are rejected with 413 before the handler. Unknown-length
 // bodies are bounded while they are read: parameter parsing returns 413, while
 // a raw handler observes http.MaxBytesError itself. Panics on a non-positive
-// size, and once the default engine is serving: the limits are assembling input
-// like everything else the frozen request pipeline reads.
+// size, and once Run is claimed: the limits are assembling input like everything
+// else the frozen request pipeline reads.
 func SetMaxBodySize(size ByteSize) {
 	defaultEngine.assertAssembling("SetMaxBodySize")
 	if size <= 0 {
@@ -104,7 +104,7 @@ func SetMaxBodySize(size ByteSize) {
 // file content up to size stays in memory, and excess spills to temporary files.
 // The parser also reserves memory for non-file form fields. This does not limit
 // the total upload size; see SetMaxBodySize for that. Panics on a non-positive
-// size, and once the default engine is serving.
+// size, and once Run is claimed.
 func SetMaxFileSize(size ByteSize) {
 	defaultEngine.assertAssembling("SetMaxFileSize")
 	if size <= 0 {
@@ -118,8 +118,7 @@ func SetMaxFileSize(size ByteSize) {
 // the request with 413, before the handler runs. It defaults to
 // defaultMaxUploadFileSize (1 MiB). Distinct from SetMaxFileSize, which is
 // only the in-memory spill threshold, and from SetMaxBodySize, which caps the
-// total body. Panics on a non-positive size, and once the default engine is
-// serving.
+// total body. Panics on a non-positive size, and once Run is claimed.
 func SetMaxUploadFileSize(size ByteSize) {
 	defaultEngine.assertAssembling("SetMaxUploadFileSize")
 	if size <= 0 {
@@ -502,8 +501,8 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 		}
 		// Body fields win over query on shared keys; query-only keys survive.
 		form = mergeFormBodyWins(queryValues(r), bodyValues)
-		// Keep the fields r.ParseForm would have filled, but do not alias the two
-		// maps when no query keys are present.
+		// Keep the fields r.ParseForm would have filled without aliasing the maps
+		// or their value slices.
 		r.PostForm = bodyValues
 		r.Form = form
 

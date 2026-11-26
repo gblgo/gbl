@@ -168,7 +168,7 @@ func (rw *pooledResponseWriter) Header() http.Header {
 
 // Write flushes any recorded status before the body, so a status set earlier
 // (for example by a middleware) is not silently downgraded to 200 once the
-// first byte commits the response.
+// first byte commits the response. Bodyless statuses reject non-empty writes.
 func (rw *pooledResponseWriter) Write(data []byte) (int, error) {
 	if rw.hijackedStatus {
 		return 0, http.ErrHijacked

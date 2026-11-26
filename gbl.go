@@ -84,7 +84,7 @@ type engine struct {
 }
 
 // runState values. A failed first Run still consumes the single-use claim, while
-// runStateIdle alone allows Shutdown before Run to return without latching.
+// runStateIdle alone allows Shutdown before Run starts without latching.
 const (
 	// runStateIdle permits the first Run and a pre-start Shutdown.
 	runStateIdle uint32 = iota
@@ -345,15 +345,12 @@ func (e *engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	e.serveHTTP(w, r)
 }
 
-// assertAssembling is the engine read-only-after-Run-claim contract: route
-// registration, middleware, loggers, CORS, configuration, panic renderers and
-// size limits are all assembling-time decisions, merged into frozen structures
-// by generateRoute. Once Run is claimed, calling one of those setters cannot take
-// effect, so instead of silently swallowing the call the engine fails fast: a
-// wrong registration ORDER is a programming error exactly like a wrong
-// registration CONTENT. The panic is raised without the failStartup log because
-// startup may already be in progress and the caller's stack trace names the
-// mistake directly.
+// assertAssembling enforces the engine's read-only-after-Run-claim contract.
+// Route registration, middleware, loggers, CORS, configuration, panic renderers
+// and size limits must all be set before Run. Once Run is claimed, those setters
+// can no longer take effect, so a wrong registration order fails fast instead of
+// being silently ignored. The panic bypasses failStartup because startup may
+// already be in progress and the caller's stack trace identifies the mistake.
 func (e *engine) assertAssembling(op string) {
 	if e.runState.Load() != runStateIdle {
 		panic("gbl." + op + " must be called before Run; the engine is read-only while serving")

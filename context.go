@@ -169,8 +169,8 @@ func (c *Context) Next() {
 	}
 }
 
-// Abort stops the chain without writing anything. Any remaining links, the
-// handler included, are skipped.
+// Abort stops the chain and suppresses automatic result writeback. Any remaining
+// links, the handler included, are skipped.
 func (c *Context) Abort() {
 	c.index = abortIndex
 }
@@ -189,10 +189,9 @@ func (c *Context) IsWritten() bool { return c.writer.written() }
 // or metrics middleware read the effective status from c.Next() return point.
 func (c *Context) StatusCode() int { return c.writer.status() }
 
-// Size reports the effective response body length: the bytes already written,
-// or — while the staged result has not been committed yet — the length of that
-// staged body. It matches what the pipeline will actually send, so a middleware
-// observing the response after c.Next() sees the true size.
+// Size reports the logical response size: bytes already written or, while the
+// staged result is pending, its length. HEAD can report a non-zero logical size
+// even though net/http suppresses the body on the wire.
 func (c *Context) Size() int {
 	if n := c.writer.size(); n > 0 {
 		return n
@@ -321,7 +320,7 @@ func Use(middleware ...HandlerFunc) { defaultEngine.use(middleware...) }
 // use appends middleware that run for every route on this engine. They are
 // combined with each route group middleware at route-generation time, the
 // engine running outermost. Register all middleware before Run; calling Use
-// afterward panics, because every route chain is already frozen.
+// after Run is claimed panics, because route chains are no longer editable.
 func (e *engine) use(middleware ...HandlerFunc) {
 	e.assertAssembling("Use")
 	e.middlewares = append(e.middlewares, middleware...)
