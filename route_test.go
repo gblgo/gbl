@@ -5,6 +5,7 @@
 package gbl
 
 import (
+	"debug/dwarf"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -796,6 +797,37 @@ func TestRouteDWARFLookup(t *testing.T) {
 	}
 }
 
+func TestRouteDWARFLookupCachesUnavailableDWARF(t *testing.T) {
+	const executable = "route-test-executable"
+	loads := 0
+	coverageSeamReplace(t, &osExecutable, func() (string, error) {
+		return executable, nil
+	})
+	coverageSeamReplace(t, &selfDWARFLoader, func(path string) *dwarf.Data {
+		if path != executable {
+			t.Fatalf("DWARF loader path = %q, want %q", path, executable)
+		}
+		loads++
+		return nil
+	})
+
+	e := routeTestNewEngine(t)
+	value := reflect.ValueOf(routeTestDWARFNamed)
+	for range 2 {
+		names, resolved, ambiguous := e.lookupParamNamesDWARF(value)
+		if names != nil || resolved || ambiguous != empty {
+			t.Fatalf("DWARF lookup without debug data = (%v, %t, %q), want (nil, false, empty)",
+				names, resolved, ambiguous)
+		}
+	}
+	if loads != 1 {
+		t.Fatalf("DWARF loader calls = %d, want 1 cached unavailable lookup", loads)
+	}
+	if e.dwarfIndex == nil || len(e.dwarfIndex) != 0 {
+		t.Fatalf("cached DWARF index = %#v, want a non-nil empty map", e.dwarfIndex)
+	}
+}
+
 func TestRouteDWARFIndexFromTestBinary(t *testing.T) {
 	index := buildDWARFIndex()
 	if index == nil {
@@ -907,6 +939,15 @@ func routeTestRecursivePointerParameterHandler() any {
 	).Interface()
 }
 
+// routeTestHandlerForParameterType builds a no-return handler with an exact
+// business parameter type, including dynamic ambiguity fixtures.
+func routeTestHandlerForParameterType(typ reflect.Type) any {
+	return reflect.MakeFunc(
+		reflect.FuncOf([]reflect.Type{typ}, nil, false),
+		func([]reflect.Value) []reflect.Value { return nil },
+	).Interface()
+}
+
 type routeTestExtendedWriter interface {
 	http.ResponseWriter
 	Extended()
@@ -966,6 +1007,65 @@ func TestRouteGenerationRejectsInvalidHandlers(t *testing.T) {
 				t.Fatal("invalid handler froze the route set")
 			}
 		})
+	}
+}
+
+// TestRouteGenerationRejectsAmbiguousStructFields proves binding validation fails
+// during startup, before a route can be frozen or serve a request.
+func TestRouteGenerationRejectsAmbiguousStructFields(t *testing.T) {
+	duplicate := correctnessBindDuplicateType()
+	for _, tt := range []struct {
+		name string
+		typ  reflect.Type
+		want []string
+	}{
+		{
+			name: "duplicate exact tag",
+			typ:  duplicate,
+			want: []string{duplicate.String(), "First", "Second", "duplicate exact bind name"},
+		},
+		{
+			name: "anonymous embedding",
+			typ:  correctnessConflictType(),
+			want: []string{"CorrectnessLeft.Shared", "CorrectnessRight.Shared", "shared"},
+		},
+		{
+			name: "Unicode fold",
+			typ:  reflect.TypeFor[CorrectnessBindUnicodeFoldConflict](),
+			want: []string{"CorrectnessBindUnicodeFoldConflict", "K", "Kelvin", "case-folding"},
+		},
+		{
+			name: "nested slice",
+			typ:  reflect.SliceOf(duplicate),
+			want: []string{duplicate.String(), "First", "Second"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			e := routeTestNewEngine(t)
+			e.register(methodGet, "/ambiguous", routeTestHandlerForParameterType(tt.typ))
+			panicValue := routeTestRequirePanicMessage(t, "invalid handler parameter type", e.generateRoute)
+			message := fmt.Sprint(panicValue)
+			for _, want := range append([]string{"GET", "/ambiguous"}, tt.want...) {
+				if !strings.Contains(message, want) {
+					t.Errorf("startup panic = %v, want substring %q", panicValue, want)
+				}
+			}
+			if e.generated {
+				t.Fatal("ambiguous handler froze the route set")
+			}
+		})
+	}
+}
+
+// TestRouteGenerationAllowsShallowStructDominance keeps the startup validator
+// aligned with the low-level JSON promotion rule.
+func TestRouteGenerationAllowsShallowStructDominance(t *testing.T) {
+	e := routeTestNewEngine(t)
+	e.register(methodGet, "/shallow",
+		routeTestHandlerForParameterType(reflect.TypeFor[CorrectnessShallow]()))
+	e.generateRoute()
+	if !e.generated {
+		t.Fatal("shallow-dominant struct did not freeze the route set")
 	}
 }
 
@@ -1097,6 +1197,11 @@ func TestRouteGenerationRejectsUnreliableParameterNames(t *testing.T) {
 		{
 			name: "source file unavailable",
 			fn:   routeTestSourceUnavailableHandler,
+			setup: func(t *testing.T, e *engine, fn any) {
+				// Model missing DWARF explicitly so this rejection does not depend
+				// on whether the test binary was built with debug information.
+				e.dwarfIndex = map[string]dwarfParamNames{}
+			},
 			want: "parameter names are unavailable at runtime",
 		},
 		{
@@ -1151,6 +1256,8 @@ func TestRouteGenerationRejectsUnreliableParameterNames(t *testing.T) {
 
 // Keep this fixture last: //line intentionally gives the handler a source path
 // that does not exist so route generation exercises its sourceless fallback.
+// An unstripped test binary can recover the name through DWARF; the rejection
+// subtest injects an empty dwarfIndex to model a binary built with -s or -w.
 //
 //line gbl_source_unavailable.go:7
 func routeTestSourceUnavailableHandler(id string) string { return id }

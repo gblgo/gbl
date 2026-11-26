@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -25,6 +26,17 @@ type CorrectnessEmbedded struct {
 // CorrectnessEmbedding exercises promotion through an embedded struct value.
 type CorrectnessEmbedding struct {
 	CorrectnessEmbedded
+}
+
+// CorrectnessNoTagEmbedded supplies default bind names without JSON tags.
+type CorrectnessNoTagEmbedded struct {
+	Value int
+	Label string
+}
+
+// CorrectnessNoTagEmbedding promotes untagged embedded fields.
+type CorrectnessNoTagEmbedding struct {
+	CorrectnessNoTagEmbedded
 }
 
 // CorrectnessPointerEmbedding exercises promotion through an embedded pointer.
@@ -52,6 +64,56 @@ type CorrectnessLeft struct {
 type CorrectnessRight struct {
 	Right  int `json:"right"`
 	Shared int `json:"shared"`
+}
+
+// CorrectnessBindCaseConflict has distinct exact names in one SimpleFold cycle.
+type CorrectnessBindCaseConflict struct {
+	Name string
+	NAME string
+}
+
+// CorrectnessBindUnicodeFoldConflict uses the Kelvin sign's ASCII fold cycle.
+type CorrectnessBindUnicodeFoldConflict struct {
+	K      string `json:"k"`
+	Kelvin string `json:"K"`
+}
+
+// CorrectnessBindDirectTagConflict is ambiguous in the flat form namespace even
+// though JSON alone would give the explicit tag priority.
+type CorrectnessBindDirectTagConflict struct {
+	Value int
+	Other string `json:"value"`
+}
+
+// CorrectnessBindFoldLeft contributes one member of a Unicode fold cycle.
+type CorrectnessBindFoldLeft struct {
+	K int `json:"k"`
+}
+
+// CorrectnessBindFoldRight contributes the other member of that fold cycle.
+type CorrectnessBindFoldRight struct {
+	Kelvin int `json:"K"`
+}
+
+// CorrectnessBindEmbeddedFoldConflict has equal-depth promoted fold collisions.
+type CorrectnessBindEmbeddedFoldConflict struct {
+	CorrectnessBindFoldLeft
+	CorrectnessBindFoldRight
+}
+
+// CorrectnessBindRecursiveEmbedding exercises cycle detection in promotion.
+type CorrectnessBindRecursiveEmbedding struct {
+	Value int
+	*CorrectnessBindRecursiveEmbedding
+}
+
+// correctnessBindDuplicateType builds duplicate exact tags dynamically so vet
+// does not reject the intentionally ambiguous fixture.
+func correctnessBindDuplicateType() reflect.Type {
+	return reflect.StructOf([]reflect.StructField{
+		{Name: "First", Type: reflect.TypeFor[int](), Tag: `json:"shared"`},
+		{Name: "Second", Type: reflect.TypeFor[string](), Tag: `json:"shared"`},
+	})
 }
 
 // correctnessConflictType builds two equally shallow tagged claims dynamically
@@ -553,6 +615,222 @@ func TestJSONStructFieldsEmbeddingEdgeCases(t *testing.T) {
 	}
 }
 
+// TestBuildBindPlanRejectsAmbiguousStructFields checks startup validation for
+// direct fields, promoted fields and structs reached through every container.
+func TestBuildBindPlanRejectsAmbiguousStructFields(t *testing.T) {
+	duplicate := correctnessBindDuplicateType()
+	tests := []struct {
+		name string
+		typ  reflect.Type
+		want []string
+	}{
+		{
+			name: "top-level case fold",
+			typ:  reflect.TypeFor[CorrectnessBindCaseConflict](),
+			want: []string{"gbl.CorrectnessBindCaseConflict", "Name", "NAME", "case-folding"},
+		},
+		{
+			name: "duplicate exact tag",
+			typ:  duplicate,
+			want: []string{`"shared"`, "First", "Second", "duplicate exact bind name"},
+		},
+		{
+			name: "direct tagged and untagged claims",
+			typ:  reflect.TypeFor[CorrectnessBindDirectTagConflict](),
+			want: []string{"gbl.CorrectnessBindDirectTagConflict", "Value", "Other", "duplicate exact"},
+		},
+		{
+			name: "top-level Unicode fold",
+			typ:  reflect.TypeFor[CorrectnessBindUnicodeFoldConflict](),
+			want: []string{"gbl.CorrectnessBindUnicodeFoldConflict", "K", "Kelvin", "case-folding"},
+		},
+		{
+			name: "nested pointer",
+			typ:  reflect.PointerTo(duplicate),
+			want: []string{duplicate.String(), "First", "Second"},
+		},
+		{
+			name: "nested slice",
+			typ:  reflect.SliceOf(duplicate),
+			want: []string{duplicate.String(), "First", "Second"},
+		},
+		{
+			name: "nested map",
+			typ:  reflect.MapOf(reflect.TypeFor[string](), duplicate),
+			want: []string{duplicate.String(), "First", "Second"},
+		},
+		{
+			name: "nested array",
+			typ:  reflect.ArrayOf(2, duplicate),
+			want: []string{duplicate.String(), "First", "Second"},
+		},
+		{
+			name: "anonymous embedding",
+			typ:  correctnessConflictType(),
+			want: []string{"shared", "CorrectnessLeft.Shared", "CorrectnessRight.Shared"},
+		},
+		{
+			name: "repeated embedding paths",
+			typ:  correctnessRepeatedEmbeddingType(),
+			want: []string{
+				"value",
+				"CorrectnessRepeatedLeft.CorrectnessRepeatedShared.Value",
+				"CorrectnessRepeatedRight.CorrectnessRepeatedShared.Value",
+			},
+		},
+		{
+			name: "embedded Unicode fold",
+			typ:  reflect.TypeFor[CorrectnessBindEmbeddedFoldConflict](),
+			want: []string{
+				"gbl.CorrectnessBindEmbeddedFoldConflict",
+				"CorrectnessBindFoldLeft.K",
+				"CorrectnessBindFoldRight.Kelvin",
+				"case-folding",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fnType := reflect.FuncOf([]reflect.Type{tt.typ}, nil, false)
+			_, err := buildBindPlan(fnType)
+			if err == nil {
+				t.Fatalf("buildBindPlan(%s) accepted an ambiguous struct", tt.typ)
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %v, want substring %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildBindPlanAllowsUnambiguousStructs checks normal name derivation,
+// recursive types and the existing shallow/tagged JSON dominance rules.
+func TestBuildBindPlanAllowsUnambiguousStructs(t *testing.T) {
+	defaults := reflect.TypeFor[CorrectnessJSONItem]()
+	defaultPlan, err := buildBindPlan(reflect.FuncOf([]reflect.Type{defaults}, nil, false))
+	if err != nil {
+		t.Fatalf("build default field name: %v", err)
+	}
+	if got := defaultPlan.structFields[0][0].name; got != "value" {
+		t.Fatalf("Value bind name = %q, want value", got)
+	}
+
+	nameType := reflect.StructOf([]reflect.StructField{
+		{Name: "Name", Type: reflect.TypeFor[string]()},
+		{Name: "CODE", Type: reflect.TypeFor[string]()},
+	})
+	namePlan, err := buildBindPlan(reflect.FuncOf([]reflect.Type{nameType}, nil, false))
+	if err != nil {
+		t.Fatalf("build ordinary field names: %v", err)
+	}
+	var names []string
+	for _, field := range namePlan.structFields[0] {
+		names = append(names, field.name)
+	}
+	if want := []string{"name", "cODE"}; !reflect.DeepEqual(names, want) {
+		t.Fatalf("ordinary bind names = %#v, want %#v", names, want)
+	}
+
+	acronymType := reflect.StructOf([]reflect.StructField{{Name: "NAME", Type: reflect.TypeFor[int]()}})
+	acronymPlan, err := buildBindPlan(reflect.FuncOf([]reflect.Type{acronymType}, nil, false))
+	if err != nil {
+		t.Fatalf("build acronym field name: %v", err)
+	}
+	if got := acronymPlan.structFields[0][0].name; got != "nAME" {
+		t.Fatalf("NAME bind name = %q, want nAME", got)
+	}
+
+	explicitType := reflect.StructOf([]reflect.StructField{
+		{Name: "Value", Type: reflect.TypeFor[int](), Tag: `json:"NAME"`},
+	})
+	explicitPlan, err := buildBindPlan(reflect.FuncOf([]reflect.Type{explicitType}, nil, false))
+	if err != nil {
+		t.Fatalf("build explicit uppercase name: %v", err)
+	}
+	if got := explicitPlan.structFields[0][0].name; got != "NAME" {
+		t.Fatalf("explicit bind name = %q, want NAME", got)
+	}
+
+	for _, typ := range []reflect.Type{
+		reflect.TypeFor[CorrectnessEmbedding](),
+		reflect.TypeFor[CorrectnessPointerEmbedding](),
+		reflect.TypeFor[CorrectnessNamedEmbedding](),
+		reflect.TypeFor[CorrectnessIgnoredEmbedding](),
+		reflect.TypeFor[CorrectnessHiddenFields](),
+		reflect.TypeFor[CorrectnessShallow](),
+		reflect.TypeFor[CorrectnessShallowDeep](),
+		reflect.TypeFor[CorrectnessTagPriority](),
+		reflect.TypeFor[CorrectnessRecursiveNode](),
+		reflect.TypeFor[CorrectnessBindRecursiveEmbedding](),
+		reflect.TypeFor[[]CorrectnessJSONItem](),
+		reflect.TypeFor[map[string]CorrectnessJSONItem](),
+		reflect.TypeFor[[2]CorrectnessJSONItem](),
+	} {
+		t.Run(typ.String(), func(t *testing.T) {
+			if _, err := buildBindPlan(reflect.FuncOf([]reflect.Type{typ}, nil, false)); err != nil {
+				t.Fatalf("buildBindPlan(%s) rejected a legal struct: %v", typ, err)
+			}
+		})
+	}
+}
+
+// TestBuildBindPlanCachesStructValidation checks that both accepted and rejected
+// struct results are reused by later startup plans.
+func TestBuildBindPlanCachesStructValidation(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		typ     reflect.Type
+		wantErr bool
+	}{
+		{name: "valid", typ: reflect.TypeFor[CorrectnessJSONItem]()},
+		{name: "invalid", typ: correctnessBindDuplicateType(), wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			structBindNameCache.Delete(tt.typ)
+			fnType := reflect.FuncOf([]reflect.Type{tt.typ}, nil, false)
+			_, firstErr := buildBindPlan(fnType)
+			_, secondErr := buildBindPlan(fnType)
+			if (firstErr != nil) != tt.wantErr || (secondErr != nil) != tt.wantErr {
+				t.Fatalf("cached build errors = (%v, %v), want error = %t", firstErr, secondErr, tt.wantErr)
+			}
+			if firstErr != secondErr {
+				t.Fatalf("validation was not reused: first %v, second %v", firstErr, secondErr)
+			}
+			cached, ok := structBindNameCache.Load(tt.typ)
+			if !ok {
+				t.Fatal("validation result was not cached")
+			}
+			if got := cached.(structBindValidation).err; got != firstErr {
+				t.Fatalf("cached error = %v, want %v", got, firstErr)
+			}
+		})
+	}
+}
+
+// TestFoldBindNameSimpleFoldCycles checks complete Unicode cycles rather than
+// relying on lowercase or upper case alone.
+func TestFoldBindNameSimpleFoldCycles(t *testing.T) {
+	for _, tt := range []struct {
+		input string
+		want  string
+	}{
+		{input: "", want: ""},
+		{input: "Name", want: "NAME"},
+		{input: "nAME", want: "NAME"},
+		{input: "kK", want: "KK"},
+		{input: "Σςσ", want: "ΣΣΣ"},
+		{input: "ſ", want: "S"},
+		{input: "é", want: "É"},
+		{input: "-_12", want: "-_12"},
+	} {
+		if got := foldBindName(tt.input); got != tt.want {
+			t.Errorf("foldBindName(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
 // TestCompareJSONFieldCandidates exercises both comparison directions directly,
 // independently of the sorting algorithm's choice of argument order.
 func TestCompareJSONFieldCandidates(t *testing.T) {
@@ -631,6 +909,26 @@ func TestValidJSONFieldName(t *testing.T) {
 
 // TestFilterExactJSONValueContainersAndOrder verifies one-pass rewriting keeps
 // duplicate order and the standard decoder's map, slice, array and custom rules.
+func TestJSONStructFieldsWithoutTags(t *testing.T) {
+	typ := reflect.TypeFor[CorrectnessNoTagEmbedding]()
+	fields := jsonStructFieldsOf(typ)
+	if len(fields) != 2 || fields["value"] != reflect.TypeFor[int]() ||
+		fields["label"] != reflect.TypeFor[string]() {
+		t.Fatalf("untagged promoted fields = %#v", fields)
+	}
+	value, err := decodeJSONExactStruct(typ, []byte(`{"value":7,"label":"ok","Value":99}`))
+	if err != nil {
+		t.Fatalf("decode untagged embedded struct: %v", err)
+	}
+	got := value.Interface().(CorrectnessNoTagEmbedding)
+	if got.Value != 7 || got.Label != "ok" {
+		t.Fatalf("untagged embedded struct = %#v", got)
+	}
+	if _, err := buildBindPlan(reflect.FuncOf([]reflect.Type{typ}, nil, false)); err != nil {
+		t.Fatalf("buildBindPlan rejected untagged embedded struct: %v", err)
+	}
+}
+
 func TestFilterExactJSONValueContainersAndOrder(t *testing.T) {
 	input := []byte(` {"map":{"Key":{"Value":9,"value":1}},"slice":[{"Value":8,"value":2},null],"array":[{"value":3},{"Value":7,"value":4}],"custom":{"Value":5},"bytes":"YQ==","unknown":true} `)
 	typ := reflect.TypeFor[CorrectnessJSONContainers]()

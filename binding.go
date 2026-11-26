@@ -232,8 +232,8 @@ func classifyParam(t reflect.Type) paramClass {
 
 // buildBindPlan turns a handler signature into its immutable binding blueprint.
 // It records each parameter type and class, collects the business-parameter
-// indexes, caches the top-level fields of struct parameters, and flags whether
-// any parameter forces the request body/query to be parsed.
+// indexes, rejects ambiguous struct fields in every reachable business type,
+// caches the struct field lookups, and flags whether request parsing is needed.
 func buildBindPlan(rt reflect.Type) (bindPlan, error) {
 	n := rt.NumIn()
 	plan := bindPlan{
@@ -255,11 +255,11 @@ func buildBindPlan(rt reflect.Type) (bindPlan, error) {
 			}
 			plan.businessIndexes = append(plan.businessIndexes, i)
 			plan.needsParse = true
+			if err := prewarmNestedStructs(t, visited); err != nil {
+				return plan, err
+			}
 			if t.Kind() == reflect.Struct {
 				plan.structFields[i] = structFieldsOf(t)
-			}
-			if selfDescribing(t) {
-				prewarmNestedStructs(t, visited)
 			}
 			if !selfDescribing(t) {
 				plan.needsNames = true
@@ -350,26 +350,245 @@ func newRequestKeySet(keys []string) requestKeySet {
 	return set
 }
 
-// prewarmNestedStructs recursively warms the structFieldsCache for every nested
-// struct reachable from t, including structs inside JSON slices and maps, so
-// request-time binding never pays a concurrent-map miss.
-func prewarmNestedStructs(t reflect.Type, visited map[reflect.Type]bool) {
-	t, ok := derefType(t)
-	if !ok || visited[t] {
-		return
-	}
-	visited[t] = true
-	switch t.Kind() {
-	case reflect.Struct:
-		_ = isRecursiveStruct(t)
-		fields := structFieldsOf(t)
-		_ = jsonStructFieldsOf(t)
-		for _, f := range fields {
-			prewarmNestedStructs(f.typ, visited)
+// bindFieldCandidate is one visible member in a struct's promoted binding view.
+type bindFieldCandidate struct {
+	// name is the exact request key after applying the binding name rule.
+	name string
+	// path identifies the field from the validated struct root.
+	path string
+	// depth counts field and anonymous-embedding edges from that root.
+	depth int
+	// tagged records whether an explicit JSON name supplied the bind key.
+	tagged bool
+}
+
+// structBindValidation is the immutable validation result cached for one struct.
+type structBindValidation struct {
+	// err is nil exactly when the struct has unambiguous bind names.
+	err error
+}
+
+// structBindNameCache stores startup validation results by struct type. Keeping
+// valid results too avoids rewalking shared request models across routes.
+var structBindNameCache sync.Map
+
+// prewarmNestedStructs validates every reachable struct and warms both field
+// caches, including structs inside pointers, arrays, slices and maps. The visited
+// set is local to one bind plan; validation results remain cached across plans.
+func prewarmNestedStructs(t reflect.Type, visited map[reflect.Type]bool) error {
+	pending := []reflect.Type{t}
+	for len(pending) > 0 {
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		current, ok := derefType(current)
+		if !ok || visited[current] {
+			continue
 		}
-	case reflect.Array, reflect.Slice, reflect.Map:
-		prewarmNestedStructs(t.Elem(), visited)
+		visited[current] = true
+		switch current.Kind() {
+		case reflect.Struct:
+			if err := validateStructBindNames(current); err != nil {
+				return err
+			}
+			_ = isRecursiveStruct(current)
+			_ = jsonStructFieldsOf(current)
+			for i := range current.NumField() {
+				field := current.Field(i)
+				if bindableStructField(field) {
+					pending = append(pending, field.Type)
+				}
+			}
+		case reflect.Array, reflect.Slice, reflect.Map:
+			pending = append(pending, current.Elem())
+		}
 	}
+	return nil
+}
+
+// validateStructBindNames returns the cached ambiguity result for a struct type.
+func validateStructBindNames(t reflect.Type) error {
+	if cached, ok := structBindNameCache.Load(t); ok {
+		return cached.(structBindValidation).err
+	}
+	err := computeStructBindNameError(t)
+	actual, _ := structBindNameCache.LoadOrStore(t, structBindValidation{err: err})
+	return actual.(structBindValidation).err
+}
+
+// computeStructBindNameError checks the direct form-binding view and the promoted
+// JSON view. Direct fields share one flat request namespace, so none may dominate
+// another there. Promoted fields use depth and explicit-tag dominance instead.
+func computeStructBindNameError(t reflect.Type) error {
+	fields := structFieldsOf(t)
+	seen := make(map[string]bindFieldCandidate, len(fields))
+	for _, field := range fields {
+		candidate := bindFieldCandidate{
+			name:  field.name,
+			path:  t.Field(field.index).Name,
+			depth: 1,
+		}
+		folded := foldBindName(candidate.name)
+		if previous, exists := seen[folded]; exists {
+			return bindFieldConflictError(t, []bindFieldCandidate{previous, candidate})
+		}
+		seen[folded] = candidate
+	}
+	return resolvePromotedBindFields(t, collectPromotedBindFields(t))
+}
+
+// collectPromotedBindFields walks anonymous structs breadth-first. Active types
+// are tracked per path, which stops recursive embedding without hiding repeated
+// sibling paths that can make a promoted member ambiguous.
+func collectPromotedBindFields(t reflect.Type) []bindFieldCandidate {
+	// bindEmbeddedType is one anonymous-struct path queued for promotion.
+	type bindEmbeddedType struct {
+		// typ is the embedded struct to scan.
+		typ reflect.Type
+		// path identifies this embedding from the validated root.
+		path string
+		// depth is the number of embedding edges already followed.
+		depth int
+		// active holds the struct types on this embedding path.
+		active []reflect.Type
+	}
+
+	queue := []bindEmbeddedType{{typ: t, active: []reflect.Type{t}}}
+	var candidates []bindFieldCandidate
+	for head := 0; head < len(queue); head++ {
+		embedded := queue[head]
+		for i := range embedded.typ.NumField() {
+			field := embedded.typ.Field(i)
+			if !bindableStructField(field) {
+				continue
+			}
+			fieldType := field.Type
+			if field.Anonymous && fieldType.Kind() == reflect.Pointer {
+				fieldType = fieldType.Elem()
+			}
+			name, tagged := jsonStructFieldName(field)
+			path := field.Name
+			if embedded.path != empty {
+				path = embedded.path + "." + field.Name
+			}
+			if field.Anonymous && !tagged && fieldType.Kind() == reflect.Struct {
+				if slices.Contains(embedded.active, fieldType) {
+					continue
+				}
+				active := append(slices.Clone(embedded.active), fieldType)
+				queue = append(queue, bindEmbeddedType{
+					typ:    fieldType,
+					path:   path,
+					depth:  embedded.depth + 1,
+					active: active,
+				})
+				continue
+			}
+			candidates = append(candidates, bindFieldCandidate{
+				name:   name,
+				path:   path,
+				depth:  embedded.depth + 1,
+				tagged: tagged,
+			})
+		}
+	}
+	return candidates
+}
+
+// resolvePromotedBindFields rejects folded-name collisions that remain after
+// shallow-member dominance. At equal depth, one explicit JSON name may dominate
+// untagged claims only when every contender has that same exact name.
+func resolvePromotedBindFields(t reflect.Type, candidates []bindFieldCandidate) error {
+	groups := make(map[string]int)
+	grouped := make([][]bindFieldCandidate, 0)
+	for _, candidate := range candidates {
+		folded := foldBindName(candidate.name)
+		index, exists := groups[folded]
+		if !exists {
+			index = len(grouped)
+			groups[folded] = index
+			grouped = append(grouped, nil)
+		}
+		grouped[index] = append(grouped[index], candidate)
+	}
+	for _, group := range grouped {
+		shallowest := group[0].depth
+		for _, candidate := range group[1:] {
+			if candidate.depth < shallowest {
+				shallowest = candidate.depth
+			}
+		}
+		contenders := make([]bindFieldCandidate, 0, len(group))
+		for _, candidate := range group {
+			if candidate.depth == shallowest {
+				contenders = append(contenders, candidate)
+			}
+		}
+		if len(contenders) == 1 || uniqueTaggedBindName(contenders) {
+			continue
+		}
+		return bindFieldConflictError(t, contenders)
+	}
+	return nil
+}
+
+// uniqueTaggedBindName reports whether equal-depth claims have one exact name
+// and one explicitly tagged claimant, matching JSON's existing tag dominance.
+func uniqueTaggedBindName(candidates []bindFieldCandidate) bool {
+	tagged := -1
+	for i, candidate := range candidates {
+		if candidate.name != candidates[0].name {
+			return false
+		}
+		if candidate.tagged {
+			if tagged >= 0 {
+				return false
+			}
+			tagged = i
+		}
+	}
+	return tagged >= 0
+}
+
+// bindFieldConflictError identifies the struct, bind keys and competing paths.
+func bindFieldConflictError(t reflect.Type, candidates []bindFieldCandidate) error {
+	details := make([]string, len(candidates))
+	for i, candidate := range candidates {
+		details[i] = fmt.Sprintf("%s (%q)", candidate.path, candidate.name)
+	}
+	duplicate := true
+	for _, candidate := range candidates[1:] {
+		if candidate.name != candidates[0].name {
+			duplicate = false
+			break
+		}
+	}
+	if duplicate {
+		return fmt.Errorf(
+			"ambiguous bind name %q in struct %s: duplicate exact bind name on fields %s",
+			candidates[0].name, t, strings.Join(details, ", "),
+		)
+	}
+	return fmt.Errorf(
+		"ambiguous bind names in struct %s: Unicode case-folding conflict between fields %s",
+		t, strings.Join(details, ", "),
+	)
+}
+
+// foldBindName returns a deterministic key for unicode.SimpleFold equivalence.
+// Each rune is represented by the smallest member of its complete fold cycle.
+func foldBindName(name string) string {
+	var folded strings.Builder
+	folded.Grow(len(name))
+	for _, r := range name {
+		canonical := r
+		for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
+			if next < canonical {
+				canonical = next
+			}
+		}
+		folded.WriteRune(canonical)
+	}
+	return folded.String()
 }
 
 // recursiveStructCache records whether a struct type occurs in its own nested
@@ -459,6 +678,32 @@ type jsonFieldCandidate struct {
 	tagged bool
 }
 
+// bindableStructField reports whether a field participates in struct binding.
+// Unexported anonymous structs may still promote their exported members.
+func bindableStructField(field reflect.StructField) bool {
+	if field.Tag.Get("json") == "-" {
+		return false
+	}
+	fieldType := field.Type
+	if field.Anonymous && fieldType.Kind() == reflect.Pointer {
+		fieldType = fieldType.Elem()
+	}
+	if field.IsExported() {
+		return true
+	}
+	return field.Anonymous && fieldType.Kind() == reflect.Struct
+}
+
+// jsonStructFieldName applies encoding/json's explicit-name validation and the
+// binding fallback for an empty or invalid tag name.
+func jsonStructFieldName(field reflect.StructField) (string, bool) {
+	name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+	if !validJSONFieldName(name) {
+		return lowerFirst(field.Name), false
+	}
+	return name, true
+}
+
 // computeJSONStructFields mirrors encoding/json's breadth-first field
 // promotion, then applies exact bind names. Shallower members dominate deeper
 // ones; equal-depth members conflict unless one name came from a JSON tag.
@@ -487,41 +732,25 @@ func computeJSONStructFields(t reflect.Type) map[string]reflect.Type {
 			visited[embedded.typ] = true
 			for i := range embedded.typ.NumField() {
 				field := embedded.typ.Field(i)
+				if !bindableStructField(field) {
+					continue
+				}
 				fieldType := field.Type
 				if field.Anonymous && fieldType.Kind() == reflect.Pointer {
 					fieldType = fieldType.Elem()
 				}
-				if field.Anonymous {
-					// Unexported embedded structs may still promote exported fields.
-					if !field.IsExported() && fieldType.Kind() != reflect.Struct {
-						continue
-					}
-				} else if !field.IsExported() {
-					continue
-				}
 
-				tag := field.Tag.Get("json")
-				if tag == "-" {
-					continue
-				}
-				name, _, _ := strings.Cut(tag, ",")
-				if !validJSONFieldName(name) {
-					name = ""
-				}
+				name, tagged := jsonStructFieldName(field)
 				index := make([]int, len(embedded.index)+1)
 				copy(index, embedded.index)
 				index[len(embedded.index)] = i
 
-				if name == "" && field.Anonymous && fieldType.Kind() == reflect.Struct {
+				if field.Anonymous && !tagged && fieldType.Kind() == reflect.Struct {
 					nextCount[fieldType]++
 					if nextCount[fieldType] == 1 {
 						next = append(next, jsonEmbeddedType{typ: fieldType, index: index})
 					}
 					continue
-				}
-				tagged := name != ""
-				if name == "" {
-					name = lowerFirst(field.Name)
 				}
 				candidate := jsonFieldCandidate{
 					name:   name,
@@ -610,12 +839,25 @@ func lowerFirst(s string) string {
 	return s
 }
 
+// structFieldBindName returns the exact form/JSON bind key for a direct field.
+// Unlike encoding/json validation, form binding preserves any non-empty tag name.
+func structFieldBindName(field reflect.StructField) (string, bool) {
+	if tag, ok := field.Tag.Lookup("json"); ok {
+		if name, _, _ := strings.Cut(tag, ","); name != "" {
+			return name, true
+		}
+	}
+	return lowerFirst(field.Name), false
+}
+
 // computeStructFields lists a struct type exported fields in declaration
 // order. Every exported field of a freshly allocated value is settable, so the
 // per-request CanSet/PkgPath checks in bindStruct collapse to this cached slice.
 // The bind key is the JSON tag name when present, else the Go field name with
 // its first letter lowercased — so a lowercase request key binds to an exported
 // PascalCase field without a tag. `json:"-"` drops the field entirely.
+// buildBindPlan rejects duplicate or folded names; this low-level list stays
+// declarative for direct binder callers.
 func computeStructFields(t reflect.Type) []structField {
 	n := t.NumField()
 	fields := make([]structField, 0, n)
@@ -624,16 +866,10 @@ func computeStructFields(t reflect.Type) []structField {
 		if field.PkgPath != empty {
 			continue
 		}
-		name := lowerFirst(field.Name)
-		if tag, ok := field.Tag.Lookup("json"); ok {
-			if tag == "-" {
-				continue
-			}
-			// A trailing comma makes the dash a literal field name.
-			if tagName, _, _ := strings.Cut(tag, ","); tagName != "" {
-				name = tagName
-			}
+		if tag, ok := field.Tag.Lookup("json"); ok && tag == "-" {
+			continue
 		}
+		name, _ := structFieldBindName(field)
 		fields = append(fields, structField{
 			index: i,
 			name:  name,
