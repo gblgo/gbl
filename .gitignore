@@ -39,6 +39,3 @@ go.work.sum
 
 # vscode
 .vscode/
-
-# Test sources: kept locally, not committed
-*_test.go
