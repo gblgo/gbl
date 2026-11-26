@@ -23,7 +23,7 @@ import (
 
 // This file holds the parameter-binding subsystem: the precomputed bind plan,
 // the per-request injection orchestration, and the scalar/struct/file/JSON
-// binders it dispatches to. The request dispatch itself lives in handler.go.
+// binders it dispatches to. The request dispatch itself lives in a_handler.go.
 
 type (
 	// filesMap maps a multipart form field name to the headers of the files
