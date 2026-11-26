@@ -439,7 +439,11 @@ func TestLifecycleShutdownDuringStartupIsNotLost(t *testing.T) {
 		shutdownResult <- e.shutdown(ctx)
 	}()
 	<-shutdownStarted
-	runtime.Gosched()
+	select {
+	case err := <-shutdownResult:
+		t.Fatalf("Shutdown returned while server publication was blocked: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
 
 	runDone := make(chan struct{})
 	var runPanic any

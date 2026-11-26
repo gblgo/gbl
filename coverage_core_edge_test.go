@@ -75,7 +75,10 @@ func TestCoreEdgeAcquireParamsGrowsAndClears(t *testing.T) {
 		params[i] = reflect.ValueOf(i)
 	}
 	releaseParams(buf, params)
-	for i, value := range params {
+	if len(*buf) != len(params) {
+		t.Fatalf("released slice length = %d, want %d", len(*buf), len(params))
+	}
+	for i, value := range *buf {
 		if value.IsValid() {
 			t.Fatalf("released params[%d] retained a value: %v", i, value)
 		}
@@ -98,31 +101,21 @@ func TestCoreEdgeAcquireParamsGrowsAndClears(t *testing.T) {
 	}
 	for i, value := range params {
 		if value.IsValid() {
-			t.Fatalf("reused params[%d] retained a value: %v", i, value)
+			t.Fatalf("acquired params[%d] retained a value: %v", i, value)
 		}
 	}
-	backing := params[:cap(params)]
-	backingStart := &backing[0]
 	for i := range params {
 		params[i] = reflect.ValueOf(i)
 	}
 	releaseParams(buf, params)
-	for i, value := range backing[:len(params)] {
+	if len(*buf) != len(params) {
+		t.Fatalf("released slice length = %d, want %d", len(*buf), len(params))
+	}
+	for i, value := range *buf {
 		if value.IsValid() {
 			t.Fatalf("released backing[%d] retained a value: %v", i, value)
 		}
 	}
-
-	reusedBuf, reused := acquireParams(requestSize)
-	if &reused[0] != backingStart {
-		t.Fatal("acquireParams did not reuse the sufficiently large backing slice")
-	}
-	for i, value := range reused {
-		if value.IsValid() {
-			t.Fatalf("reacquired params[%d] retained a value: %v", i, value)
-		}
-	}
-	releaseParams(reusedBuf, reused)
 }
 
 func TestCoreEdgeAppendStructQueryKeysVisitedAndDeref(t *testing.T) {

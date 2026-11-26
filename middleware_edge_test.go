@@ -16,40 +16,33 @@ import (
 	"time"
 )
 
-func TestMiddlewareEdgeCompressPoolReuse(t *testing.T) {
-	body := bytes.Repeat([]byte("pooled gzip writer\n"), 100)
-	e := mwTestNewEngine(t, func() string { return string(body) }, Compress(BestSpeed))
-	var writers []*gzip.Writer
-	coverageSeamReplace(t, &gzipWriteAndClose, func(w io.WriteCloser, data []byte) (error, error) {
-		writer, ok := w.(*gzip.Writer)
-		if !ok {
-			t.Fatalf("gzip sink = %T, want *gzip.Writer", w)
-		}
-		writers = append(writers, writer)
-		return writeGzipAndClose(w, data)
-	})
+func TestMiddlewareEdgeCompressSequentialResponsesStayIsolated(t *testing.T) {
+	// Different lengths and markers expose stale gzip or response-buffer bytes
+	// without assuming sync.Pool reuses a particular object between requests.
+	bodies := [][]byte{
+		bytes.Repeat([]byte("first gzip response alpha\n"), 128),
+		bytes.Repeat([]byte("second gzip response beta\n"), 96),
+		bytes.Repeat([]byte("third gzip response gamma\n"), 160),
+	}
+	calls := 0
+	e := mwTestNewEngine(t, func() string {
+		body := bodies[calls]
+		calls++
+		return string(body)
+	}, Compress(BestSpeed))
 
-	for request := 0; request < 3; request++ {
-		rec := mwTestGzipResponse(e, "gzip")
+	for request, body := range bodies {
+		rec := mwTestGzipResponse(e, encodingGzip)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d status = %d, want 200", request, rec.Code)
+		}
 		mwTestRequireGzipBody(t, rec, body)
 		if got := rec.Header().Values(vary); len(got) != 1 || got[0] != acceptEncoding {
 			t.Fatalf("request %d Vary = %q, want exactly [Accept-Encoding]", request, got)
 		}
 	}
-	if len(writers) != 3 {
-		t.Fatalf("gzip seam calls = %d, want 3", len(writers))
-	}
-	reused := false
-	for i, writer := range writers {
-		for _, previous := range writers[:i] {
-			if writer == previous {
-				reused = true
-			}
-		}
-	}
-	if !reused {
-		t.Fatalf("gzip writer identities = %p, %p, %p, want at least one reuse",
-			writers[0], writers[1], writers[2])
+	if calls != len(bodies) {
+		t.Fatalf("handler calls = %d, want %d", calls, len(bodies))
 	}
 }
 

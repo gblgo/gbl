@@ -321,19 +321,39 @@ func TestUnsupportedMediaLimitAndReplay(t *testing.T) {
 }
 
 func TestURLEncodedBodyGrowsPooledBuffer(t *testing.T) {
+	const initialCapacity = 64
+	var pooled *bytes.Buffer
 	originalNew := bodyBufferPool.New
-	bodyBufferPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+	bodyBufferPool = sync.Pool{New: func() any {
+		pooled = bytes.NewBuffer(make([]byte, 0, initialCapacity))
+		return pooled
+	}}
 	t.Cleanup(func() { bodyBufferPool = sync.Pool{New: originalNew} })
 
 	requestTestLimits(t, 4096, 8, 128)
-	r := httptest.NewRequest(http.MethodPost, "/form", strings.NewReader("name=alice"))
+	value := strings.Repeat("x", 512)
+	payload := "name=" + value
+	r := httptest.NewRequest(http.MethodPost, "/form", strings.NewReader(payload))
 	r.Header.Set(contentType, xWwwFormUrlencoded)
+	if r.ContentLength != int64(len(payload)) || len(payload) <= initialCapacity {
+		t.Fatalf("fixture length/capacity = %d/%d, want a known length greater than %d",
+			r.ContentLength, initialCapacity, initialCapacity)
+	}
 	form, _, _, _, err := requestTestParse(t, r, []string{"name"})
 	if err != nil {
 		t.Fatalf("parse urlencoded body: %v", err)
 	}
-	if got := form.Get("name"); got != "alice" {
-		t.Fatalf("form name = %q, want alice", got)
+	if got := form.Get("name"); got != value {
+		t.Fatalf("form name = %q, want the %d-byte payload value", got, len(value))
+	}
+	if pooled == nil {
+		t.Fatal("urlencoded parsing did not acquire the fixture buffer")
+	}
+	if pooled.Cap() < len(payload) {
+		t.Fatalf("grown buffer capacity = %d, want at least %d", pooled.Cap(), len(payload))
+	}
+	if pooled.Len() != 0 {
+		t.Fatalf("released buffer length = %d, want 0", pooled.Len())
 	}
 }
 

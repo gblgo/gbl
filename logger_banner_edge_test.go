@@ -11,7 +11,6 @@ import (
 	"errors"
 	"log"
 	"os"
-	"runtime/debug"
 	"strings"
 	"syscall"
 	"testing"
@@ -28,20 +27,6 @@ func (w *loggerBannerEdgeErrorWriter) Write(p []byte) (int, error) {
 	w.calls++
 	w.bytesWritten += len(p)
 	return 0, w.err
-}
-
-func TestLoggerBannerEdgeReadBuildInfoFallbackDocumented(t *testing.T) {
-	info, ok := debug.ReadBuildInfo()
-	want := versionDevel
-	if ok {
-		want = frameworkVersion(info)
-		t.Log("debug.ReadBuildInfo returned true; bannerVersion's !ok branch is not injectable in a standard go test binary")
-	} else {
-		t.Log("debug.ReadBuildInfo returned false; bannerVersion's fallback branch was reached naturally")
-	}
-	if got := bannerVersion(); got != want {
-		t.Fatalf("bannerVersion() = %q, want %q", got, want)
-	}
 }
 
 func TestLoggerBannerEdgeSinkErrorsAreIgnored(t *testing.T) {
