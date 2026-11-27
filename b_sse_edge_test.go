@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -100,6 +101,47 @@ func TestSSEEdgeBeginSendClosingWithAndWithoutCause(t *testing.T) {
 			t.Fatalf("rejected send touched sink: body=%q flushes=%d deadlines=%d", body, flushes, deadlines)
 		}
 	})
+}
+
+func TestSSEContextStartCancellationIsNormal(t *testing.T) {
+	writer, sink := sseTestNewWriter(t, time.Second, nil, nil)
+	writer.cancel(context.Canceled)
+	c := &Context{sse: writer}
+
+	stop, err := c.startSSE()
+	if err != nil || stop != nil {
+		t.Fatalf("startSSE after cancellation = (%p, %v), want (nil, nil)", stop, err)
+	}
+	writer.complete()
+
+	writer.callbackMu.Lock()
+	terminalErr, completed := writer.terminalErr, writer.completed
+	writer.callbackMu.Unlock()
+	if terminalErr != nil || !completed {
+		t.Fatalf("canceled startup state: terminalErr=%v completed=%t", terminalErr, completed)
+	}
+	_, _, status, flushes, deadlines, _ := sink.snapshot()
+	if status != 0 || flushes != 0 || deadlines != 0 {
+		t.Fatalf("canceled startup touched sink: status=%d flushes=%d deadlines=%d", status, flushes, deadlines)
+	}
+}
+
+func TestSSECanceledRequestBeforeStartSkipsHandler(t *testing.T) {
+	called := false
+	e := requestTestEngine(t, http.MethodGet, "/events", func(SSEWriter) { called = true }, []string{"stream"})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodGet, "/events", nil).WithContext(ctx)
+	recorder := httptest.NewRecorder()
+
+	e.ServeHTTP(recorder, request)
+
+	if called {
+		t.Fatal("SSE handler ran after request cancellation before startup")
+	}
+	if recorder.Body.Len() != 0 || recorder.Code == http.StatusInternalServerError {
+		t.Fatalf("canceled SSE response = %d %q, want empty non-500", recorder.Code, recorder.Body.String())
+	}
 }
 
 func TestSSEEdgeStartFlushFailure(t *testing.T) {

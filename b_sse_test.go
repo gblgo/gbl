@@ -252,6 +252,14 @@ func sseTestWait[T any](t *testing.T, ch <-chan T, what string) T {
 
 func sseTestRequireNoValue[T any](t *testing.T, ch <-chan T, duration time.Duration, what string) {
 	t.Helper()
+	if duration <= 0 {
+		select {
+		case value := <-ch:
+			t.Errorf("unexpected %s: %v", what, value)
+		default:
+		}
+		return
+	}
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
 	select {

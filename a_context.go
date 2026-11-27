@@ -6,7 +6,9 @@ package gbl
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
 	"reflect"
@@ -290,6 +292,14 @@ func (c *Context) commitPendingResponse() {
 	}
 }
 
+// validateFinalAbortStatus rejects informational and out-of-range statuses before
+// an abort can serialize or commit a response.
+func validateFinalAbortStatus(status int) {
+	if status < http.StatusOK || status > 999 {
+		panic("gbl: abort status must be a final HTTP status between 200 and 999")
+	}
+}
+
 // AbortWithStatusString denies the request with a plain-text body and stops the chain.
 func (c *Context) AbortWithStatusString(status int, body string) {
 	if c.writer.headed() || c.writer.flushed() || c.writer.written() || c.writer.hijacked() {
@@ -297,6 +307,7 @@ func (c *Context) AbortWithStatusString(status int, body string) {
 		c.Abort()
 		return
 	}
+	validateFinalAbortStatus(status)
 	c.writer.Header().Set(contentType, textPlainCharset)
 	c.writer.WriteHeader(status)
 	c.writer.writeHeader()
@@ -312,6 +323,14 @@ func (c *Context) AbortWithStatusString(status int, body string) {
 func (c *Context) AbortWithStatusJSON(status int, body any) {
 	if c.writer.headed() || c.writer.flushed() || c.writer.written() || c.writer.hijacked() {
 		c.commitPendingResponse()
+		c.Abort()
+		return
+	}
+	validateFinalAbortStatus(status)
+	if !bodyAllowedForStatus(status) {
+		c.writer.Header().Set(contentType, applicationJsonCharset)
+		c.writer.WriteHeader(status)
+		c.writer.writeHeader()
 		c.Abort()
 		return
 	}
@@ -436,11 +455,21 @@ func (c *Context) invokeHandler() {
 			}
 			abort(http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError))
 		}
+		if stopHeartbeat == nil {
+			return
+		}
 		defer stopHeartbeat()
 	}
 
 	out := rh.v.Call(in)
 	if len(out) > 0 {
+		// Retain the raw return; Result boxes it only if a middleware asks.
+		c.ret = out[0]
+		if c.writer.hijacked() || !bodyAllowedForStatus(c.writer.status()) {
+			c.writer.writeHeader()
+			c.handled = true
+			return
+		}
 		buf := responseBufferPool.Get().(*bytes.Buffer)
 		buf.Reset()
 		mediaType, convertErr := convertToBuffer(buf, out[0])
@@ -457,15 +486,18 @@ func (c *Context) invokeHandler() {
 		}
 		c.bytes = buf.Bytes()
 		c.responseBuf = buf
-		// Retain the raw return; Result boxes it only if a middleware asks.
-		c.ret = out[0]
 	}
 	c.handled = true
 }
 
 // startSSE commits the stream and starts its heartbeat after binding succeeds.
+// A stream canceled before its first write is a normal exit; the caller skips the
+// business handler and deferred completion still runs.
 func (c *Context) startSSE() (func(), error) {
 	if err := c.sse.start(); err != nil {
+		if cause := context.Cause(c.sse.ctx); cause != nil && errors.Is(err, cause) {
+			return nil, nil
+		}
 		return nil, c.sse.fail(err)
 	}
 	return c.sse.startHeartbeat(), nil

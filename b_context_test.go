@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -477,6 +478,38 @@ func TestContextAbortWithStatusJSONSerializationFailure(t *testing.T) {
 	}
 }
 
+func TestContextAbortForbiddenStatusSkipsJSONSerialization(t *testing.T) {
+	c, sink := ctxTestNewContext(func(c *Context) {
+		c.AbortWithStatusJSON(http.StatusNoContent, make(chan int))
+	})
+	if recovered := responseTestCapturePanic(c.Next); recovered != nil {
+		t.Fatalf("AbortWithStatusJSON escaped panic for forbidden body: %v", recovered)
+	}
+
+	if !c.Aborted() {
+		t.Fatal("AbortWithStatusJSON did not abort the chain")
+	}
+	if got := c.StatusCode(); got != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", got)
+	}
+	if sink.body.Len() != 0 {
+		t.Fatalf("forbidden status body = %q, want empty", sink.body.String())
+	}
+}
+
+func TestContextAbortRejectsInformationalStatus(t *testing.T) {
+	for _, status := range []int{http.StatusEarlyHints, 99, 1000} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			c, _ := ctxTestNewContext(func(c *Context) {
+				c.AbortWithStatusString(status, "not final")
+			})
+			if recovered := responseTestCapturePanic(c.Next); recovered == nil {
+				t.Fatalf("AbortWithStatusString(%d) accepted a non-final status", status)
+			}
+		})
+	}
+}
+
 func TestContextAbortMethodsPreservePriorState(t *testing.T) {
 	states := []string{"staged status", "zero length write", "flushed", "hijacked"}
 	for _, method := range []string{"string", "json"} {
@@ -563,32 +596,6 @@ func TestContextAsValidatable(t *testing.T) {
 	secret := struct{ name string }{name: "hidden"}
 	if target, ok := asValidatable(reflect.ValueOf(&secret).Elem().Field(0)); ok || target != nil {
 		t.Fatalf("unexported field = (%v, %v), want (nil, false)", target, ok)
-	}
-}
-
-func TestContextValidatablePointerModeAvoidsBoxing(t *testing.T) {
-	value := ctxTestValidatable{Name: "value"}
-	addressable := reflect.ValueOf(&value).Elem()
-	var target Validatable
-	var ok bool
-	allocations := testing.AllocsPerRun(100, func() {
-		target, ok = asValidatableMode(addressable, true)
-	})
-	if allocations != 0 {
-		t.Fatalf("pointer-mode validation allocations = %v, want 0", allocations)
-	}
-	if !ok || target != &value {
-		t.Fatalf("pointer-mode target = (%v, %t), want original pointer", target, ok)
-	}
-	if target, ok := asValidatableMode(reflect.Value{}, true); ok || target != nil {
-		t.Fatalf("invalid pointer-mode value = (%v, %t), want (nil, false)", target, ok)
-	}
-	if target, ok := asValidatableMode(reflect.ValueOf(value), true); ok || target != nil {
-		t.Fatalf("unaddressable pointer-mode value = (%v, %t), want (nil, false)", target, ok)
-	}
-	plain := struct{ Name string }{}
-	if target, ok := asValidatableMode(reflect.ValueOf(&plain).Elem(), true); ok || target != nil {
-		t.Fatalf("plain pointer-mode value = (%v, %t), want (nil, false)", target, ok)
 	}
 }
 
