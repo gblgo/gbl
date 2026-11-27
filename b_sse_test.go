@@ -1030,6 +1030,34 @@ func (v sseTestBlockingJSON) MarshalJSON() ([]byte, error) {
 	return []byte(`"queued"`), nil
 }
 
+func TestSSEErrorCallbackWaitsForInflightSend(t *testing.T) {
+	writer, sink := sseTestNewWriter(t, time.Second, nil, nil)
+	sseTestStart(t, writer, sink)
+	errorResult := make(chan error, 1)
+	writer.OnError(func(err error) { errorResult <- err })
+
+	marshalEntered := make(chan struct{}, 1)
+	marshalRelease := make(chan struct{})
+	queuedResult := make(chan error, 1)
+	go func() {
+		queuedResult <- writer.Send(sseTestBlockingJSON{entered: marshalEntered, release: marshalRelease})
+	}()
+	sseTestWait(t, marshalEntered, "queued Send to enter MarshalJSON")
+
+	sink.mu.Lock()
+	sink.writeErr = errors.New("write failed")
+	sink.mu.Unlock()
+	if err := writer.Send("fail"); err == nil {
+		t.Fatal("failing Send returned nil")
+	}
+	sseTestRequireNoValue(t, errorResult, 50*time.Millisecond, "OnError before in-flight Send drained")
+
+	close(marshalRelease)
+	sseTestWait(t, queuedResult, "queued Send to finish")
+	sseTestWait(t, errorResult, "OnError after in-flight Send drained")
+	writer.complete()
+}
+
 func TestSSEConcurrentSendDuringNormalClose(t *testing.T) {
 	const queued = 8
 	logger := newSSETestLogger()

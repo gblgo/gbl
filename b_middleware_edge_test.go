@@ -16,6 +16,48 @@ import (
 	"time"
 )
 
+func TestMiddlewareEdgeCompressSkipsAbortedResult(t *testing.T) {
+	calls := 0
+	old := gzipWriteAndClose
+	gzipWriteAndClose = func(io.WriteCloser, []byte) (error, error) {
+		calls++
+		return nil, nil
+	}
+	t.Cleanup(func() { gzipWriteAndClose = old })
+	e := mwTestNewEngine(t, func() string { return strings.Repeat("compressible", 200) },
+		Compress(DefaultCompression), func(c *Context) {
+			c.Next()
+			c.Abort()
+		})
+	rec := mwTestGzipResponse(e, encodingGzip)
+	if calls != 0 {
+		t.Fatalf("gzip calls = %d, want 0 for aborted result", calls)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("aborted body = %q, want empty", rec.Body.String())
+	}
+}
+
+func TestMiddlewareEdgeCompressDoesNotRetryFailedAttempt(t *testing.T) {
+	calls := 0
+	old := gzipWriteAndClose
+	gzipWriteAndClose = func(io.WriteCloser, []byte) (error, error) {
+		calls++
+		return errors.New("injected gzip failure"), nil
+	}
+	t.Cleanup(func() { gzipWriteAndClose = old })
+	e := mwTestNewEngine(t, func() string { return strings.Repeat("compressible", 200) },
+		Compress(DefaultCompression), Compress(DefaultCompression))
+	rec := mwTestGzipResponse(e, encodingGzip)
+	if calls != 1 {
+		t.Fatalf("gzip calls = %d, want one shared attempt", calls)
+	}
+	if rec.Header().Get(contentEncoding) != empty {
+		t.Fatalf("Content-Encoding = %q, want absent after failed attempt",
+			rec.Header().Get(contentEncoding))
+	}
+}
+
 func TestMiddlewareEdgeCompressSequentialResponsesStayIsolated(t *testing.T) {
 	// Different lengths and markers expose stale gzip or response-buffer bytes
 	// without assuming sync.Pool reuses a particular object between requests.

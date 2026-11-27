@@ -98,7 +98,7 @@ func Compress(level int) HandlerFunc {
 		ensureVaryAcceptEncoding(c.writer.Header())
 
 		// Only compress if the handler produced a result and nothing wrote yet
-		if !c.handled || c.writer.written() || c.writer.flushed() ||
+		if c.Aborted() || !c.handled || c.writer.written() || c.writer.flushed() ||
 			!bodyAllowedForStatus(c.writer.status()) {
 			return
 		}
@@ -111,7 +111,7 @@ func Compress(level int) HandlerFunc {
 
 		// Header.Values preserves repeated field lines; joining them keeps the
 		// second and later lines in the same negotiation as the first.
-		if !acceptsGzip(strings.Join(c.Request.Header.Values(acceptEncoding), comma)) {
+		if !acceptsGzipValues(c.Request.Header.Values(acceptEncoding)) {
 			return
 		}
 
@@ -121,12 +121,12 @@ func Compress(level int) HandlerFunc {
 			return
 		}
 
-		// A stacked Compress must not deflate twice: an inner instance has
-		// already stamped the encoding, and a second pass would corrupt the
-		// body while both instances claim success.
-		if c.writer.Header().Get(contentEncoding) != empty {
+		// A stacked Compress must not repeat deflate work after an inner attempt,
+		// whether that attempt succeeded, failed or produced a larger body.
+		if c.writer.Header().Get(contentEncoding) != empty || c.compressTried {
 			return
 		}
+		c.compressTried = true
 
 		// Compress the response body into a pooled buffer
 		buf := responseBufferPool.Get().(*bytes.Buffer)
@@ -188,26 +188,50 @@ func ensureVaryAcceptEncoding(header http.Header) {
 	header.Add(vary, acceptEncoding)
 }
 
-// acceptsGzip reports whether an Accept-Encoding header permits gzip. Explicit
-// gzip or x-gzip entries take precedence over the wildcard, so a later q=0
-// refusal cannot be undone by an earlier "*;q=1".
-func acceptsGzip(header string) bool {
-	var explicit, allowed, wildcard bool
+// gzipAcceptance accumulates encoding decisions across repeated header lines.
+type gzipAcceptance struct {
+	explicit bool
+	allowed  bool
+	wildcard bool
+}
+
+// add scans one Accept-Encoding field line.
+func (a *gzipAcceptance) add(header string) {
 	for part := range strings.SplitSeq(header, comma) {
 		token, params, _ := strings.Cut(part, ";")
 		zero := hasZeroWeight(params)
 		switch strings.ToLower(strings.TrimSpace(token)) {
 		case encodingGzip, encodingXGzip:
-			explicit = true
-			allowed = allowed || !zero
+			a.explicit = true
+			a.allowed = a.allowed || !zero
 		case asterisk:
-			wildcard = wildcard || !zero
+			a.wildcard = a.wildcard || !zero
 		}
 	}
-	if explicit {
-		return allowed
+}
+
+// result applies explicit gzip entries before the wildcard.
+func (a *gzipAcceptance) result() bool {
+	if a.explicit {
+		return a.allowed
 	}
-	return wildcard
+	return a.wildcard
+}
+
+// acceptsGzip reports whether one Accept-Encoding header permits gzip.
+func acceptsGzip(header string) bool {
+	var acceptance gzipAcceptance
+	acceptance.add(header)
+	return acceptance.result()
+}
+
+// acceptsGzipValues scans repeated header lines without joining them.
+func acceptsGzipValues(values []string) bool {
+	var acceptance gzipAcceptance
+	for _, value := range values {
+		acceptance.add(value)
+	}
+	return acceptance.result()
 }
 
 // hasZeroWeight reports whether coding parameters pin the quality value to

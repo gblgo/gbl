@@ -583,6 +583,19 @@ func TestCORSActualRequests(t *testing.T) {
 		mwTestRequireVary(t, rec.Header(), headerOrigin)
 	})
 
+	t.Run("simple request method is enforced", func(t *testing.T) {
+		config := mwTestCORSConfig()
+		config.AllowedMethods = []string{http.MethodGet}
+		handler := mwTestCORSHandler(t, config)
+		rec := mwTestCORSRequest(handler, http.MethodPost, "https://APP.example.test", nil)
+		if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+			t.Fatalf("response = %d %q, want 200 ok", rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get(accessControlAllowOrigin); got != empty {
+			t.Errorf("Allow-Origin = %q, want absent for disallowed method", got)
+		}
+	})
+
 	t.Run("same-origin request has no allow headers", func(t *testing.T) {
 		handler := mwTestCORSHandler(t, mwTestCORSConfig())
 		rec := mwTestCORSRequest(handler, http.MethodGet, empty, nil)

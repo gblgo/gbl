@@ -50,9 +50,9 @@ type SSEWriter interface {
 	// Done closes when the client disconnects, a write fails or the handler exits.
 	Done() <-chan struct{}
 	// OnError sets the callback for the first stream I/O failure. It runs
-	// asynchronously after termination, including when registered late with the
-	// retained failure. Startup failures happen before the handler runs; normal
-	// completion and cancellation do not invoke it.
+	// asynchronously after termination and in-flight sends drain, including when
+	// registered late with the retained failure. Startup failures happen before
+	// the handler runs; normal completion and cancellation do not invoke it.
 	OnError(func(error))
 	// OnComplete sets the callback invoked once after the handler exits and all
 	// in-flight writes drain. Stream failures are reported by OnError. It runs
@@ -190,11 +190,11 @@ func (s *sseWriter) beginClosing() {
 func (s *sseWriter) Done() <-chan struct{} { return s.ctx.Done() }
 
 // OnError sets the callback for the first stream failure. A callback registered
-// after termination runs immediately with the retained failure.
+// after termination runs once all in-flight sends have drained.
 func (s *sseWriter) OnError(fn func(error)) {
 	s.callbackMu.Lock()
 	s.onError = fn
-	if s.completed && s.terminalErr != nil && !s.errorNotified && fn != nil {
+	if s.completed && s.drained && s.terminalErr != nil && !s.errorNotified && fn != nil {
 		s.errorNotified = true
 		err := s.terminalErr
 		s.callbackMu.Unlock()
@@ -340,20 +340,30 @@ func (s *sseWriter) fail(err error) error {
 	}
 	s.completed = true
 	s.terminalErr = err
-	onError := s.onError
 	started := s.started
-	if onError != nil {
-		s.errorNotified = true
-	}
 	s.callbackMu.Unlock()
 
 	if started && s.logger != nil {
 		safeLog(func() { s.logger.Error("SSE stream failed", "error", err) })
 	}
-	if onError != nil {
-		go s.runCallback("error", func() { onError(err) })
-	}
+	go s.notifyErrorAfterDrain()
 	return err
+}
+
+// notifyErrorAfterDrain delays OnError until every in-flight Send has finished.
+func (s *sseWriter) notifyErrorAfterDrain() {
+	s.sends.Wait()
+	s.callbackMu.Lock()
+	s.drained = true
+	if s.terminalErr == nil || s.errorNotified || s.onError == nil {
+		s.callbackMu.Unlock()
+		return
+	}
+	s.errorNotified = true
+	err := s.terminalErr
+	callback := s.onError
+	s.callbackMu.Unlock()
+	s.runCallback("error", func() { callback(err) })
 }
 
 // complete cancels a finished stream, drains business writes and invokes
@@ -368,14 +378,26 @@ func (s *sseWriter) complete() {
 	s.callbackMu.Lock()
 	s.drained = true
 	s.completed = true
+	onError := s.onError
 	onComplete := s.onComplete
-	if onComplete != nil && !s.completeNotified {
+	if s.terminalErr == nil || s.errorNotified {
+		onError = nil
+	} else if onError != nil {
+		s.errorNotified = true
+	}
+	if s.completeNotified {
+		onComplete = nil
+	} else if onComplete != nil {
 		s.completeNotified = true
-		s.callbackMu.Unlock()
-		go s.runCallback("complete", onComplete)
-		return
 	}
 	s.callbackMu.Unlock()
+
+	if onError != nil {
+		go s.runCallback("error", func() { onError(s.terminalErr) })
+	}
+	if onComplete != nil {
+		go s.runCallback("complete", onComplete)
+	}
 }
 
 // runCallback isolates user callback panics so a heartbeat goroutine or deferred
