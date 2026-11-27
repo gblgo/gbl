@@ -489,6 +489,100 @@ func TestRequestBodyLimit(t *testing.T) {
 	})
 }
 
+func TestPooledFormValuesSurviveRelease(t *testing.T) {
+	form, err := formValuesForSet(
+		[]byte("name=alice&escaped=a%20b&plus=a+b"),
+		newRequestKeySet([]string{"name", "escaped", "plus"}),
+	)
+	if err != nil {
+		t.Fatalf("parse pooled form: %v", err)
+	}
+	name := form.values["name"][0]
+	escaped := form.values["escaped"][0]
+	plus := form.values["plus"][0]
+	var retainedKey string
+	for key := range form.values {
+		retainedKey = key
+	}
+	releasePooledForm(form)
+
+	if retainedKey == "" || name != "alice" || escaped != "a b" || plus != "a b" {
+		t.Fatalf("retained form values changed after release: key=%q name=%q escaped=%q plus=%q", retainedKey, name, escaped, plus)
+	}
+}
+
+func TestRequestBodyLimitAppliedBeforeMiddleware(t *testing.T) {
+	const limit = 32
+	requestTestLimits(t, limit, 8, 128)
+
+	t.Run("known oversize skips middleware", func(t *testing.T) {
+		middlewareCalled := false
+		e := requestTestEngine(t, http.MethodPost, "/limited", func(name string) string { return name }, []string{"name"},
+			func(c *Context) {
+				middlewareCalled = true
+				c.Next()
+			})
+		payload := "name=" + strings.Repeat("x", limit)
+		r := httptest.NewRequest(http.MethodPost, "/limited", strings.NewReader(payload))
+		r.Header.Set(contentType, xWwwFormUrlencoded)
+		recorder := httptest.NewRecorder()
+
+		e.ServeHTTP(recorder, r)
+
+		if recorder.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status = %d, want 413", recorder.Code)
+		}
+		if middlewareCalled {
+			t.Fatal("middleware ran before the known body limit was enforced")
+		}
+	})
+
+	t.Run("unknown length is bounded in middleware", func(t *testing.T) {
+		var readErr error
+		e := requestTestEngine(t, http.MethodPost, "/limited", func(name string) string { return name }, []string{"name"},
+			func(c *Context) {
+				_, readErr = io.ReadAll(c.Request.Body)
+				c.AbortWithStatusString(http.StatusRequestEntityTooLarge, "limited")
+			})
+		payload := "name=" + strings.Repeat("x", limit)
+		r := httptest.NewRequest(http.MethodPost, "/limited", strings.NewReader(payload))
+		r.Header.Set(contentType, xWwwFormUrlencoded)
+		r.ContentLength = -1
+		recorder := httptest.NewRecorder()
+
+		e.ServeHTTP(recorder, r)
+
+		var maxBytesErr *http.MaxBytesError
+		if !errors.As(readErr, &maxBytesErr) {
+			t.Fatalf("middleware body read error = %v, want MaxBytesError", readErr)
+		}
+		if recorder.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status = %d, want 413", recorder.Code)
+		}
+	})
+
+	t.Run("middleware replacement is limited during parsing", func(t *testing.T) {
+		handlerCalled := false
+		e := requestTestEngine(t, http.MethodPost, "/limited", func(name string) string {
+			handlerCalled = true
+			return name
+		}, []string{"name"}, func(c *Context) {
+			c.Request.Body = io.NopCloser(strings.NewReader("name=" + strings.Repeat("x", limit)))
+			c.Request.ContentLength = -1
+			c.Next()
+		})
+		r := httptest.NewRequest(http.MethodPost, "/limited", strings.NewReader("name=ok"))
+		r.Header.Set(contentType, xWwwFormUrlencoded)
+		recorder := httptest.NewRecorder()
+
+		e.ServeHTTP(recorder, r)
+
+		if recorder.Code != http.StatusRequestEntityTooLarge || handlerCalled {
+			t.Fatalf("replaced body response: status=%d handlerCalled=%t, want 413 and false", recorder.Code, handlerCalled)
+		}
+	})
+}
+
 func TestRequestUnsupportedMediaHonorsBodyLimit(t *testing.T) {
 	requestTestLimits(t, 32, 8, 128)
 	r := httptest.NewRequest(http.MethodPost, "/raw?name=query", strings.NewReader(strings.Repeat("x", 33)))

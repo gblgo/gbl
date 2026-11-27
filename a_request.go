@@ -95,11 +95,14 @@ func releaseBodyBuffer(buf *bytes.Buffer) {
 // size, and once Run is claimed: the limits are assembling input like everything
 // else the frozen request pipeline reads.
 func SetMaxBodySize(size ByteSize) {
-	defer defaultEngine.assertAssembling("SetMaxBodySize")()
+	unlock := defaultEngine.assertAssembling("SetMaxBodySize")
 	if size <= 0 {
+		unlock()
 		defaultEngine.failStartup("gbl: max body size must be greater than zero")
+		return
 	}
 	maxBodySize.Store(int64(size))
+	unlock()
 }
 
 // SetMaxFileSize sets the multipart in-memory spill threshold for file content:
@@ -108,11 +111,14 @@ func SetMaxBodySize(size ByteSize) {
 // the total upload size; see SetMaxBodySize for that. Panics on a non-positive
 // size, and once Run is claimed.
 func SetMaxFileSize(size ByteSize) {
-	defer defaultEngine.assertAssembling("SetMaxFileSize")()
+	unlock := defaultEngine.assertAssembling("SetMaxFileSize")
 	if size <= 0 {
+		unlock()
 		defaultEngine.failStartup("gbl: multipart memory threshold must be greater than zero")
+		return
 	}
 	maxFileMemory.Store(int64(size))
+	unlock()
 }
 
 // SetMaxUploadFileSize sets a hard, per-file cap on every uploaded file
@@ -122,11 +128,14 @@ func SetMaxFileSize(size ByteSize) {
 // only the in-memory spill threshold, and from SetMaxBodySize, which caps the
 // total body. Panics on a non-positive size, and once Run is claimed.
 func SetMaxUploadFileSize(size ByteSize) {
-	defer defaultEngine.assertAssembling("SetMaxUploadFileSize")()
+	unlock := defaultEngine.assertAssembling("SetMaxUploadFileSize")
 	if size <= 0 {
+		unlock()
 		defaultEngine.failStartup("gbl: max upload file size must be greater than zero")
+		return
 	}
 	maxUploadFileSize.Store(int64(size))
+	unlock()
 }
 
 // requestClientError marks malformed client input whose message may be returned
@@ -250,6 +259,13 @@ func (r *requestReadTracker) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// preparedRequestBody marks a body already wrapped with the framework limit.
+// The wrapper makes boundary preparation idempotent while still allowing a
+// middleware-replaced body to be limited again during parameter parsing.
+type preparedRequestBody struct {
+	io.ReadCloser
+}
+
 // prepareRequestBody applies the total body cap before media-type parsing. A
 // known oversized length is rejected without reading; net/http already bounds a
 // server body to its declared length. Unknown lengths are wrapped without being
@@ -271,6 +287,9 @@ func prepareRequestBody(w http.ResponseWriter, r *http.Request) error {
 	if r.Body == nil {
 		return nil
 	}
+	if _, ok := r.Body.(*preparedRequestBody); ok {
+		return nil
+	}
 
 	unknownLength := r.ContentLength < 0 ||
 		(r.ContentLength == 0 && r.Body != http.NoBody)
@@ -278,7 +297,7 @@ func prepareRequestBody(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	r.Body = &preparedRequestBody{ReadCloser: http.MaxBytesReader(w, r.Body, limit)}
 	return nil
 }
 
@@ -365,7 +384,7 @@ const maxPooledFormKeys = 64
 // maxPooledFormValues bounds each pooled field slice.
 const maxPooledFormValues = 256
 
-// maxPooledFormBytes bounds retained body storage for zero-copy form strings.
+// maxPooledFormBytes bounds body buffers eligible for pooling and marks larger forms unpooled.
 const maxPooledFormBytes = 64 << 10
 
 // pooledFormValues owns one pooled field slice.
@@ -381,11 +400,12 @@ var formValueSlicePool = sync.Pool{
 // pooledForm owns request-scoped Form/PostForm maps and pooled field slices.
 // It remains valid until Context.recycle releases it after middleware and handlers return.
 type pooledForm struct {
-	values  url.Values
-	objects map[string]*pooledFormValues
-	sets    []*pooledFormValues
-	body    []byte
-	large   bool
+	values       url.Values
+	objects      map[string]*pooledFormValues
+	sets         []*pooledFormValues
+	body         []byte
+	bodyRetained bool // selected strings alias body, so release drops instead of clearing it.
+	large        bool
 }
 
 // formPool reuses ordinary form maps and field-slice bookkeeping.
@@ -406,6 +426,7 @@ func acquirePooledForm(keyCount int) *pooledForm {
 	clear(form.sets)
 	form.sets = form.sets[:0]
 	form.body = form.body[:0]
+	form.bodyRetained = false
 	form.large = keyCount > maxPooledFormKeys
 	return form
 }
@@ -505,7 +526,12 @@ func releasePooledForm(form *pooledForm) {
 	clear(form.values)
 	clear(form.objects)
 	clear(form.sets)
-	clear(form.body)
+	if form.bodyRetained {
+		form.body = nil
+		form.bodyRetained = false
+	} else {
+		clear(form.body)
+	}
 	if form.large || cap(form.sets) > maxPooledFormKeys || cap(form.body) > maxPooledFormBytes {
 		return
 	}
@@ -544,9 +570,15 @@ func (form *pooledForm) parse(data []byte, keys requestKeySet) error {
 		if _, ok := keys[key]; !ok {
 			continue
 		}
+		if !strings.ContainsAny(rawKey, "%+") {
+			form.bodyRetained = true
+		}
 		value, err := url.QueryUnescape(rawValue)
 		if err != nil {
 			return err
+		}
+		if !strings.ContainsAny(rawValue, "%+") {
+			form.bodyRetained = true
 		}
 		form.appendValue(key, value)
 	}

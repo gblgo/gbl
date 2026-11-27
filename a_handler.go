@@ -89,10 +89,10 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Raw handlers do not enter parameter parsing. Reject a known oversized body
-	// before application code runs, but leave an unknown-length body unread and
-	// wrap it with MaxBytesReader so the handler can stream up to the same cap.
-	if method.isBodyMethod() && !rh.plan.needsParse {
+	// Apply the body boundary before middleware runs. Parameter parsing prepares
+	// the same body again, but the marker makes that check idempotent; a middleware
+	// replacement is still limited when the handler parses it.
+	if method.isBodyMethod() {
 		if err := prepareRequestBody(w, r); err != nil {
 			writeRequestError(err, e.logger)
 			return
