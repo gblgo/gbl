@@ -73,22 +73,31 @@ func BenchmarkBindStruct(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		bindTestBenchCheck(b, c, params, form, nil, nil, false)
-		if params[0].Interface().(bindTestBenchStruct).Name != "alice" {
-			b.Fatalf("bound struct = %#v", params[0].Interface())
+		got := params[0].Addr().Interface().(*bindTestBenchStruct)
+		if got.Name != "alice" {
+			b.Fatalf("bound struct = %#v", got)
 		}
 	}
 }
 
-func BenchmarkBindJSON(b *testing.B) {
-	body := []byte(bindTestBenchJSONPayload)
-	c, params := bindTestBenchContext(reflect.TypeFor[bindTestBenchStruct](), "payload")
+// BenchmarkFrameworkJSONFieldExtraction measures pooled multi-parameter member selection.
+func BenchmarkFrameworkJSONFieldExtraction(b *testing.B) {
+	body := []byte(`{"id":42,"name":"alice","enabled":true,"noise":"ignored"}`)
+	keys := []string{"id", "name", "enabled"}
 	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		bindTestBenchCheck(b, c, params, nil, nil, body, true)
-		if params[0].Interface().(bindTestBenchStruct).ID != 42 {
-			b.Fatalf("bound JSON struct = %#v", params[0].Interface())
+	for range b.N {
+		fields := acquireJSONFields(len(keys))
+		if err := decodeJSONFieldsListInto(body, keys, fields.values); err != nil {
+			releaseJSONFields(fields)
+			b.Fatalf("select JSON fields: %v", err)
 		}
+		if len(fields.values) != len(keys) {
+			releaseJSONFields(fields)
+			b.Fatalf("selected JSON fields = %#v", fields.values)
+		}
+		releaseJSONFields(fields)
 	}
 }
 
@@ -105,6 +114,7 @@ func BenchmarkBindMultipart(b *testing.B) {
 	}
 	c, params := bindTestBenchContext(reflect.TypeFor[multipart.FileHeader](), "upload")
 	b.Cleanup(func() {
+		releasePooledForm(form)
 		if r.MultipartForm != nil {
 			_ = r.MultipartForm.RemoveAll()
 		}
@@ -113,7 +123,7 @@ func BenchmarkBindMultipart(b *testing.B) {
 	b.ResetTimer()
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		bindTestBenchCheck(b, c, params, form, files, nil, jsonMedia)
+		bindTestBenchCheck(b, c, params, form.urlValues(), files, nil, jsonMedia)
 		if params[0].Interface().(multipart.FileHeader).Filename != "bench.txt" {
 			b.Fatalf("bound file = %#v", params[0].Interface())
 		}

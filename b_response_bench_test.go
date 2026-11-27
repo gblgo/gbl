@@ -45,17 +45,6 @@ func BenchmarkResponseScalarSerialization(b *testing.B) {
 	}
 }
 
-func BenchmarkResponseJSONSerialization(b *testing.B) {
-	value := reflect.ValueOf(responseTestPayload{Name: "responseTest", Count: 42})
-	buf := new(bytes.Buffer)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		buf.Reset()
-		responseTestBenchMediaType, responseTestBenchErr = convertToBuffer(buf, value)
-	}
-}
-
 func BenchmarkResponseWriterStatus(b *testing.B) {
 	rw := &pooledResponseWriter{w: responseTestNewBenchWriter(), headedStatus: true, statusCode: http.StatusCreated}
 	b.ReportAllocs()

@@ -47,6 +47,24 @@ func BenchmarkRouteStaticMatch(b *testing.B) {
 	}
 }
 
+// BenchmarkRouteStaticNormalizeMatch measures the pooled non-normalized static probe.
+func BenchmarkRouteStaticNormalizeMatch(b *testing.B) {
+	e := newEngine()
+	e.logger = routeTestDiscardLogger{}
+	b.Cleanup(e.cancelStreams)
+	e.register(methodGet, "/api/users/me", routeTestNoArgHandler)
+	e.generateRoute()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		routeTestHandlerSink, routeTestParamsSink = e.matchNode(methodGet, "/api//users/me/", nil)
+	}
+	b.StopTimer()
+	if routeTestHandlerSink == nil || routeTestParamsSink != nil {
+		b.Fatal("normalized static route did not match")
+	}
+}
+
 func BenchmarkRouteDynamicMatch(b *testing.B) {
 	e := newEngine()
 	e.logger = routeTestDiscardLogger{}
