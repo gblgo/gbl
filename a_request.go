@@ -12,10 +12,12 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 )
 
 // This file holds request parsing: turning the inbound request into bindable
@@ -93,11 +95,14 @@ func releaseBodyBuffer(buf *bytes.Buffer) {
 // size, and once Run is claimed: the limits are assembling input like everything
 // else the frozen request pipeline reads.
 func SetMaxBodySize(size ByteSize) {
-	defaultEngine.assertAssembling("SetMaxBodySize")
+	unlock := defaultEngine.assertAssembling("SetMaxBodySize")
 	if size <= 0 {
+		unlock()
 		defaultEngine.failStartup("gbl: max body size must be greater than zero")
+		return
 	}
 	maxBodySize.Store(int64(size))
+	unlock()
 }
 
 // SetMaxFileSize sets the multipart in-memory spill threshold for file content:
@@ -106,11 +111,14 @@ func SetMaxBodySize(size ByteSize) {
 // the total upload size; see SetMaxBodySize for that. Panics on a non-positive
 // size, and once Run is claimed.
 func SetMaxFileSize(size ByteSize) {
-	defaultEngine.assertAssembling("SetMaxFileSize")
+	unlock := defaultEngine.assertAssembling("SetMaxFileSize")
 	if size <= 0 {
+		unlock()
 		defaultEngine.failStartup("gbl: multipart memory threshold must be greater than zero")
+		return
 	}
 	maxFileMemory.Store(int64(size))
+	unlock()
 }
 
 // SetMaxUploadFileSize sets a hard, per-file cap on every uploaded file
@@ -120,11 +128,14 @@ func SetMaxFileSize(size ByteSize) {
 // only the in-memory spill threshold, and from SetMaxBodySize, which caps the
 // total body. Panics on a non-positive size, and once Run is claimed.
 func SetMaxUploadFileSize(size ByteSize) {
-	defaultEngine.assertAssembling("SetMaxUploadFileSize")
+	unlock := defaultEngine.assertAssembling("SetMaxUploadFileSize")
 	if size <= 0 {
+		unlock()
 		defaultEngine.failStartup("gbl: max upload file size must be greater than zero")
+		return
 	}
 	maxUploadFileSize.Store(int64(size))
+	unlock()
 }
 
 // requestClientError marks malformed client input whose message may be returned
@@ -181,6 +192,14 @@ func classifyBodyReadError(err error) error {
 	return &requestInternalError{err: err}
 }
 
+// classifyMultipartParseError keeps temporary-file and disk failures server-side.
+func classifyMultipartParseError(err error) error {
+	if _, ok := errors.AsType[*os.PathError](err); ok {
+		return &requestInternalError{err: err}
+	}
+	return &requestClientError{err: err}
+}
+
 // replayRequestBody restores a body after bounded buffering on the unsupported-
 // media parameter-parsing path and retains the original closer so replacing Body
 // does not change its lifecycle. Raw handlers keep the streaming body instead.
@@ -208,6 +227,29 @@ type requestReadTracker struct {
 	err error
 }
 
+// requestReadTrackerPool reuses the multipart parser's internal body wrapper.
+var requestReadTrackerPool = sync.Pool{
+	New: func() any { return &requestReadTracker{} },
+}
+
+// acquireRequestReadTracker binds a fresh body reader to a pooled tracker.
+func acquireRequestReadTracker(body io.ReadCloser) *requestReadTracker {
+	tracker := requestReadTrackerPool.Get().(*requestReadTracker)
+	tracker.ReadCloser = body
+	tracker.err = nil
+	return tracker
+}
+
+// releaseRequestReadTracker clears body references before pooling.
+func releaseRequestReadTracker(tracker *requestReadTracker) {
+	if tracker == nil {
+		return
+	}
+	tracker.ReadCloser = nil
+	tracker.err = nil
+	requestReadTrackerPool.Put(tracker)
+}
+
 // Read records body failures that a multipart parser may wrap.
 func (r *requestReadTracker) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
@@ -215,6 +257,13 @@ func (r *requestReadTracker) Read(p []byte) (int, error) {
 		r.err = err
 	}
 	return n, err
+}
+
+// preparedRequestBody marks a body already wrapped with the framework limit.
+// The wrapper makes boundary preparation idempotent while still allowing a
+// middleware-replaced body to be limited again during parameter parsing.
+type preparedRequestBody struct {
+	io.ReadCloser
 }
 
 // prepareRequestBody applies the total body cap before media-type parsing. A
@@ -238,6 +287,9 @@ func prepareRequestBody(w http.ResponseWriter, r *http.Request) error {
 	if r.Body == nil {
 		return nil
 	}
+	if _, ok := r.Body.(*preparedRequestBody); ok {
+		return nil
+	}
 
 	unknownLength := r.ContentLength < 0 ||
 		(r.ContentLength == 0 && r.Body != http.NoBody)
@@ -245,13 +297,23 @@ func prepareRequestBody(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	r.Body = &preparedRequestBody{ReadCloser: http.MaxBytesReader(w, r.Body, limit)}
 	return nil
 }
 
-// mergeFormBodyWins merges URL query values with parsed body values, letting the
-// body win on any key present in both. The returned map and value slices are
-// independent of both inputs.
+// mergeSelectedFormInPlace adds query-only fields to the selected body map.
+// Request.Form and Request.PostForm intentionally share this request-local view.
+func mergeSelectedFormInPlace(query, body url.Values) url.Values {
+	for key, values := range query {
+		if _, exists := body[key]; !exists {
+			body[key] = values
+		}
+	}
+	return body
+}
+
+// mergeFormBodyWins merges multipart query and body values without mutating the
+// standard library's PostForm map. The returned map and slices are independent.
 func mergeFormBodyWins(query, body url.Values) url.Values {
 	merged := make(url.Values, len(query)+len(body))
 	for key, values := range query {
@@ -288,11 +350,6 @@ func queryValuesForSet(r *http.Request, keys requestKeySet) url.Values {
 	if len(keys) == 0 || r.URL.RawQuery == empty {
 		return nil
 	}
-	// The standard parser is faster for a single pair, so use it unless the
-	// query contains multiple pairs.
-	if !strings.Contains(r.URL.RawQuery, "&") {
-		return queryValues(r)
-	}
 	var values url.Values
 	for part := range strings.SplitSeq(r.URL.RawQuery, "&") {
 		if part == empty {
@@ -321,30 +378,251 @@ func queryValuesForSet(r *http.Request, keys requestKeySet) url.Values {
 	return values
 }
 
+// maxPooledFormKeys bounds retained map capacity for request-scoped form values.
+const maxPooledFormKeys = 64
+
+// maxPooledFormValues bounds each pooled field slice.
+const maxPooledFormValues = 256
+
+// maxPooledFormBytes bounds body buffers eligible for pooling and marks larger forms unpooled.
+const maxPooledFormBytes = 64 << 10
+
+// pooledFormValues owns one pooled field slice.
+type pooledFormValues struct {
+	values []string
+}
+
+// formValueSlicePool reuses field slices without pooling the exposed url.Values map.
+var formValueSlicePool = sync.Pool{
+	New: func() any { return &pooledFormValues{} },
+}
+
+// pooledForm owns request-scoped Form/PostForm maps and pooled field slices.
+// It remains valid until Context.recycle releases it after middleware and handlers return.
+type pooledForm struct {
+	values       url.Values
+	objects      map[string]*pooledFormValues
+	sets         []*pooledFormValues
+	body         []byte
+	bodyRetained bool // selected strings alias body, so release drops instead of clearing it.
+	large        bool
+}
+
+// formPool reuses ordinary form maps and field-slice bookkeeping.
+var formPool = sync.Pool{
+	New: func() any {
+		return &pooledForm{
+			values:  make(url.Values),
+			objects: make(map[string]*pooledFormValues),
+		}
+	},
+}
+
+// acquirePooledForm clears a pooled form and records whether its capacity is bounded.
+func acquirePooledForm(keyCount int) *pooledForm {
+	form := formPool.Get().(*pooledForm)
+	clear(form.values)
+	clear(form.objects)
+	clear(form.sets)
+	form.sets = form.sets[:0]
+	form.body = form.body[:0]
+	form.bodyRetained = false
+	form.large = keyCount > maxPooledFormKeys
+	return form
+}
+
+// urlValues returns the request-scoped binding view.
+func (form *pooledForm) urlValues() url.Values {
+	if form == nil {
+		return nil
+	}
+	return form.values
+}
+
+// appendValue stores one value in a pooled field slice.
+func (form *pooledForm) appendValue(key, value string) {
+	set := form.objects[key]
+	if set == nil {
+		set = formValueSlicePool.Get().(*pooledFormValues)
+		set.values = set.values[:0]
+		form.objects[key] = set
+		form.sets = append(form.sets, set)
+	}
+	set.values = append(set.values, value)
+	form.values[key] = set.values
+}
+
+// parseQuery selects request query values into the same pool used for form bodies.
+func (form *pooledForm) parseQuery(r *http.Request, keys requestKeySet) {
+	if len(keys) == 0 || r.URL.RawQuery == empty {
+		return
+	}
+	for part := range strings.SplitSeq(r.URL.RawQuery, "&") {
+		if part == empty {
+			continue
+		}
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		if strings.Contains(part, ";") {
+			continue
+		}
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			continue
+		}
+		if _, ok := keys[key]; !ok {
+			continue
+		}
+		value, err := url.QueryUnescape(rawValue)
+		if err != nil {
+			continue
+		}
+		form.appendValue(key, value)
+	}
+}
+
+// mergeQuery adds query-only fields while preserving body precedence.
+func (form *pooledForm) mergeQuery(r *http.Request, keys requestKeySet) {
+	if len(keys) == 0 || r.URL.RawQuery == empty {
+		return
+	}
+	for part := range strings.SplitSeq(r.URL.RawQuery, "&") {
+		if part == empty {
+			continue
+		}
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		if strings.Contains(part, ";") {
+			continue
+		}
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			continue
+		}
+		if _, ok := keys[key]; !ok {
+			continue
+		}
+		if _, exists := form.objects[key]; exists {
+			continue
+		}
+		value, err := url.QueryUnescape(rawValue)
+		if err != nil {
+			continue
+		}
+		form.appendValue(key, value)
+	}
+}
+
+// releasePooledForm clears request references and pools only bounded storage.
+func releasePooledForm(form *pooledForm) {
+	if form == nil {
+		return
+	}
+	for _, set := range form.sets {
+		clear(set.values)
+		if !form.large && cap(set.values) <= maxPooledFormValues {
+			set.values = set.values[:0]
+			formValueSlicePool.Put(set)
+		}
+	}
+	clear(form.values)
+	clear(form.objects)
+	clear(form.sets)
+	if form.bodyRetained {
+		form.body = nil
+		form.bodyRetained = false
+	} else {
+		clear(form.body)
+	}
+	if form.large || cap(form.sets) > maxPooledFormKeys || cap(form.body) > maxPooledFormBytes {
+		return
+	}
+	form.sets = form.sets[:0]
+	form.body = form.body[:0]
+	formPool.Put(form)
+}
+
+// parse decodes selected urlencoded fields in one pass using pooled maps and field slices.
+func (form *pooledForm) parse(data []byte, keys requestKeySet) error {
+	if len(keys) == 0 || len(data) == 0 {
+		return nil
+	}
+	if len(data) > maxPooledFormBytes {
+		form.large = true
+	}
+	if cap(form.body) < len(data) {
+		form.body = make([]byte, len(data))
+	} else {
+		form.body = form.body[:len(data)]
+	}
+	copy(form.body, data)
+	text := unsafe.String(unsafe.SliceData(form.body), len(form.body))
+	for part := range strings.SplitSeq(text, "&") {
+		if part == empty {
+			continue
+		}
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		if strings.Contains(part, ";") {
+			return errors.New("invalid semicolon separator in query")
+		}
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			return err
+		}
+		if _, ok := keys[key]; !ok {
+			continue
+		}
+		if !strings.ContainsAny(rawKey, "%+") {
+			form.bodyRetained = true
+		}
+		value, err := url.QueryUnescape(rawValue)
+		if err != nil {
+			return err
+		}
+		if !strings.ContainsAny(rawValue, "%+") {
+			form.bodyRetained = true
+		}
+		form.appendValue(key, value)
+	}
+	return nil
+}
+
+// formValuesForSet is the direct-call variant; callers must release the returned form.
+func formValuesForSet(data []byte, keys requestKeySet) (*pooledForm, error) {
+	form := acquirePooledForm(len(keys))
+	if err := form.parse(data, keys); err != nil {
+		releasePooledForm(form)
+		return nil, err
+	}
+	return form, nil
+}
+
 // requestKeySource accepts the startup-prepared set used by route handlers and
 // a plain slice used by direct parser callers.
-func requestKeySource(source any) (int, requestKeySet) {
+func requestKeySource(source any) (int, requestKeySet, bool) {
 	switch keys := source.(type) {
 	case requestKeySet:
-		return len(keys), keys
+		return len(keys), keys, true
 	case []string:
-		return len(keys), newRequestKeySet(keys)
+		if keys == nil {
+			return 0, nil, false
+		}
+		return len(keys), newRequestKeySet(keys), true
 	default:
-		return 0, nil
+		return 0, nil, false
 	}
 }
 
 // parseRequestParameters collects handler-bindable inputs for the request:
 // form values, uploaded files, the JSON body buffer and whether a JSON body
 // with actual content is present. queryKeys may be the startup-prepared set from
-// a bind plan or a plain slice for direct callers. Selective query parsing avoids
-// adding unrelated keys to the binding inputs. The body buffer is pooled; the
-// caller must release it once binding is done. The returned flag already folds
+// a bind plan or a plain slice for direct callers. Route handlers parse only
+// planned form keys, and Request.Form/PostForm expose that selected namespace.
+// The body buffer is pooled; the caller must release it once binding is done.
+// The returned flag already folds
 // in the non-empty check, so a whitespace-only JSON body fails here and a body
 // that passes is never scanned again downstream.
 func parseRequestParameters(w http.ResponseWriter, r *http.Request,
-	method httpMethod, queryKeys any) (url.Values, filesMap, *bytes.Buffer, bool, error) {
-	keyCount, keySet := requestKeySource(queryKeys)
+	method httpMethod, queryKeys any) (*pooledForm, filesMap, *bytes.Buffer, bool, error) {
+	keyCount, keySet, selective := requestKeySource(queryKeys)
 
 	// GBL deliberately applies a strict parameter-source policy by HTTP method.
 	// GET, HEAD, DELETE and OPTIONS may read only URL path parameters (matched by
@@ -354,13 +632,14 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 	// Only POST, PUT and PATCH may carry a body GBL reads; every other method
 	// exposes query parameters and leaves the body untouched.
 	if !method.isBodyMethod() {
-		var form url.Values
-		if keyCount > 0 {
-			if strings.Contains(r.URL.RawQuery, "&") {
-				form = queryValuesForSet(r, keySet)
-			} else {
-				form = queryValues(r)
-			}
+		if keyCount == 0 {
+			return nil, nil, nil, false, nil
+		}
+		form := acquirePooledForm(keyCount)
+		form.parseQuery(r, keySet)
+		if len(form.values) == 0 {
+			releasePooledForm(form)
+			return nil, nil, nil, false, nil
 		}
 		return form, nil, nil, false, nil
 	}
@@ -370,7 +649,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 	}
 
 	var (
-		form      url.Values
+		form      *pooledForm
 		files     filesMap
 		bodyBuf   *bytes.Buffer
 		mediaType string
@@ -431,12 +710,17 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 		// larger amount to disk merely because the aggregate threshold is higher.
 		memory = min(memory, maxUpload)
 
-		body := r.Body
+		originalBody := r.Body
+		body := originalBody
 		if body == nil {
 			body = http.NoBody
 		}
-		tracker := &requestReadTracker{ReadCloser: body}
+		tracker := acquireRequestReadTracker(body)
 		r.Body = tracker
+		defer func() {
+			r.Body = originalBody
+			releaseRequestReadTracker(tracker)
+		}()
 		if err := r.ParseMultipartForm(memory); err != nil {
 			cleanupParsedMultipart(r)
 			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
@@ -445,7 +729,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 			if tracker.err != nil {
 				return nil, nil, nil, false, classifyBodyReadError(tracker.err)
 			}
-			return nil, nil, nil, false, &requestClientError{err: err}
+			return nil, nil, nil, false, classifyMultipartParseError(err)
 		}
 		if tracker.err != nil {
 			cleanupParsedMultipart(r)
@@ -456,8 +740,9 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 		}
 		// ReadForm combines query and body values with query first. Binding uses
 		// body-wins precedence, so publish that same merged view on Request.Form.
-		form = mergeFormBodyWins(queryValues(r), r.PostForm)
-		r.Form = form
+		merged := mergeFormBodyWins(queryValues(r), r.PostForm)
+		r.Form = merged
+		form = &pooledForm{values: merged, large: true}
 		if r.MultipartForm != nil {
 			files = r.MultipartForm.File
 		}
@@ -478,7 +763,6 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 		// ParseForm would parse the URL query a second time: queryValues below
 		// owns that single parse. prepareRequestBody rejects known oversized
 		// lengths early and bounds unknown-length streams with MaxBytesReader.
-		var bodyValues url.Values
 		if r.Body != nil {
 			buf := bodyBufferPool.Get().(*bytes.Buffer)
 			buf.Reset()
@@ -489,22 +773,36 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 				releaseBodyBuffer(buf)
 				return nil, nil, nil, false, classifyBodyReadError(readErr)
 			}
-			parsed, parseErr := url.ParseQuery(string(buf.Bytes()))
+			var parseErr error
+			if selective {
+				form, parseErr = formValuesForSet(buf.Bytes(), keySet)
+			} else {
+				values, queryErr := url.ParseQuery(string(buf.Bytes()))
+				parseErr = queryErr
+				if values != nil {
+					form = &pooledForm{values: values, large: true}
+				}
+			}
 			releaseBodyBuffer(buf)
 			if parseErr != nil {
 				return nil, nil, nil, false, &requestClientError{err: parseErr}
 			}
-			bodyValues = parsed
 		}
-		if bodyValues == nil {
-			bodyValues = make(url.Values)
+		if form == nil {
+			if selective {
+				form = acquirePooledForm(len(keySet))
+			} else {
+				form = &pooledForm{values: make(url.Values), large: true}
+			}
 		}
-		// Body fields win over query on shared keys; query-only keys survive.
-		form = mergeFormBodyWins(queryValues(r), bodyValues)
-		// Keep the fields r.ParseForm would have filled without aliasing the maps
-		// or their value slices.
-		r.PostForm = bodyValues
-		r.Form = form
+		// Body fields win over query on shared keys; planned keys survive selection.
+		if selective {
+			form.mergeQuery(r, keySet)
+		} else {
+			mergeSelectedFormInPlace(queryValues(r), form.values)
+		}
+		r.PostForm = form.values
+		r.Form = form.values
 
 	default:
 		// Unsupported body media types are not interpreted as parameters.
@@ -515,10 +813,11 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 			return nil, nil, nil, false, err
 		}
 		if keyCount > 0 {
-			if strings.Contains(r.URL.RawQuery, "&") {
-				form = queryValuesForSet(r, keySet)
-			} else {
-				form = queryValues(r)
+			form = acquirePooledForm(keyCount)
+			form.parseQuery(r, keySet)
+			if len(form.values) == 0 {
+				releasePooledForm(form)
+				form = nil
 			}
 		}
 	}

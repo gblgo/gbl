@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"mime/multipart"
 	"net/http"
@@ -91,9 +92,9 @@ type bindTestValidated struct {
 }
 
 var (
-	bindTestValidationError  = errors.New("name is required")
-	bindTestValidationCalls  atomic.Int64
-	bindTestRecursiveEnvName = "GBL_BIND_TEST_RECURSIVE_CHILD"
+	bindTestValidationError = errors.New("name is required")
+	bindTestValidationCalls atomic.Int64
+	bindTestRecursiveChild  = flag.Bool("gbl-bind-recursive-child", false, "run recursive binding subprocess helper")
 )
 
 func (v *bindTestValidated) Validate() error {
@@ -408,6 +409,31 @@ func TestBindStructRejectsWrongCaseKeys(t *testing.T) {
 	}
 }
 
+func TestValidateFormPointerExpansionBoundsTraversal(t *testing.T) {
+	old := maxFormPointerExpansionSteps
+	maxFormPointerExpansionSteps = 1
+	t.Cleanup(func() { maxFormPointerExpansionSteps = old })
+	if err := validateFormPointerExpansion(reflect.TypeFor[bindTestNested]()); err == nil {
+		t.Fatal("pointer expansion traversal exceeded its step budget without an error")
+	}
+}
+
+func TestBindPlanRejectsHiddenAnonymousPointer(t *testing.T) {
+	typ := reflect.TypeFor[CorrectnessHiddenPointerEmbedding]()
+	_, err := buildBindPlan(reflect.FuncOf([]reflect.Type{typ}, nil, false))
+	if err == nil || !strings.Contains(err.Error(), "unexported anonymous pointer") {
+		t.Fatalf("hidden anonymous pointer error = %v, want startup rejection", err)
+	}
+}
+
+func TestBindPlanRejectsEndlessNamedPointerField(t *testing.T) {
+	typ := reflect.TypeFor[correctnessEndlessPointerHolder]()
+	_, err := buildBindPlan(reflect.FuncOf([]reflect.Type{typ}, nil, false))
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("endless named pointer error = %v, want bounded startup rejection", err)
+	}
+}
+
 func TestValidateFormPointerExpansionRejectsWideAcyclicTree(t *testing.T) {
 	leaf := reflect.TypeFor[struct{}]()
 	for range 16 {
@@ -475,6 +501,17 @@ func TestBindPathPrecedence(t *testing.T) {
 	}
 	if got := bindTestInterface(t, values[0]).(bindTestJSONStruct).Name; got != "path-name" {
 		t.Fatalf("path struct field = %q, want path-name", got)
+	}
+
+	values, err = bindTestInject(t, func(payload bindTestJSONStruct) {}, []string{"payload"}, nameSources{
+		path: map[string]string{"payload": "path-value"},
+		form: url.Values{"name": {"form-name"}},
+	}, nil, false)
+	if err != nil {
+		t.Fatalf("inject struct with colliding path name: %v", err)
+	}
+	if got := bindTestInterface(t, values[0]).(bindTestJSONStruct).Name; got != "form-name" {
+		t.Fatalf("struct path-name collision = %q, want form-name", got)
 	}
 
 	_, err = bindTestInject(t, func(id int) {}, []string{"id"}, nameSources{
@@ -572,6 +609,18 @@ func TestBindJSONSingleStructUsesExactFieldCase(t *testing.T) {
 	got := bindTestInterface(t, values[0]).(bindTestJSONStruct)
 	if !reflect.DeepEqual(got, bindTestJSONStruct{}) {
 		t.Fatalf("JSON struct field names must match exact bind names; got %#v, want zero value", got)
+	}
+}
+
+func TestBindJSONMultipleParametersUseExactStructFieldCase(t *testing.T) {
+	body := []byte(`{"payload":{"Name":"alice","Count":3},"id":1}`)
+	values, err := bindTestInject(t, func(payload bindTestJSONStruct, id int) {},
+		[]string{"payload", "id"}, nameSources{}, body, true)
+	if err != nil {
+		t.Fatalf("inject multi-parameter JSON struct: %v", err)
+	}
+	if got := bindTestInterface(t, values[0]); !reflect.DeepEqual(got, bindTestJSONStruct{}) {
+		t.Fatalf("multi-parameter JSON struct = %#v, want exact-case zero value", got)
 	}
 }
 
@@ -759,15 +808,19 @@ func TestBindFileHeaderShapes(t *testing.T) {
 }
 
 func TestBindRecursiveStructForm(t *testing.T) {
-	if os.Getenv(bindTestRecursiveEnvName) != "1" {
+	if !*bindTestRecursiveChild {
 		executable, err := os.Executable()
 		if err != nil {
 			t.Fatalf("find test executable: %v", err)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, executable, "-test.run=^TestBindRecursiveStructFormSubprocess$", "-test.count=1", "-test.timeout=15s")
-		cmd.Env = append(os.Environ(), bindTestRecursiveEnvName+"=1")
+		cmd := exec.CommandContext(ctx, executable,
+			"-test.run=^TestBindRecursiveStructFormSubprocess$",
+			"-gbl-bind-recursive-child",
+			"-test.count=1",
+			"-test.timeout=15s",
+		)
 		output, runErr := cmd.CombinedOutput()
 		if runErr != nil {
 			var diagnostics []string
@@ -790,7 +843,7 @@ func TestBindRecursiveStructForm(t *testing.T) {
 }
 
 func TestBindRecursiveStructFormSubprocess(t *testing.T) {
-	if os.Getenv(bindTestRecursiveEnvName) != "1" {
+	if !*bindTestRecursiveChild {
 		t.Skip("subprocess helper; run by TestBindRecursiveStructForm")
 	}
 	// Keep a regression failure fast and bounded. A fatal runtime stack overflow

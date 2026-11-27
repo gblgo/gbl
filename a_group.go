@@ -55,56 +55,56 @@ func (e *engine) group(group string) RouteGroup {
 // middleware and only for routes registered through this group. Like every
 // assembling API, it panics once Run is claimed.
 func (rg *routeGroup) GroupUse(middleware ...HandlerFunc) RouteGroup {
-	rg.engine.assertAssembling("GroupUse")
+	defer rg.engine.assertAssembling("GroupUse")()
 	rg.middlewares = append(rg.middlewares, middleware...)
 	return rg
 }
 
 // Get registers a GET handler under the group prefix.
 func (rg *routeGroup) Get(path string, fn any) RouteGroup {
-	rg.engine.assertAssembling("Group.Get")
+	defer rg.engine.assertAssembling("Group.Get")()
 	rg.engine.registerWith(methodGet, rg.group+path, fn, rg.middlewares)
 	return rg
 }
 
 // Head registers a HEAD handler under the group prefix.
 func (rg *routeGroup) Head(path string, fn any) RouteGroup {
-	rg.engine.assertAssembling("Group.Head")
+	defer rg.engine.assertAssembling("Group.Head")()
 	rg.engine.registerWith(methodHead, rg.group+path, fn, rg.middlewares)
 	return rg
 }
 
 // Post registers a POST handler under the group prefix.
 func (rg *routeGroup) Post(path string, fn any) RouteGroup {
-	rg.engine.assertAssembling("Group.Post")
+	defer rg.engine.assertAssembling("Group.Post")()
 	rg.engine.registerWith(methodPost, rg.group+path, fn, rg.middlewares)
 	return rg
 }
 
 // Put registers a PUT handler under the group prefix.
 func (rg *routeGroup) Put(path string, fn any) RouteGroup {
-	rg.engine.assertAssembling("Group.Put")
+	defer rg.engine.assertAssembling("Group.Put")()
 	rg.engine.registerWith(methodPut, rg.group+path, fn, rg.middlewares)
 	return rg
 }
 
 // Patch registers a PATCH handler under the group prefix.
 func (rg *routeGroup) Patch(path string, fn any) RouteGroup {
-	rg.engine.assertAssembling("Group.Patch")
+	defer rg.engine.assertAssembling("Group.Patch")()
 	rg.engine.registerWith(methodPatch, rg.group+path, fn, rg.middlewares)
 	return rg
 }
 
 // Delete registers a DELETE handler under the group prefix.
 func (rg *routeGroup) Delete(path string, fn any) RouteGroup {
-	rg.engine.assertAssembling("Group.Delete")
+	defer rg.engine.assertAssembling("Group.Delete")()
 	rg.engine.registerWith(methodDelete, rg.group+path, fn, rg.middlewares)
 	return rg
 }
 
 // Options registers an OPTIONS handler under the group prefix.
 func (rg *routeGroup) Options(path string, fn any) RouteGroup {
-	rg.engine.assertAssembling("Group.Options")
+	defer rg.engine.assertAssembling("Group.Options")()
 	rg.engine.registerWith(methodOptions, rg.group+path, fn, rg.middlewares)
 	return rg
 }

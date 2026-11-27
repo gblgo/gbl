@@ -6,7 +6,6 @@ package gbl
 
 import (
 	"errors"
-	"go/ast"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -259,29 +258,6 @@ func TestCoreEdgeInjectedParametersSpecialAndDefensiveBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("final invalid", func(t *testing.T) {
-		c := &Context{rh: &routeHandler{}}
-		err := injectedParameters(c, nil, nil, nil, false, make([]reflect.Value, 1))
-		if err == nil || !strings.Contains(err.Error(), `parameter "arg0" was not initialized`) {
-			t.Fatalf("injectedParameters() error = %v, want uninitialized arg0", err)
-		}
-	})
-
-	t.Run("final type mismatch", func(t *testing.T) {
-		plan := bindPlan{
-			types:    []reflect.Type{reflect.TypeFor[coreEdgeNarrowWriter]()},
-			classes:  []paramClass{classWriter},
-			writerOK: []bool{true},
-		}
-		c := &Context{
-			writer: &pooledResponseWriter{},
-			rh:     &routeHandler{plan: plan, paramNames: []string{"writer"}},
-		}
-		err := injectedParameters(c, nil, nil, nil, false, make([]reflect.Value, 1))
-		if err == nil || !strings.Contains(err.Error(), "type mismatch") {
-			t.Fatalf("injectedParameters() error = %v, want type mismatch", err)
-		}
-	})
 }
 
 func TestCoreEdgeBindFormParameterDepthAndMissingScalarPointer(t *testing.T) {
@@ -396,60 +372,13 @@ func coreEdgeNoArg() {}
 func TestCoreEdgeParamNameLookupNilFunction(t *testing.T) {
 	var nilFunction func(int)
 	value := reflect.ValueOf(nilFunction)
-
-	e := &engine{}
-	names, resolved, ambiguous := e.resolveParamNames(value)
-	if names != nil || resolved || ambiguous != "" {
-		t.Fatalf("resolveParamNames(nil) = (%v, %t, %q), want (nil, false, empty)", names, resolved, ambiguous)
-	}
-
-	e = &engine{dwarfIndex: map[string]dwarfParamNames{
+	e := &engine{dwarfIndex: map[string]dwarfParamNames{
 		"unused": {names: []string{"unused"}},
 	}}
-	names, resolved, ambiguous = e.lookupParamNamesDWARF(value)
+	names, resolved, ambiguous := e.lookupParamNamesDWARF(value)
 	if names != nil || resolved || ambiguous != "" {
-		t.Fatalf("lookupParamNamesDWARF(nil) = (%v, %t, %q), want (nil, false, empty)", names, resolved, ambiguous)
-	}
-}
-
-func TestCoreEdgeFuncSpanIndexAtBounds(t *testing.T) {
-	signature := &ast.FuncType{}
-	var nilIndex *funcSpanIndex
-	if got, ambiguous := nilIndex.at(1); got != nil || ambiguous {
-		t.Fatalf("nil index at(1) = (%v, %t), want (nil, false)", got, ambiguous)
-	}
-	if got, ambiguous := (&funcSpanIndex{}).at(1); got != nil || ambiguous {
-		t.Fatalf("empty index at(1) = (%v, %t), want (nil, false)", got, ambiguous)
-	}
-
-	index := &funcSpanIndex{
-		lines:     []int{10},
-		funcTypes: []*ast.FuncType{signature},
-		ambiguous: []bool{false},
-	}
-	if got, ambiguous := index.at(9); got != nil || ambiguous {
-		t.Fatalf("index at(9) = (%v, %t), want (nil, false)", got, ambiguous)
-	}
-	if got, ambiguous := index.at(10); got != signature || ambiguous {
-		t.Fatalf("index at(10) = (%p, %t), want (%p, false)", got, ambiguous, signature)
-	}
-}
-
-func TestCoreEdgeFindFuncTypeAtSameLineAmbiguityAndBounds(t *testing.T) {
-	outer := &ast.FuncType{}
-	inner := &ast.FuncType{}
-	spans := []funcSpan{
-		{start: 5, end: 10, funcType: outer},
-		{start: 5, end: 6, funcType: inner},
-	}
-	if got, ambiguous := findFuncTypeAt(spans, 5); got != nil || !ambiguous {
-		t.Fatalf("findFuncTypeAt(same line) = (%v, %t), want (nil, true)", got, ambiguous)
-	}
-	if got, ambiguous := findFuncTypeAt(spans, 4); got != nil || ambiguous {
-		t.Fatalf("findFuncTypeAt(before) = (%v, %t), want (nil, false)", got, ambiguous)
-	}
-	if got, ambiguous := findFuncTypeAt(spans, 11); got != nil || ambiguous {
-		t.Fatalf("findFuncTypeAt(after) = (%v, %t), want (nil, false)", got, ambiguous)
+		t.Fatalf("lookupParamNamesDWARF(nil) = (%v, %t, %q), want (nil, false, empty)",
+			names, resolved, ambiguous)
 	}
 }
 

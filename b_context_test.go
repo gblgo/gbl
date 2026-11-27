@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -477,6 +478,38 @@ func TestContextAbortWithStatusJSONSerializationFailure(t *testing.T) {
 	}
 }
 
+func TestContextAbortForbiddenStatusSkipsJSONSerialization(t *testing.T) {
+	c, sink := ctxTestNewContext(func(c *Context) {
+		c.AbortWithStatusJSON(http.StatusNoContent, make(chan int))
+	})
+	if recovered := responseTestCapturePanic(c.Next); recovered != nil {
+		t.Fatalf("AbortWithStatusJSON escaped panic for forbidden body: %v", recovered)
+	}
+
+	if !c.Aborted() {
+		t.Fatal("AbortWithStatusJSON did not abort the chain")
+	}
+	if got := c.StatusCode(); got != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", got)
+	}
+	if sink.body.Len() != 0 {
+		t.Fatalf("forbidden status body = %q, want empty", sink.body.String())
+	}
+}
+
+func TestContextAbortRejectsInformationalStatus(t *testing.T) {
+	for _, status := range []int{http.StatusEarlyHints, 99, 1000} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			c, _ := ctxTestNewContext(func(c *Context) {
+				c.AbortWithStatusString(status, "not final")
+			})
+			if recovered := responseTestCapturePanic(c.Next); recovered == nil {
+				t.Fatalf("AbortWithStatusString(%d) accepted a non-final status", status)
+			}
+		})
+	}
+}
+
 func TestContextAbortMethodsPreservePriorState(t *testing.T) {
 	states := []string{"staged status", "zero length write", "flushed", "hijacked"}
 	for _, method := range []string{"string", "json"} {
@@ -574,7 +607,7 @@ func TestContextValidateBusinessOrderAndNilSkip(t *testing.T) {
 	last := &ctxTestValidationProbe{Name: "last", Calls: &calls}
 	values := []reflect.Value{reflect.ValueOf(first), reflect.ValueOf(nilProbe), reflect.ValueOf(last)}
 
-	err := validateBusiness(values, []int{0, 1, 2})
+	err := validateBusiness(values, []int{0, 1, 2}, []bool{false, false, false})
 	if !errors.Is(err, firstErr) {
 		t.Fatalf("validateBusiness error = %v, want %v", err, firstErr)
 	}
@@ -584,7 +617,7 @@ func TestContextValidateBusinessOrderAndNilSkip(t *testing.T) {
 
 	calls = nil
 	first.Err = nil
-	if err := validateBusiness(values, []int{0, 1, 2}); err != nil {
+	if err := validateBusiness(values, []int{0, 1, 2}, []bool{false, false, false}); err != nil {
 		t.Fatalf("valid validateBusiness returned %v", err)
 	}
 	if !reflect.DeepEqual(calls, []string{"first", "last"}) {
@@ -592,7 +625,7 @@ func TestContextValidateBusinessOrderAndNilSkip(t *testing.T) {
 	}
 
 	invalid := []reflect.Value{reflect.Value{}, reflect.ValueOf(last)}
-	if err := validateBusiness(invalid, []int{0, 1}); err != nil {
+	if err := validateBusiness(invalid, []int{0, 1}, []bool{false, false}); err != nil {
 		t.Fatalf("invalid reflected slot returned %v", err)
 	}
 }

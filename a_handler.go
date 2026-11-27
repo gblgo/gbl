@@ -89,10 +89,10 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Raw handlers do not enter parameter parsing. Reject a known oversized body
-	// before application code runs, but leave an unknown-length body unread and
-	// wrap it with MaxBytesReader so the handler can stream up to the same cap.
-	if method.isBodyMethod() && !rh.plan.needsParse {
+	// Apply the body boundary before middleware runs. Parameter parsing prepares
+	// the same body again, but the marker makes that check idempotent; a middleware
+	// replacement is still limited when the handler parses it.
+	if method.isBodyMethod() {
 		if err := prepareRequestBody(w, r); err != nil {
 			writeRequestError(err, e.logger)
 			return
@@ -102,10 +102,10 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	c := newContext(rw, r, pathParams, rh, method, e.logger)
 	defer c.recycle()
 
-	// Return-value handlers expose a provisional media type before middleware or
-	// the handler can flush. Serialization replaces it immediately after staging;
-	// interface returns defer an in-handler flush until that replacement is known.
-	if rh.t.NumOut() > 0 {
+	// Concrete return-value handlers expose a provisional media type before
+	// middleware or the handler can flush. Interface returns stay unset because
+	// only the runtime value can determine a truthful type.
+	if rh.contentType != empty {
 		rw.Header().Set(contentType, rh.contentType)
 	}
 
@@ -114,7 +114,7 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	c.Next()
 
-	if !c.handled && rw.headed() && !rw.flushed() {
+	if rw.headed() && !rw.flushed() && !rw.written() && !rw.hijacked() {
 		rw.writeHeader()
 	}
 

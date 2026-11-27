@@ -6,10 +6,11 @@ package gbl
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
-	"net/url"
 	"reflect"
 	"sync"
 )
@@ -77,6 +78,8 @@ type Context struct {
 	keys map[string]any
 	// pooled buffer for handler result serialization, released after Write
 	responseBuf *bytes.Buffer
+	// form owns request-scoped Form/PostForm maps until the request fully unwinds.
+	form *pooledForm
 	// sse is non-nil while an SSE handler is binding or running.
 	sse *sseWriter
 
@@ -86,7 +89,12 @@ type Context struct {
 	handled bool
 	// SSE routes own their response and skip automatic return-value writeback.
 	skipWriteback bool
+	// compressTried prevents stacked middleware from repeating deflate work.
+	compressTried bool
 }
+
+// maxPooledContextKeys bounds retained map capacity after unusually large requests.
+const maxPooledContextKeys = 64
 
 // contextPool recycles Context objects across requests.
 var contextPool = sync.Pool{
@@ -119,9 +127,11 @@ func newContext(w *pooledResponseWriter,
 	c.ret = reflect.Value{}
 	c.handled = false
 	c.skipWriteback = false
+	c.compressTried = false
 	c.logger = logger
 	c.src = nameSources{}
 	c.responseBuf = nil
+	c.form = nil
 	return c
 }
 
@@ -137,10 +147,13 @@ func (c *Context) recycle() {
 	c.handlers = nil
 	c.params = nil
 	c.rh = nil
-	// Return keys map to pool if it was used
+	// Return ordinary keys maps to the pool; drop unusually large buckets.
 	if c.keys != nil {
+		keyCount := len(c.keys)
 		clear(c.keys)
-		keysPool.Put(c.keys)
+		if keyCount <= maxPooledContextKeys {
+			keysPool.Put(c.keys)
+		}
 		c.keys = nil
 	}
 	c.bytes = nil
@@ -148,6 +161,7 @@ func (c *Context) recycle() {
 	c.ret = reflect.Value{}
 	c.handled = false
 	c.skipWriteback = false
+	c.compressTried = false
 	c.logger = nil
 	c.src = nameSources{}
 	// A panic between staging the result and the pipeline write would
@@ -155,6 +169,10 @@ func (c *Context) recycle() {
 	if c.responseBuf != nil {
 		releaseResponseBuffer(c.responseBuf)
 		c.responseBuf = nil
+	}
+	if c.form != nil {
+		releasePooledForm(c.form)
+		c.form = nil
 	}
 	contextPool.Put(c)
 }
@@ -274,6 +292,14 @@ func (c *Context) commitPendingResponse() {
 	}
 }
 
+// validateFinalAbortStatus rejects informational and out-of-range statuses before
+// an abort can serialize or commit a response.
+func validateFinalAbortStatus(status int) {
+	if status < http.StatusOK || status > 999 {
+		panic("gbl: abort status must be a final HTTP status between 200 and 999")
+	}
+}
+
 // AbortWithStatusString denies the request with a plain-text body and stops the chain.
 func (c *Context) AbortWithStatusString(status int, body string) {
 	if c.writer.headed() || c.writer.flushed() || c.writer.written() || c.writer.hijacked() {
@@ -281,6 +307,7 @@ func (c *Context) AbortWithStatusString(status int, body string) {
 		c.Abort()
 		return
 	}
+	validateFinalAbortStatus(status)
 	c.writer.Header().Set(contentType, textPlainCharset)
 	c.writer.WriteHeader(status)
 	c.writer.writeHeader()
@@ -296,6 +323,14 @@ func (c *Context) AbortWithStatusString(status int, body string) {
 func (c *Context) AbortWithStatusJSON(status int, body any) {
 	if c.writer.headed() || c.writer.flushed() || c.writer.written() || c.writer.hijacked() {
 		c.commitPendingResponse()
+		c.Abort()
+		return
+	}
+	validateFinalAbortStatus(status)
+	if !bodyAllowedForStatus(status) {
+		c.writer.Header().Set(contentType, applicationJsonCharset)
+		c.writer.WriteHeader(status)
+		c.writer.writeHeader()
 		c.Abort()
 		return
 	}
@@ -322,7 +357,7 @@ func Use(middleware ...HandlerFunc) { defaultEngine.use(middleware...) }
 // engine running outermost. Register all middleware before Run; calling Use
 // after Run is claimed panics, because route chains are no longer editable.
 func (e *engine) use(middleware ...HandlerFunc) {
-	e.assertAssembling("Use")
+	defer e.assertAssembling("Use")()
 	e.middlewares = append(e.middlewares, middleware...)
 }
 
@@ -341,7 +376,7 @@ func (c *Context) invokeHandler() {
 	}
 
 	var (
-		form    url.Values
+		form    *pooledForm
 		files   filesMap
 		bodyBuf *bytes.Buffer
 		isJSON  bool
@@ -354,6 +389,7 @@ func (c *Context) invokeHandler() {
 		form, files, bodyBuf, isJSON, err = parseRequestParameters(
 			c.writer, c.Request, c.method, rh.plan.queryKeys,
 		)
+		c.form = form
 		if err != nil {
 			writeRequestError(err, c.logger)
 			return
@@ -379,7 +415,7 @@ func (c *Context) invokeHandler() {
 		// Released on every exit path — error aborts included, and a panicking
 		// handler, which the manual releases after Call could not cover.
 		defer releaseParams(paramsBuf, in)
-		if err = injectedParameters(c, form, files, body, isJSON, in); err != nil {
+		if err = injectedParameters(c, form.urlValues(), files, body, isJSON, in); err != nil {
 			// Binding errors are assembled from reflection internals (parameter
 			// names, Go type strings, numeric parsing detail), so only a generic 400 is
 			// returned and the detail stays in the server log.
@@ -390,7 +426,8 @@ func (c *Context) invokeHandler() {
 		// Business values that opt into Validatable are checked before the
 		// handler runs. The message is authored by the application developer, so
 		// it is echoed as the 400 body: whoever wrote it owns what it discloses.
-		if vErr := validateBusiness(in, rh.plan.validatableIndexes); vErr != nil {
+		if vErr := validateBusiness(in, rh.plan.validatableIndexes,
+			rh.plan.validatablePointers); vErr != nil {
 			abort(http.StatusBadRequest, vErr.Error())
 			return
 		}
@@ -418,11 +455,21 @@ func (c *Context) invokeHandler() {
 			}
 			abort(http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError))
 		}
+		if stopHeartbeat == nil {
+			return
+		}
 		defer stopHeartbeat()
 	}
 
 	out := rh.v.Call(in)
 	if len(out) > 0 {
+		// Retain the raw return; Result boxes it only if a middleware asks.
+		c.ret = out[0]
+		if c.writer.hijacked() || !bodyAllowedForStatus(c.writer.status()) {
+			c.writer.writeHeader()
+			c.handled = true
+			return
+		}
 		buf := responseBufferPool.Get().(*bytes.Buffer)
 		buf.Reset()
 		mediaType, convertErr := convertToBuffer(buf, out[0])
@@ -433,20 +480,24 @@ func (c *Context) invokeHandler() {
 			return
 		}
 		c.contentType = mediaType
-		if !c.writer.flushed() && !c.writer.hijacked() {
+		if !c.writer.flushed() && !c.writer.hijacked() &&
+			c.writer.Header().Get(contentType) != mediaType {
 			c.writer.Header().Set(contentType, mediaType)
 		}
 		c.bytes = buf.Bytes()
 		c.responseBuf = buf
-		// Retain the raw return; Result boxes it only if a middleware asks.
-		c.ret = out[0]
 	}
 	c.handled = true
 }
 
 // startSSE commits the stream and starts its heartbeat after binding succeeds.
+// A stream canceled before its first write is a normal exit; the caller skips the
+// business handler and deferred completion still runs.
 func (c *Context) startSSE() (func(), error) {
 	if err := c.sse.start(); err != nil {
+		if cause := context.Cause(c.sse.ctx); cause != nil && errors.Is(err, cause) {
+			return nil, nil
+		}
 		return nil, c.sse.fail(err)
 	}
 	return c.sse.startHeartbeat(), nil

@@ -35,7 +35,7 @@ func RegisterPanicProcessor(p PanicProcessor) {
 
 // setPanicProcessor installs the panic renderer on this engine.
 func (e *engine) setPanicProcessor(p PanicProcessor) {
-	e.assertAssembling("RegisterPanicProcessor")
+	defer e.assertAssembling("RegisterPanicProcessor")()
 	e.panicProcessor = p
 }
 
@@ -131,6 +131,33 @@ func errorWritebackDepth(err any, depth int) ([]byte, string) {
 	}
 }
 
+// errorMediaType chooses the same representation as errorWriteback without
+// serializing a payload whose response status forbids a body.
+func errorMediaType(err any) string {
+	return errorMediaTypeDepth(err, 0)
+}
+
+func errorMediaTypeDepth(err any, depth int) string {
+	if err == nil {
+		return textPlainCharset
+	}
+	if _, ok := err.(error); ok {
+		return textPlainCharset
+	}
+	value := reflect.ValueOf(err)
+	switch value.Kind() {
+	case reflect.Struct, reflect.Map, reflect.Array, reflect.Slice:
+		return applicationJsonCharset
+	case reflect.Pointer, reflect.Interface:
+		if value.IsNil() || depth >= maxResponseDerefDepth {
+			return textPlainCharset
+		}
+		return errorMediaTypeDepth(value.Elem().Interface(), depth+1)
+	default:
+		return textPlainCharset
+	}
+}
+
 // safeErrorMessage keeps user-defined Error methods from escaping a panic during
 // response rendering. The fallback is fixed and contains no recovered detail.
 func safeErrorMessage(err error) (message string) {
@@ -185,6 +212,12 @@ func (e *engine) renderPanic(rw responseWriter, err any) {
 		code := int(httpStatus)
 		if code < http.StatusOK || code > 999 {
 			code = http.StatusInternalServerError
+		}
+		if !bodyAllowedForStatus(code) {
+			rw.Header().Set(contentType, errorMediaType(payload))
+			rw.replaceStatus(code)
+			rw.writeHeader()
+			return
 		}
 		body, mediaType := errorWriteback(payload)
 		rw.Header().Set(contentType, mediaType)

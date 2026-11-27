@@ -41,7 +41,7 @@ func (e *engine) registerWith(method httpMethod, path string, fn any, mw []Handl
 
 // Get registers a handler for GET requests at path.
 func Get(path string, fn any) {
-	defaultEngine.assertAssembling("Get")
+	defer defaultEngine.assertAssembling("Get")()
 	defaultEngine.register(methodGet, path, fn)
 }
 
@@ -50,35 +50,35 @@ func Get(path string, fn any) {
 // Registering it is optional: an unregistered HEAD automatically reuses the GET
 // route for the same path.
 func Head(path string, fn any) {
-	defaultEngine.assertAssembling("Head")
+	defer defaultEngine.assertAssembling("Head")()
 	defaultEngine.register(methodHead, path, fn)
 }
 
 // Post registers a handler for POST requests at path. The request body is read
 // and bound according to its Content-Type.
 func Post(path string, fn any) {
-	defaultEngine.assertAssembling("Post")
+	defer defaultEngine.assertAssembling("Post")()
 	defaultEngine.register(methodPost, path, fn)
 }
 
 // Put registers a handler for PUT requests at path. The request body is read and
 // bound according to its Content-Type.
 func Put(path string, fn any) {
-	defaultEngine.assertAssembling("Put")
+	defer defaultEngine.assertAssembling("Put")()
 	defaultEngine.register(methodPut, path, fn)
 }
 
 // Patch registers a handler for PATCH requests at path. The request body is read
 // and bound according to its Content-Type.
 func Patch(path string, fn any) {
-	defaultEngine.assertAssembling("Patch")
+	defer defaultEngine.assertAssembling("Patch")()
 	defaultEngine.register(methodPatch, path, fn)
 }
 
 // Delete registers a handler for DELETE requests at path. Like GET, DELETE never
 // reads the request body; only path and query parameters bind.
 func Delete(path string, fn any) {
-	defaultEngine.assertAssembling("Delete")
+	defer defaultEngine.assertAssembling("Delete")()
 	defaultEngine.register(methodDelete, path, fn)
 }
 
@@ -88,6 +88,6 @@ func Delete(path string, fn any) {
 // header listing the methods the path really supports, so registering a handler
 // opts that path out of the automatic answer.
 func Options(path string, fn any) {
-	defaultEngine.assertAssembling("Options")
+	defer defaultEngine.assertAssembling("Options")()
 	defaultEngine.register(methodOptions, path, fn)
 }

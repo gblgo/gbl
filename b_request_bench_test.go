@@ -6,10 +6,10 @@ package gbl
 
 import (
 	"bytes"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -17,124 +17,114 @@ const requestTestBenchQueryPayload = "id=42&name=alice&active=true&tags=go&tags=
 	"&noise0=0&noise1=1&noise2=2&noise3=3&noise4=4&noise5=5&noise6=6&noise7=7&noise8=8&noise9=9" +
 	"&extra0=a&extra1=b&extra2=c&extra3=d&extra4=e&extra5=f&extra6=g&extra7=h&extra8=i&extra9=j"
 
-// Request benchmarks isolate parsing. The request and payload are built once
-// outside the timer; each iteration includes only body-reader replacement and
-// parser-required buffer/temp-file cleanup. Handler binding and response writing
-// are excluded, so these are not end-to-end HTTP costs. Scalar and struct use the
-// exact same fixture and reset path; JSON and multipart reuse the binding
-// benchmarks' payload construction helpers.
-func requestTestBenchResetBody(r *http.Request, payload []byte) {
-	r.Body = io.NopCloser(bytes.NewReader(payload))
+// requestTestBenchBody reuses one reader so fixture setup stays outside measured allocations.
+type requestTestBenchBody struct {
+	*bytes.Reader
+}
+
+// Close implements io.Closer without releasing the reusable reader.
+func (b *requestTestBenchBody) Close() error { return nil }
+
+// requestTestBenchResetBody restores the reusable request body between iterations.
+func requestTestBenchResetBody(r *http.Request, payload []byte, body *requestTestBenchBody) {
+	body.Reset(payload)
+	r.Body = body
 	r.Form = nil
 	r.PostForm = nil
 	r.MultipartForm = nil
 }
 
-func requestTestBenchURLEncoded(b *testing.B, keys []string) {
-	b.StopTimer()
-	payload := []byte(bindTestBenchFormPayload)
-	r := httptest.NewRequest(http.MethodPost, "/bench", bytes.NewReader(payload))
-	r.Header.Set(contentType, xWwwFormUrlencoded)
-	recorder := httptest.NewRecorder()
+// BenchmarkFrameworkFormMergeInPlace measures only the framework's query/body merge.
+func BenchmarkFrameworkFormMergeInPlace(b *testing.B) {
+	body := url.Values{
+		"name": {"body"}, "bodyOnly": {"yes"}, "tag": {"a", "b"},
+	}
+	query := url.Values{"queryOnly": {"yes"}}
+	var sink url.Values
 	b.ReportAllocs()
 	b.ResetTimer()
-	b.StartTimer()
-	for i := 0; i < b.N; i++ {
-		requestTestBenchResetBody(r, payload)
-		form, files, body, jsonMedia, err := parseRequestParameters(recorder, r, methodPost, keys)
-		if err != nil {
-			b.Fatalf("parse urlencoded benchmark: %v", err)
-		}
-		if body != nil {
-			releaseBodyBuffer(body)
-		}
-		if form.Get("id") != "42" || files != nil || jsonMedia {
-			b.Fatalf("unexpected urlencoded parse result: form=%#v files=%#v json=%v", form, files, jsonMedia)
-		}
+	for range b.N {
+		delete(body, "queryOnly")
+		sink = mergeSelectedFormInPlace(query, body)
 	}
 	b.StopTimer()
+	if sink.Get("name") != "body" || sink.Get("queryOnly") != "yes" {
+		b.Fatalf("unexpected merged form: %#v", sink)
+	}
 }
 
-func BenchmarkRequestParseScalar(b *testing.B) {
-	requestTestBenchURLEncoded(b, []string{"id"})
+// BenchmarkFrameworkFormSelectiveBody measures framework parsing without HTTP or ParseQuery.
+func BenchmarkFrameworkFormSelectiveBody(b *testing.B) {
+	payload := []byte(bindTestBenchFormPayload + strings.Repeat("&noise=ignored", 64))
+	keys := newRequestKeySet([]string{"id", "name", "active", "tags", "pair", "raw"})
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	for range b.N {
+		form, err := formValuesForSet(payload, keys)
+		if err != nil || form.urlValues().Get("id") != "42" || len(form.values) != len(keys) {
+			releasePooledForm(form)
+			b.Fatalf("unexpected selected form: (%#v, %v)", form, err)
+		}
+		releasePooledForm(form)
+	}
 }
 
-func BenchmarkRequestParseStruct(b *testing.B) {
-	requestTestBenchURLEncoded(b, []string{"id", "name", "active", "tags", "pair", "raw"})
+// BenchmarkFrameworkQuerySelection measures only the framework's selective query parser.
+func BenchmarkFrameworkQuerySelection(b *testing.B) {
+	r := &http.Request{URL: &url.URL{RawQuery: requestTestBenchQueryPayload}}
+	keys := newRequestKeySet([]string{"id", "name"})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		form := acquirePooledForm(len(keys))
+		form.parseQuery(r, keys)
+		if form.values.Get("id") != "42" || len(form.values) != len(keys) {
+			releasePooledForm(form)
+			b.Fatalf("unexpected selected query: %#v", form.values)
+		}
+		releasePooledForm(form)
+	}
 }
 
-func BenchmarkRequestParseJSON(b *testing.B) {
-	b.StopTimer()
+// BenchmarkFrameworkMultipartReadTracker measures the pooled body wrapper only.
+func BenchmarkFrameworkMultipartReadTracker(b *testing.B) {
+	payload := []byte("multipart-body")
+	body := &requestTestBenchBody{Reader: bytes.NewReader(payload)}
+	var buffer [64]byte
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		body.Reset(payload)
+		tracker := acquireRequestReadTracker(body)
+		n, err := tracker.Read(buffer[:])
+		releaseRequestReadTracker(tracker)
+		if err != nil || n != len(payload) {
+			b.Fatalf("tracked read = (%d, %v)", n, err)
+		}
+	}
+}
+
+// BenchmarkFrameworkJSONBodyBuffer measures only framework body buffering, not JSON decoding.
+func BenchmarkFrameworkJSONBodyBuffer(b *testing.B) {
 	payload := []byte(bindTestBenchJSONPayload)
-	r := httptest.NewRequest(http.MethodPost, "/bench", bytes.NewReader(payload))
+	body := &requestTestBenchBody{Reader: bytes.NewReader(payload)}
+	r := httptest.NewRequest(http.MethodPost, "/bench", body)
 	r.Header.Set(contentType, applicationJson)
 	recorder := httptest.NewRecorder()
 	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
 	b.ResetTimer()
-	b.StartTimer()
-	for i := 0; i < b.N; i++ {
-		requestTestBenchResetBody(r, payload)
-		form, files, body, jsonMedia, err := parseRequestParameters(recorder, r, methodPost, nil)
+	for range b.N {
+		requestTestBenchResetBody(r, payload, body)
+		form, files, bodyBuf, jsonMedia, err := parseRequestParameters(recorder, r, methodPost, nil)
 		if err != nil {
-			b.Fatalf("parse JSON benchmark: %v", err)
+			b.Fatalf("buffer JSON body: %v", err)
 		}
-		if body == nil || !jsonMedia || form != nil || files != nil {
-			b.Fatalf("unexpected JSON parse result: form=%#v files=%#v body=%v json=%v", form, files, body, jsonMedia)
+		if bodyBuf == nil || !jsonMedia || form != nil || files != nil {
+			b.Fatalf("unexpected JSON buffer result: form=%#v files=%#v body=%v json=%v",
+				form, files, bodyBuf, jsonMedia)
 		}
-		releaseBodyBuffer(body)
+		releaseBodyBuffer(bodyBuf)
 	}
-	b.StopTimer()
-}
-
-func BenchmarkRequestParseMultipart(b *testing.B) {
-	b.StopTimer()
-	fields := url.Values{"name": {"alice"}}
-	upload := requestTestUpload{field: "upload", filename: "bench.txt", body: []byte("hello")}
-	r, payload := requestTestNewMultipart(b, "/bench", fields, upload)
-	recorder := httptest.NewRecorder()
-	b.ReportAllocs()
-	b.ResetTimer()
-	b.StartTimer()
-	for i := 0; i < b.N; i++ {
-		requestTestBenchResetBody(r, payload)
-		form, files, body, jsonMedia, err := parseRequestParameters(recorder, r, methodPost, []string{"name", "upload"})
-		if err != nil {
-			b.Fatalf("parse multipart benchmark: %v", err)
-		}
-		if body != nil {
-			releaseBodyBuffer(body)
-		}
-		if form.Get("name") != "alice" || len(files["upload"]) != 1 || jsonMedia {
-			b.Fatalf("unexpected multipart parse result: form=%#v files=%#v json=%v", form, files, jsonMedia)
-		}
-		if r.MultipartForm != nil {
-			if err := r.MultipartForm.RemoveAll(); err != nil {
-				b.Fatalf("clean multipart benchmark: %v", err)
-			}
-		}
-	}
-	b.StopTimer()
-}
-
-func BenchmarkRequestQuerySelective(b *testing.B) {
-	r := httptest.NewRequest(http.MethodGet, "/bench?"+requestTestBenchQueryPayload, nil)
-	keys := []string{"id", "name"}
-	b.Run("full", func(b *testing.B) {
-		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			values := queryValues(r)
-			if values.Get("id") != "42" || len(values) <= len(keys) {
-				b.Fatalf("unexpected full query result: %#v", values)
-			}
-		}
-	})
-	b.Run("selected", func(b *testing.B) {
-		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			values := queryValuesFor(r, keys)
-			if values.Get("id") != "42" || len(values) != len(keys) {
-				b.Fatalf("unexpected selected query result: %#v", values)
-			}
-		}
-	})
 }

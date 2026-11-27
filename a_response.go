@@ -50,6 +50,16 @@ func convertToBuffer(buf *bytes.Buffer, val reflect.Value) (string, error) {
 	return convertToBufferDepth(buf, val, 0)
 }
 
+// encodeJSONBuffer writes compact JSON directly into the pooled response buffer.
+// Encoder appends one newline on success, which is removed to preserve Marshal output.
+func encodeJSONBuffer(buf *bytes.Buffer, value any) error {
+	if err := json.NewEncoder(buf).Encode(value); err != nil {
+		return err
+	}
+	buf.Truncate(buf.Len() - 1)
+	return nil
+}
+
 // convertToBufferDepth renders one value while bounding pointer/interface walks.
 func convertToBufferDepth(buf *bytes.Buffer, val reflect.Value, depth int) (string, error) {
 	if !val.IsValid() {
@@ -102,18 +112,14 @@ func convertToBufferDepth(buf *bytes.Buffer, val reflect.Value, depth int) (stri
 			buf.Write(val.Bytes())
 			return textPlainCharset, nil
 		}
-		data, err := json.Marshal(val.Interface())
-		if err != nil {
+		if err := encodeJSONBuffer(buf, val.Interface()); err != nil {
 			return empty, err
 		}
-		buf.Write(data)
 		return applicationJsonCharset, nil
 	case reflect.Array, reflect.Map, reflect.Struct:
-		data, err := json.Marshal(val.Interface())
-		if err != nil {
+		if err := encodeJSONBuffer(buf, val.Interface()); err != nil {
 			return empty, err
 		}
-		buf.Write(data)
 		return applicationJsonCharset, nil
 	default:
 		return empty, fmt.Errorf("unsupported response type: %s", val.Type())

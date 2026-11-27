@@ -8,12 +8,11 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"go/ast"
-	"go/token"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -50,18 +49,12 @@ type engine struct {
 	cfg *Config
 	// nil disables the CORS layer
 	cors *CorsConfig
-	// parsed source files for parameter names
-	astFileMap map[string]*ast.File
-	// per-file function line spans, collected once per file during name recovery
-	astSpans map[*ast.File][]funcSpan
-	// per-file line index built from astSpans for logarithmic handler lookup
-	astSpanIndex map[*ast.File]*funcSpanIndex
-	// file set backing astFileMap
-	fest *token.FileSet
-	// lazily built "<file>:<line>"->param names from the binary DWARF; the sourceless fallback
+	// lazily built "<file>:<line>"->param names from the binary DWARF.
 	dwarfIndex map[string]dwarfParamNames
 	// handler positions collected before generation so DWARF indexes only relevant entries
 	dwarfTargets map[string]struct{}
+	// paramNameResolver lets tests force the production DWARF path explicitly.
+	paramNameResolver func(reflect.Value) ([]string, bool, string)
 	// live server, published by Run; nil before publication
 	server *http.Server
 	// owns connections removed from net/http by Hijack
@@ -70,6 +63,8 @@ type engine struct {
 	cancelStreams context.CancelFunc
 
 	// sync primitives
+	// assemblyMu serializes the Run claim with every assembling mutation.
+	assemblyMu sync.RWMutex
 	// guards server publication only; net.Listen deliberately runs outside this lock
 	startMu sync.Mutex
 	// serializes shutdown attempts so Run can wait for an in-progress drain
@@ -107,10 +102,6 @@ func newEngine() *engine {
 	streamCtx, cancelStreams := context.WithCancel(context.Background())
 	return &engine{
 		roots:         make([]*routeNode, methodCount),
-		astFileMap:    make(map[string]*ast.File),
-		astSpans:      make(map[*ast.File][]funcSpan),
-		astSpanIndex:  make(map[*ast.File]*funcSpanIndex),
-		fest:          token.NewFileSet(),
 		logger:        newStdLogger(),
 		cfg:           defaultConfig(),
 		hijacks:       newHijackRegistry(),
@@ -150,6 +141,8 @@ var (
 	netListen = net.Listen
 	// shutdownGracePeriod bounds signal-triggered graceful shutdown.
 	shutdownGracePeriod = 5 * time.Second
+	// shutdownStart lets lifecycle tests synchronize before the publication lock.
+	shutdownStart = func() {}
 )
 
 // run is the instance-level counterpart of the package-level Run.
@@ -157,8 +150,11 @@ func (e *engine) run() {
 	// Claim the engine before any startup work so concurrent callers cannot race
 	// into route generation or net.Listen and produce a port error instead of the
 	// single-use diagnostic.
-	if !e.runState.CompareAndSwap(runStateIdle, runStateStarting) {
-		panic("gbl.Run called twice; the engine serves only once")
+	e.assemblyMu.Lock()
+	claimed := e.runState.CompareAndSwap(runStateIdle, runStateStarting)
+	e.assemblyMu.Unlock()
+	if !claimed {
+		e.failStartup("gbl.Run called twice; the engine serves only once")
 	}
 	defer e.runState.Store(runStateStopped)
 
@@ -281,6 +277,7 @@ func (e *engine) run() {
 
 // shutdown is the instance-level counterpart of the package-level Shutdown.
 func (e *engine) shutdown(ctx context.Context) error {
+	shutdownStart()
 	// Taking startMu first preserves the before-Run behavior while also waiting
 	// behind a test or integration layer that deliberately holds the publication
 	// lock. Never wait for startDone while holding it: Run needs the lock to publish.
@@ -348,11 +345,21 @@ func (e *engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // assertAssembling enforces the engine's read-only-after-Run-claim contract.
 // Route registration, middleware, loggers, CORS, configuration, panic renderers
 // and size limits must all be set before Run. Once Run is claimed, those setters
-// can no longer take effect, so a wrong registration order fails fast instead of
-// being silently ignored. The panic bypasses failStartup because startup may
-// already be in progress and the caller's stack trace identifies the mistake.
-func (e *engine) assertAssembling(op string) {
+// can no longer take effect, so a wrong registration order is logged and fails
+// fast instead of being silently ignored.
+func (e *engine) assertAssembling(op string) func() {
+	e.assemblyMu.RLock()
 	if e.runState.Load() != runStateIdle {
-		panic("gbl." + op + " must be called before Run; the engine is read-only while serving")
+		e.assemblyMu.RUnlock()
+		e.failAssembling(op)
 	}
+	return e.assemblyMu.RUnlock
+}
+
+// failAssembling records an API-order violation without letting a failing logger
+// replace the panic that callers use to detect the mistake.
+func (e *engine) failAssembling(op string) {
+	reason := "gbl." + op + " must be called before Run; the engine is read-only while serving"
+	safeLog(func() { e.logger.Error("assembly rejected", "reason", reason) })
+	panic(reason)
 }

@@ -63,16 +63,32 @@ func Configure(fn func(*Config)) { defaultEngine.configure(fn) }
 // path takes effect without a separate switch. Once Run is claimed the
 // configuration is frozen and re-Configure panics.
 func (e *engine) configure(fn func(*Config)) {
-	e.assertAssembling("Configure")
+	e.assemblyMu.Lock()
+	if e.runState.Load() != runStateIdle {
+		e.assemblyMu.Unlock()
+		e.failAssembling("Configure")
+		return
+	}
 	next := *e.cfg
+	e.assemblyMu.Unlock()
+
 	if fn != nil {
 		callbackCfg := next
 		fn(&callbackCfg)
 		next = callbackCfg
 	}
+	e.assemblyMu.Lock()
+	if e.runState.Load() != runStateIdle {
+		e.assemblyMu.Unlock()
+		e.failAssembling("Configure")
+		return
+	}
 	if (next.CertFile == empty) != (next.KeyFile == empty) {
+		e.assemblyMu.Unlock()
 		e.failStartup("gbl: CertFile and KeyFile must both be set or both be empty")
+		return
 	}
 	next.useTLS = next.CertFile != empty && next.KeyFile != empty
 	e.cfg = &next
+	e.assemblyMu.Unlock()
 }

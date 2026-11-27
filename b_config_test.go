@@ -93,6 +93,46 @@ func TestEngineConfigureOverlaysAndCopies(t *testing.T) {
 	}
 }
 
+func TestEngineConfigureCallbackRunsOutsideAssemblyLock(t *testing.T) {
+	e := newEngine()
+	defer e.cancelStreams()
+
+	e.configure(func(*Config) {
+		if !e.assemblyMu.TryLock() {
+			t.Error("Configure callback ran while assemblyMu was held")
+		} else {
+			e.assemblyMu.Unlock()
+		}
+		e.register(methodGet, "/from-configure", func() {})
+	})
+
+	if len(e.routeMetaSlice) != 1 || e.routeMetaSlice[0].path != "/from-configure" {
+		t.Fatalf("reentrant registration from Configure was not retained: %#v", e.routeMetaSlice)
+	}
+}
+
+func TestEngineConfigureRejectsRunClaimDuringCallback(t *testing.T) {
+	e := newEngine()
+	defer e.cancelStreams()
+	before := e.cfg
+	beforeValue := *before
+	e.runState.Store(runStateIdle)
+	t.Cleanup(func() { e.runState.Store(runStateIdle) })
+
+	recovered := configTestPanicValue(func() {
+		e.configure(func(c *Config) {
+			c.CertFile = "unpaired.crt"
+			e.runState.Store(runStateStarting)
+		})
+	})
+	if recovered != "gbl.Configure must be called before Run; the engine is read-only while serving" {
+		t.Fatalf("configure panic = %#v", recovered)
+	}
+	if e.cfg != before || *e.cfg != beforeValue {
+		t.Fatalf("rejected configure published a config: %#v", e.cfg)
+	}
+}
+
 func TestEngineConfigureNilCopiesCurrentSnapshot(t *testing.T) {
 	e := newEngine()
 	defer e.cancelStreams()

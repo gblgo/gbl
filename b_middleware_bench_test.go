@@ -7,7 +7,6 @@ package gbl
 import (
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -66,42 +65,37 @@ func BenchmarkCORSContains(b *testing.B) {
 	}
 }
 
-// BenchmarkCompressGzip measures complete compressed responses at each level.
-func BenchmarkCompressGzip(b *testing.B) {
-	body := strings.Repeat("compressible benchmark payload\n", 80)
-	levels := []struct {
-		name  string
-		level int
-	}{
-		{name: "best_speed", level: BestSpeed},
-		{name: "default", level: DefaultCompression},
-		{name: "best_compression", level: BestCompression},
+// BenchmarkFrameworkAcceptEncodingValues measures repeated-header scanning without joining.
+func BenchmarkFrameworkAcceptEncodingValues(b *testing.B) {
+	values := []string{"br", "gzip;q=0.8, deflate;q=0.5"}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		middlewareBenchContains = acceptsGzipValues(values)
 	}
-	for _, tt := range levels {
-		b.Run(tt.name, func(b *testing.B) {
-			e := newEngine()
-			b.Cleanup(e.cancelStreams)
-			e.use(Compress(tt.level))
-			e.register(methodGet, "/test", func() string { return body })
-			e.generateRoute()
-			req := httptest.NewRequest(http.MethodGet, "http://example.test/test", nil)
-			req.Header.Set(acceptEncoding, encodingGzip)
-			rec := httptest.NewRecorder()
-			b.ReportAllocs()
-			b.SetBytes(int64(len(body)))
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				rec = httptest.NewRecorder()
-				e.ServeHTTP(rec, req)
-			}
-			b.StopTimer()
-			if got := rec.Header().Get(contentEncoding); got != encodingGzip {
-				b.Fatalf("Content-Encoding = %q, want gzip", got)
-			}
-			if rec.Body.Len() == 0 {
-				b.Fatal("compressed response body is empty")
-			}
-			b.ReportMetric(float64(rec.Body.Len()), "compressed-bytes/op")
-		})
+	b.StopTimer()
+	if !middlewareBenchContains {
+		b.Fatal("gzip header values were rejected")
+	}
+}
+
+// BenchmarkFrameworkCompressHeaders measures framework negotiation and Vary handling only.
+func BenchmarkFrameworkCompressHeaders(b *testing.B) {
+	header := make(http.Header, 8)
+	header.Set(contentType, textPlainCharset)
+	accept := "gzip, deflate;q=0.5"
+	var accepted, compressible bool
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		header.Del(vary)
+		ensureVaryAcceptEncoding(header)
+		accepted = acceptsGzip(accept)
+		compressible = isCompressible(header.Get(contentType))
+	}
+	b.StopTimer()
+	if !accepted || !compressible || header.Get(vary) != acceptEncoding {
+		b.Fatalf("unexpected compression headers: accept=%t compressible=%t vary=%q",
+			accepted, compressible, header.Get(vary))
 	}
 }

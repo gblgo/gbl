@@ -7,6 +7,7 @@ package gbl
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -290,6 +291,9 @@ func responseTestServe(t *testing.T, e *engine, method, path, body, contentType 
 
 func responseTestServeWriter(t *testing.T, e *engine, writer http.ResponseWriter, request *http.Request) (panicValue any) {
 	t.Helper()
+	ctx, cancel := context.WithCancel(request.Context())
+	defer cancel()
+	request = request.WithContext(ctx)
 	type result struct{ panicValue any }
 	done := make(chan result, 1)
 	go func() {
@@ -307,6 +311,11 @@ func responseTestServeWriter(t *testing.T, e *engine, writer http.ResponseWriter
 	case got := <-done:
 		return got.panicValue
 	case <-timer.C:
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(responseTestTimeout):
+		}
 		t.Fatal("request exceeded responseTestTimeout")
 		return nil
 	}
@@ -706,6 +715,20 @@ func TestResponsePipelineNoReturnPreservesContentType(t *testing.T) {
 	responseTestCheckResponse(t, rec, http.StatusCreated, "", "application/x-responseTest")
 }
 
+func TestResponsePipelineNoReturnUsesDefaultContentType(t *testing.T) {
+	e := responseTestNewEngine(t)
+	e.register(methodGet, "/responseTest", func(w http.ResponseWriter) {
+		w.Header().Set(contentType, "application/x-responseTest")
+		w.Header().Del(contentType)
+	})
+	e.generateRoute()
+	rec, escaped := responseTestServe(t, e, http.MethodGet, "/responseTest", "", "")
+	if escaped != nil {
+		t.Fatalf("pipeline leaked a panic: %v", escaped)
+	}
+	responseTestCheckResponse(t, rec, http.StatusOK, "", textPlainCharset)
+}
+
 func TestResponsePipelineInterfaceResultFlushCommitsImmediately(t *testing.T) {
 	e := responseTestNewEngine(t)
 	sink := &responseTestFlushWriter{responseTestWriter: responseTestNewWriter()}
@@ -723,8 +746,8 @@ func TestResponsePipelineInterfaceResultFlushCommitsImmediately(t *testing.T) {
 	if sink.finalStatus != http.StatusOK || sink.body.String() != "plain" {
 		t.Fatalf("response = (%d, %q), want (200, plain)", sink.finalStatus, sink.body.String())
 	}
-	if got := sink.header.Get(contentType); got != applicationJsonCharset {
-		t.Fatalf("Content-Type after immediate flush = %q, want provisional %q", got, applicationJsonCharset)
+	if got := sink.header.Get(contentType); got != empty {
+		t.Fatalf("Content-Type after immediate flush = %q, want no provisional JSON type", got)
 	}
 }
 
@@ -745,6 +768,24 @@ func TestResponseBodyAllowedForStatus(t *testing.T) {
 		if got := bodyAllowedForStatus(tc.status); got != tc.want {
 			t.Errorf("bodyAllowedForStatus(%d) = %v, want %v", tc.status, got, tc.want)
 		}
+	}
+}
+
+func TestResponseForbiddenStatusSkipsHandlerSerialization(t *testing.T) {
+	e := responseTestNewEngine(t)
+	e.use(func(c *Context) {
+		c.writer.WriteHeader(http.StatusNoContent)
+		c.Next()
+	})
+	e.register(methodGet, "/no-content", func() responseTestPanicJSON { return responseTestPanicJSON{} })
+	e.generateRoute()
+
+	recorder, escaped := responseTestServe(t, e, http.MethodGet, "/no-content", empty, empty)
+	if escaped != nil {
+		t.Fatalf("response escaped panic: %v", escaped)
+	}
+	if recorder.Code != http.StatusNoContent || recorder.Body.Len() != 0 {
+		t.Fatalf("response = %d %q, want 204 with empty body", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -897,14 +938,19 @@ func TestResponseWriterReplaceStatusOnlyBeforeCommit(t *testing.T) {
 				rw.hijackedStatus = true
 			}
 			rw.replaceStatus(http.StatusInternalServerError)
-			want := http.StatusInternalServerError
-			if state == "flushed" || state == "written" {
-				want = rw.status()
-			} else {
-				want = http.StatusOK
+			want := http.StatusOK
+			if state == "flushed" {
+				want = http.StatusAccepted
 			}
 			if rw.status() != want {
 				t.Fatalf("status after replace = %d, want %d", rw.status(), want)
+			}
+			if state == "hijacked" {
+				if len(sink.statuses) != 0 {
+					t.Fatalf("hijacked response committed statuses: %v", sink.statuses)
+				}
+			} else if !reflect.DeepEqual(sink.statuses, []int{want}) {
+				t.Fatalf("underlying statuses = %v, want [%d]", sink.statuses, want)
 			}
 		})
 	}
@@ -1535,6 +1581,55 @@ func TestResponsePipelineAbortAfterNextSuppressesStagedResult(t *testing.T) {
 	}
 }
 
+func TestResponsePipelineAbortAfterNextCommitsStagedStatus(t *testing.T) {
+	e := responseTestNewEngine(t)
+	e.use(func(c *Context) {
+		c.Next()
+		c.writer.WriteHeader(http.StatusCreated)
+		c.Abort()
+	})
+	e.register(methodGet, "/responseTest", func() string { return "suppressed" })
+	e.generateRoute()
+	rec, escaped := responseTestServe(t, e, http.MethodGet, "/responseTest", "", "")
+	if escaped != nil {
+		t.Fatalf("pipeline leaked a panic: %v", escaped)
+	}
+	if rec.Code != http.StatusCreated || rec.Body.Len() != 0 {
+		t.Fatalf("response = (%d, %q), want empty 201", rec.Code, rec.Body.String())
+	}
+}
+
+func TestErrorMediaTypeDepth(t *testing.T) {
+	var nilPayload *responseTestPayload
+	var deep any = responseTestPayload{}
+	for range maxResponseDerefDepth + 1 {
+		deep = &deep
+	}
+	tests := []struct {
+		name    string
+		payload any
+		want    string
+	}{
+		{name: "nil", payload: nil, want: textPlainCharset},
+		{name: "error", payload: errors.New("boom"), want: textPlainCharset},
+		{name: "struct", payload: responseTestPayload{}, want: applicationJsonCharset},
+		{name: "map", payload: map[string]int{"a": 1}, want: applicationJsonCharset},
+		{name: "slice", payload: []int{1}, want: applicationJsonCharset},
+		{name: "array", payload: [1]int{1}, want: applicationJsonCharset},
+		{name: "string", payload: "text", want: textPlainCharset},
+		{name: "pointer", payload: &responseTestPayload{}, want: applicationJsonCharset},
+		{name: "nil pointer", payload: nilPayload, want: textPlainCharset},
+		{name: "depth fallback", payload: deep, want: textPlainCharset},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := errorMediaType(tt.payload); got != tt.want {
+				t.Fatalf("errorMediaType(%T) = %q, want %q", tt.payload, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResponsePanicProcessor(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -1551,6 +1646,7 @@ func TestResponsePanicProcessor(t *testing.T) {
 		{name: "no content", payload: "hidden", status: HttpStatus(http.StatusNoContent), body: "", mediaType: textPlainCharset},
 		{name: "reset content", payload: "hidden", status: HttpStatus(http.StatusResetContent), body: "", mediaType: textPlainCharset},
 		{name: "not modified", payload: "hidden", status: HttpStatus(http.StatusNotModified), body: "", mediaType: textPlainCharset},
+		{name: "no content skips bad JSON", payload: responseTestPanicJSON{}, status: HttpStatus(http.StatusNoContent), body: "", mediaType: applicationJsonCharset},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := responseTestNewEngine(t)
