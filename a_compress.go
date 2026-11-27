@@ -175,17 +175,22 @@ func writeGzipAndClose(gw io.WriteCloser, data []byte) (error, error) {
 // gzipWriteAndClose lets serial fault-injection tests exercise middleware cleanup.
 var gzipWriteAndClose = writeGzipAndClose
 
-// ensureVaryAcceptEncoding adds the cache-key field once, preserving any other
-// Vary tokens and recognizing combined or repeated field lines.
-func ensureVaryAcceptEncoding(header http.Header) {
+// ensureVaryHeader adds one cache-key field once, preserving other Vary tokens
+// and recognizing combined or repeated field lines.
+func ensureVaryHeader(header http.Header, token string) {
 	for _, value := range header.Values(vary) {
-		for token := range strings.SplitSeq(value, comma) {
-			if strings.EqualFold(strings.TrimSpace(token), acceptEncoding) {
+		for existing := range strings.SplitSeq(value, comma) {
+			if strings.EqualFold(strings.TrimSpace(existing), token) {
 				return
 			}
 		}
 	}
-	header.Add(vary, acceptEncoding)
+	header.Add(vary, token)
+}
+
+// ensureVaryAcceptEncoding adds the gzip cache-key field.
+func ensureVaryAcceptEncoding(header http.Header) {
+	ensureVaryHeader(header, acceptEncoding)
 }
 
 // gzipAcceptance accumulates encoding decisions across repeated header lines.

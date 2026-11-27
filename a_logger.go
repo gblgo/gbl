@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Logger is the minimal, zero-dependency logging contract of gbl. The framework
@@ -101,9 +102,9 @@ func (s stdLogger) emit(level, msg string, kv []any) {
 func logLine(level, msg string, kv []any) string {
 	var b strings.Builder
 	b.Grow(len(level) + len(msg) + len(kv)*8)
-	b.WriteString(level)
+	appendLogString(&b, level)
 	b.WriteByte(' ')
-	b.WriteString(msg)
+	appendLogString(&b, msg)
 	for i := 0; i+1 < len(kv); i += 2 {
 		b.WriteByte(' ')
 		appendLogValue(&b, kv[i])
@@ -126,7 +127,9 @@ func appendLogValue(b *strings.Builder, value any) {
 	case nil:
 		b.WriteString("<nil>")
 	case string:
-		b.WriteString(v)
+		appendLogString(b, v)
+	case time.Duration:
+		appendLogString(b, v.String())
 	case bool:
 		b.WriteString(strconv.FormatBool(v))
 	case int:
@@ -158,8 +161,36 @@ func appendLogValue(b *strings.Builder, value any) {
 	default:
 		// fmt handles typed-nil values and recovers panics from Error, String and
 		// Format methods while preserving their normal formatting precedence.
-		b.WriteString(fmt.Sprint(value))
+		appendLogString(b, fmt.Sprint(value))
 	}
+}
+
+// appendLogString keeps the default text logger on one physical line and prevents
+// terminal control sequences from untrusted messages or values.
+func appendLogString(b *strings.Builder, value string) {
+	const hex = "0123456789abcdef"
+	start := 0
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c >= 0x20 && c != 0x7f {
+			continue
+		}
+		b.WriteString(value[start:i])
+		switch c {
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			b.WriteString(`\x`)
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&0x0f])
+		}
+		start = i + 1
+	}
+	b.WriteString(value[start:])
 }
 
 // SetLogger installs a Logger on the default engine. Passing nil or a typed-nil
@@ -195,15 +226,20 @@ func Error(msg string, keysAndValues ...any) {
 // and typed-nil pointers are rejected. Once Run is claimed the logger is frozen
 // like every other assembling input, and calling this again panics.
 func (e *engine) setLogger(l Logger) {
-	defer e.assertAssembling("SetLogger")()
+	unlock := e.assertAssembling("SetLogger")
 	if l == nil {
+		unlock()
 		e.failStartup("gbl: SetLogger requires a non-nil Logger")
+		return
 	}
 	value := reflect.ValueOf(l)
 	if value.Kind() == reflect.Pointer && value.IsNil() {
+		unlock()
 		e.failStartup(fmt.Errorf("gbl: SetLogger received a typed-nil %T", l))
+		return
 	}
 	e.logger = l
+	unlock()
 }
 
 // safeLog keeps a failing logging sink from replacing the framework error or

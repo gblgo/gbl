@@ -100,10 +100,12 @@ func SetCorsConfig(cc *CorsConfig) {
 
 // useCors installs the CORS configuration on this engine.
 func (e *engine) useCors(cc *CorsConfig) {
-	defer e.assertAssembling("SetCorsConfig")()
+	unlock := e.assertAssembling("SetCorsConfig")
 	if cc != nil {
 		if err := cc.validate(); err != nil {
+			unlock()
 			e.failStartup(err)
+			return
 		}
 		owned := *cc
 		owned.AllowedOrigins = slices.Clone(cc.AllowedOrigins)
@@ -116,6 +118,7 @@ func (e *engine) useCors(cc *CorsConfig) {
 		cc = &owned
 	}
 	e.cors = cc
+	unlock()
 }
 
 // isPreflightRequest reports whether r is a CORS preflight request.
@@ -150,6 +153,38 @@ type corsHandler struct {
 	// allowedHeadersMap holds lowercased headers for large lists
 	allowedHeadersMap map[string]struct{}
 }
+
+// corsResponseWriter restores policy-owned Vary fields at the commit boundary,
+// after application middleware had a chance to replace the header map.
+type corsResponseWriter struct {
+	http.ResponseWriter
+	varyFields []string
+}
+
+func (w *corsResponseWriter) ensureVary() {
+	for _, field := range w.varyFields {
+		ensureVaryHeader(w.Header(), field)
+	}
+}
+
+func (w *corsResponseWriter) WriteHeader(code int) {
+	if code >= http.StatusOK {
+		w.ensureVary()
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *corsResponseWriter) Write(data []byte) (int, error) {
+	w.ensureVary()
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *corsResponseWriter) FlushError() error {
+	w.ensureVary()
+	return http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *corsResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // newCorsHandler wires the CORS layer over e, precomputing the header values and
 // allow-list maps that stay constant for the lifetime of the configuration.
@@ -322,16 +357,22 @@ func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	origin := strings.TrimSpace(r.Header.Get(headerOrigin))
 	header := w.Header()
+	var varyFields []string
 	if !ch.wildcard || ch.config.AllowCredentials {
-		header.Add(vary, headerOrigin)
+		varyFields = append(varyFields, headerOrigin)
 	}
 
 	// Mark every preflight response before any origin, method or header check
 	// can reject it, so caches never reuse a denial for different inputs.
 	preflight := isPreflightRequest(r)
 	if preflight {
-		header.Add(vary, accessControlRequestMethod)
-		header.Add(vary, accessControlRequestHeaders)
+		varyFields = append(varyFields, accessControlRequestMethod, accessControlRequestHeaders)
+	}
+	if len(varyFields) > 0 {
+		for _, field := range varyFields {
+			ensureVaryHeader(header, field)
+		}
+		w = &corsResponseWriter{ResponseWriter: w, varyFields: varyFields}
 	}
 
 	// Non-cross-origin request

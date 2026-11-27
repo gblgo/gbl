@@ -183,6 +183,18 @@ func TestCompressQualityLevels(t *testing.T) {
 	}
 }
 
+func TestCompressNoCompressionKeepsGzipForLargerOutput(t *testing.T) {
+	body := make([]byte, minCompressSize+128)
+	var state uint32 = 1
+	for i := range body {
+		state = state*1664525 + 1013904223
+		body[i] = byte(state >> 24)
+	}
+	e := mwTestNewEngine(t, func() string { return string(body) }, Compress(NoCompression))
+	rec := mwTestGzipResponse(e, "gzip")
+	mwTestRequireGzipBody(t, rec, body)
+}
+
 func TestCompressThreshold(t *testing.T) {
 	for _, size := range []int{minCompressSize - 1, minCompressSize, minCompressSize + 1} {
 		t.Run(fmt.Sprintf("body size %d", size), func(t *testing.T) {
@@ -624,6 +636,36 @@ func TestCORSActualRequests(t *testing.T) {
 			t.Errorf("wildcard response unnecessarily varies on Origin: %q", rec.Header().Values(vary))
 		}
 	})
+}
+
+func TestCORSResponseWriterUnwrap(t *testing.T) {
+	sink := httptest.NewRecorder()
+	writer := &corsResponseWriter{ResponseWriter: sink}
+	if writer.Unwrap() != sink {
+		t.Fatal("corsResponseWriter.Unwrap did not return the underlying writer")
+	}
+}
+
+func TestCORSVarySurvivesHandlerOverride(t *testing.T) {
+	for _, mode := range []string{"write", "flush"} {
+		t.Run(mode, func(t *testing.T) {
+			e := newEngine()
+			t.Cleanup(e.cancelStreams)
+			e.use(func(c *Context) {
+				c.writer.Header().Set(vary, acceptEncoding)
+				if mode == "flush" {
+					_ = http.NewResponseController(c.writer).Flush()
+				}
+				c.Next()
+			})
+			e.register(methodGet, "/test", func() string { return "ok" })
+			e.useCors(mwTestCORSConfig())
+			e.generateRoute()
+
+			rec := mwTestCORSRequest(e.buildHandler(), http.MethodGet, "https://app.example.test", nil)
+			mwTestRequireVary(t, rec.Header(), headerOrigin, acceptEncoding)
+		})
+	}
 }
 
 func TestCORSPreflightAllowLists(t *testing.T) {

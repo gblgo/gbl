@@ -272,6 +272,37 @@ func TestAppendLogValueTypedNilAndPanickingMethods(t *testing.T) {
 	}
 }
 
+type logTestLockProbeLogger struct {
+	engine     *engine
+	lockFree   bool
+	registered bool
+}
+
+func (*logTestLockProbeLogger) Info(string, ...any) {}
+func (*logTestLockProbeLogger) Warn(string, ...any) {}
+func (l *logTestLockProbeLogger) Error(string, ...any) {
+	if l.engine.assemblyMu.TryLock() {
+		l.lockFree = true
+		l.engine.assemblyMu.Unlock()
+	}
+	l.engine.register(methodGet, "/from-logger", func() {})
+	l.registered = true
+}
+
+func TestSetLoggerFailureLogsOutsideAssemblyLock(t *testing.T) {
+	e := newEngine()
+	defer e.cancelStreams()
+	probe := &logTestLockProbeLogger{engine: e}
+	e.setLogger(probe)
+
+	if recovered := logTestPanicValue(func() { e.setLogger(nil) }); recovered == nil {
+		t.Fatal("SetLogger(nil) did not fail")
+	}
+	if !probe.lockFree || !probe.registered {
+		t.Fatalf("failure logger ran under assembly lock: lockFree=%t registered=%t", probe.lockFree, probe.registered)
+	}
+}
+
 func TestStdLoggerLevelsAndBanner(t *testing.T) {
 	var out bytes.Buffer
 	logger := stdLogger{l: log.New(&out, "", 0)}
@@ -285,6 +316,18 @@ func TestStdLoggerLevelsAndBanner(t *testing.T) {
 		"WARN slow route=/x duration=1s\n" +
 		"ERROR failed error=boom retry=true\n" +
 		"\nline one\nline two\n"
+	if got := out.String(); got != want {
+		t.Fatalf("stdLogger output = %q, want %q", got, want)
+	}
+}
+
+func TestStdLoggerEscapesControlCharacters(t *testing.T) {
+	var out bytes.Buffer
+	logger := stdLogger{l: log.New(&out, "", 0)}
+
+	logger.Info("line\nbreak", "key\r\n", "value\x1b[31m", "error", errors.New("bad\nline"))
+
+	want := "INFO line\\nbreak key\\r\\n=value\\x1b[31m error=bad\\nline\n"
 	if got := out.String(); got != want {
 		t.Fatalf("stdLogger output = %q, want %q", got, want)
 	}
