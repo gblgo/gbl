@@ -141,6 +141,8 @@ var (
 	netListen = net.Listen
 	// shutdownGracePeriod bounds signal-triggered graceful shutdown.
 	shutdownGracePeriod = 5 * time.Second
+	// shutdownStart lets lifecycle tests synchronize before the publication lock.
+	shutdownStart = func() {}
 )
 
 // run is the instance-level counterpart of the package-level Run.
@@ -275,6 +277,7 @@ func (e *engine) run() {
 
 // shutdown is the instance-level counterpart of the package-level Shutdown.
 func (e *engine) shutdown(ctx context.Context) error {
+	shutdownStart()
 	// Taking startMu first preserves the before-Run behavior while also waiting
 	// behind a test or integration layer that deliberately holds the publication
 	// lock. Never wait for startDone while holding it: Run needs the lock to publish.
@@ -342,14 +345,21 @@ func (e *engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // assertAssembling enforces the engine's read-only-after-Run-claim contract.
 // Route registration, middleware, loggers, CORS, configuration, panic renderers
 // and size limits must all be set before Run. Once Run is claimed, those setters
-// can no longer take effect, so a wrong registration order fails fast instead of
-// being silently ignored. The panic bypasses failStartup because startup may
-// already be in progress and the caller's stack trace identifies the mistake.
+// can no longer take effect, so a wrong registration order is logged and fails
+// fast instead of being silently ignored.
 func (e *engine) assertAssembling(op string) func() {
 	e.assemblyMu.RLock()
 	if e.runState.Load() != runStateIdle {
 		e.assemblyMu.RUnlock()
-		panic("gbl." + op + " must be called before Run; the engine is read-only while serving")
+		e.failAssembling(op)
 	}
 	return e.assemblyMu.RUnlock
+}
+
+// failAssembling records an API-order violation without letting a failing logger
+// replace the panic that callers use to detect the mistake.
+func (e *engine) failAssembling(op string) {
+	reason := "gbl." + op + " must be called before Run; the engine is read-only while serving"
+	safeLog(func() { e.logger.Error("assembly rejected", "reason", reason) })
+	panic(reason)
 }

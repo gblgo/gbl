@@ -427,19 +427,23 @@ func TestLifecycleShutdownDuringStartupIsNotLost(t *testing.T) {
 	unlock := func() { unlockOnce.Do(e.startMu.Unlock) }
 	t.Cleanup(unlock)
 
-	shutdownStarted := make(chan struct{})
+	shutdownEntered := make(chan struct{})
+	var shutdownEnterOnce sync.Once
+	previousShutdownStart := shutdownStart
+	shutdownStart = func() { shutdownEnterOnce.Do(func() { close(shutdownEntered) }) }
+	t.Cleanup(func() { shutdownStart = previousShutdownStart })
+
 	shutdownResult := make(chan error, 1)
 	go func() {
-		close(shutdownStarted)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		shutdownResult <- e.shutdown(ctx)
 	}()
-	<-shutdownStarted
+	<-shutdownEntered
 	select {
 	case err := <-shutdownResult:
 		t.Fatalf("Shutdown returned while server publication was blocked: %v", err)
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 
 	runDone := make(chan struct{})
