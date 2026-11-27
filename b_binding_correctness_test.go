@@ -682,6 +682,32 @@ func TestBuildBindPlanRejectsAmbiguousStructFields(t *testing.T) {
 	}
 }
 
+func TestBindStructPointerEmbeddingAllocatesPromotedPath(t *testing.T) {
+	value, err := bindStruct(reflect.TypeFor[CorrectnessPointerEmbedding](), &nameSources{
+		form: url.Values{"value": {"9"}, "default": {"bound"}},
+	})
+	if err != nil {
+		t.Fatalf("bind pointer embedding: %v", err)
+	}
+	got := value.Interface().(CorrectnessPointerEmbedding)
+	if got.CorrectnessEmbedded == nil || got.Value != 9 || got.Default != "bound" {
+		t.Fatalf("bound pointer embedding = %#v", got)
+	}
+}
+
+func TestBindStructShallowFieldDominatesEmbeddedMember(t *testing.T) {
+	value, err := bindStruct(reflect.TypeFor[CorrectnessShallow](), &nameSources{
+		form: url.Values{"shared": {"true"}, "left": {"7"}},
+	})
+	if err != nil {
+		t.Fatalf("bind shallow dominance: %v", err)
+	}
+	got := value.Interface().(CorrectnessShallow)
+	if !got.Shared || got.Left != 7 {
+		t.Fatalf("bound shallow struct = %#v, want Shared=true Left=7", got)
+	}
+}
+
 // TestBuildBindPlanAllowsUnambiguousStructs checks normal name derivation,
 // recursive types and the existing shallow/tagged JSON dominance rules.
 func TestBuildBindPlanAllowsUnambiguousStructs(t *testing.T) {

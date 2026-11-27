@@ -20,12 +20,11 @@ type Validatable interface {
 }
 
 // validateBusiness runs Validate over the precomputed validatable indexes,
-// returning the first failure. buildBindPlan already filtered these by type, so
-// a handler whose parameters do not implement Validatable passes an empty slice
-// and pays no per-request reflection or interface boxing.
-func validateBusiness(values []reflect.Value, indexes []int) error {
-	for _, i := range indexes {
-		target, ok := asValidatable(values[i])
+// returning the first failure. Pointer mode uses the addressable bound value so
+// struct copies are not boxed into an interface on every request.
+func validateBusiness(values []reflect.Value, indexes []int, pointers []bool) error {
+	for position, i := range indexes {
+		target, ok := asValidatableMode(values[i], pointers[position])
 		if !ok {
 			continue
 		}
@@ -34,6 +33,21 @@ func validateBusiness(values []reflect.Value, indexes []int) error {
 		}
 	}
 	return nil
+}
+
+// asValidatableMode converts a bound value according to the startup-time plan.
+func asValidatableMode(v reflect.Value, pointer bool) (Validatable, bool) {
+	if pointer {
+		if !v.IsValid() || !v.CanAddr() {
+			return nil, false
+		}
+		target, ok := v.Addr().Interface().(Validatable)
+		if !ok {
+			return nil, false
+		}
+		return target, true
+	}
+	return asValidatable(v)
 }
 
 // asValidatable reports whether a bound value satisfies Validatable, trying the

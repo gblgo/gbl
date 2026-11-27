@@ -178,6 +178,35 @@ func releaseSegments(bufPool *[]string, segments []string) {
 	segmentPool.Put(bufPool)
 }
 
+// maxPooledPathBytes bounds temporary normalized-path storage.
+const maxPooledPathBytes = 4 << 10
+
+// pathBufPool reuses byte storage for static-route normalization probes.
+var pathBufPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, 0, 64)
+		return &buffer
+	},
+}
+
+// normalizePathBytes joins path segments without allocating a string.
+func normalizePathBytes(dst []byte, segments []string) []byte {
+	for _, segment := range segments {
+		dst = append(dst, '/')
+		dst = append(dst, segment...)
+	}
+	return dst
+}
+
+// releasePathBytes pools bounded normalization storage.
+func releasePathBytes(bufPool *[]byte, buffer []byte) {
+	if cap(buffer) > maxPooledPathBytes {
+		return
+	}
+	*bufPool = buffer[:0]
+	pathBufPool.Put(bufPool)
+}
+
 // splitPathInto appends the non-empty "/"-separated segments of path to dst and
 // returns the grown slice, reusing dst backing array. Segments are substrings
 // sharing path storage, so unlike strings.Split this copies nothing.
@@ -217,12 +246,14 @@ func (e *engine) matchNode(
 	}
 
 	if len(statics) > 0 && !isNormalized(path) {
-		bufPool := segmentPool.Get().(*[]string)
-		segments := splitPathInto((*bufPool)[:0], path)
-		path = slash + strings.Join(segments, slash)
-		releaseSegments(bufPool, segments)
-
-		if handler, ok := statics[path]; ok {
+		segmentBuf := segmentPool.Get().(*[]string)
+		segments := splitPathInto((*segmentBuf)[:0], path)
+		pathBuf := pathBufPool.Get().(*[]byte)
+		normalized := normalizePathBytes((*pathBuf)[:0], segments)
+		handler, ok := statics[string(normalized)]
+		releasePathBytes(pathBuf, normalized)
+		releaseSegments(segmentBuf, segments)
+		if ok {
 			return handler, params
 		}
 	}

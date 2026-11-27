@@ -566,6 +566,32 @@ func TestContextAsValidatable(t *testing.T) {
 	}
 }
 
+func TestContextValidatablePointerModeAvoidsBoxing(t *testing.T) {
+	value := ctxTestValidatable{Name: "value"}
+	addressable := reflect.ValueOf(&value).Elem()
+	var target Validatable
+	var ok bool
+	allocations := testing.AllocsPerRun(100, func() {
+		target, ok = asValidatableMode(addressable, true)
+	})
+	if allocations != 0 {
+		t.Fatalf("pointer-mode validation allocations = %v, want 0", allocations)
+	}
+	if !ok || target != &value {
+		t.Fatalf("pointer-mode target = (%v, %t), want original pointer", target, ok)
+	}
+	if target, ok := asValidatableMode(reflect.Value{}, true); ok || target != nil {
+		t.Fatalf("invalid pointer-mode value = (%v, %t), want (nil, false)", target, ok)
+	}
+	if target, ok := asValidatableMode(reflect.ValueOf(value), true); ok || target != nil {
+		t.Fatalf("unaddressable pointer-mode value = (%v, %t), want (nil, false)", target, ok)
+	}
+	plain := struct{ Name string }{}
+	if target, ok := asValidatableMode(reflect.ValueOf(&plain).Elem(), true); ok || target != nil {
+		t.Fatalf("plain pointer-mode value = (%v, %t), want (nil, false)", target, ok)
+	}
+}
+
 func TestContextValidateBusinessOrderAndNilSkip(t *testing.T) {
 	firstErr := errors.New("ctxTest first validation error")
 	var calls []string
@@ -574,7 +600,7 @@ func TestContextValidateBusinessOrderAndNilSkip(t *testing.T) {
 	last := &ctxTestValidationProbe{Name: "last", Calls: &calls}
 	values := []reflect.Value{reflect.ValueOf(first), reflect.ValueOf(nilProbe), reflect.ValueOf(last)}
 
-	err := validateBusiness(values, []int{0, 1, 2})
+	err := validateBusiness(values, []int{0, 1, 2}, []bool{false, false, false})
 	if !errors.Is(err, firstErr) {
 		t.Fatalf("validateBusiness error = %v, want %v", err, firstErr)
 	}
@@ -584,7 +610,7 @@ func TestContextValidateBusinessOrderAndNilSkip(t *testing.T) {
 
 	calls = nil
 	first.Err = nil
-	if err := validateBusiness(values, []int{0, 1, 2}); err != nil {
+	if err := validateBusiness(values, []int{0, 1, 2}, []bool{false, false, false}); err != nil {
 		t.Fatalf("valid validateBusiness returned %v", err)
 	}
 	if !reflect.DeepEqual(calls, []string{"first", "last"}) {
@@ -592,7 +618,7 @@ func TestContextValidateBusinessOrderAndNilSkip(t *testing.T) {
 	}
 
 	invalid := []reflect.Value{reflect.Value{}, reflect.ValueOf(last)}
-	if err := validateBusiness(invalid, []int{0, 1}); err != nil {
+	if err := validateBusiness(invalid, []int{0, 1}, []bool{false, false}); err != nil {
 		t.Fatalf("invalid reflected slot returned %v", err)
 	}
 }

@@ -8,7 +8,6 @@ import (
 	"debug/dwarf"
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -583,138 +582,163 @@ func TestRouteGroupRegistersEveryVerb(t *testing.T) {
 	}
 }
 
-func routeTestParseAST(t *testing.T, e *engine, filename, source string) *ast.File {
-	t.Helper()
-	file, err := parser.ParseFile(e.fest, filename, source, parser.ParseComments)
-	if err != nil {
-		t.Fatalf("parse AST fixture: %v", err)
+// routeTestDWARFNameHandler provides a stable position for injected DWARF names.
+func routeTestDWARFNameHandler(value int) string { return strconv.Itoa(value) }
+
+func TestRouteGenerationUsesDWARFNames(t *testing.T) {
+	e := routeTestNewEngine(t)
+	value := reflect.ValueOf(routeTestDWARFNameHandler)
+	file, line := runtime.FuncForPC(value.Pointer()).FileLine(value.Pointer())
+	key := file + colon + strconv.Itoa(line)
+	e.dwarfIndex = map[string]dwarfParamNames{key: {names: []string{"binaryName"}}}
+	e.register(methodGet, "/dwarf", routeTestDWARFNameHandler)
+	e.generateRoute()
+	handler := e.staticRoutes[methodGet]["/dwarf"]
+	var names []string
+	if handler != nil {
+		names = handler.paramNames
 	}
-	return file
+	if len(names) != 1 || names[0] != "binaryName" {
+		t.Fatalf("recovered names = %#v, want binaryName", names)
+	}
 }
 
-func TestRouteASTParamNamesFromSource(t *testing.T) {
+func TestRouteGenerationUsesSourceNamesWhenDWARFMissing(t *testing.T) {
 	e := routeTestNewEngine(t)
-	names, resolved, ambiguous := e.resolveParamNames(reflect.ValueOf(routeTestASTNamed))
-	if ambiguous != "" || !resolved {
-		t.Fatalf("named handler resolution = (%v, %q), want (true, empty)", resolved, ambiguous)
+	e.dwarfIndex = map[string]dwarfParamNames{}
+	e.register(methodGet, "/source", routeTestSourceNamed)
+	e.generateRoute()
+	handler := e.staticRoutes[methodGet]["/source"]
+	var names []string
+	if handler != nil {
+		names = handler.paramNames
 	}
-	if want := []string{"id", "count"}; !reflect.DeepEqual(names, want) {
-		t.Fatalf("named parameter names = %#v, want %#v", names, want)
-	}
-	if len(e.astFileMap) != 1 || len(e.astSpans) != 1 {
-		t.Fatalf("AST cache sizes = (%d, %d), want (1, 1)", len(e.astFileMap), len(e.astSpans))
+	if !reflect.DeepEqual(names, []string{"id", "count"}) {
+		t.Fatalf("source parameter names = %#v, want [id count]", names)
 	}
 }
 
-func TestRouteASTUnnamedParametersKeepPositions(t *testing.T) {
-	e := routeTestNewEngine(t)
+func TestRouteSourceParamNameShapes(t *testing.T) {
 	tests := []struct {
 		name string
 		fn   any
 		want []string
 	}{
-		{"all unnamed", routeTestASTUnnamed, []string{"arg0", "arg1"}},
-		// The blank identifier is still an explicit parameter name and must keep
-		// its position so the following named parameter does not shift left.
-		{"blank and named", routeTestASTBlank, []string{"_", "named"}},
+		{name: "named", fn: routeTestSourceNamed, want: []string{"id", "count"}},
+		{name: "unnamed", fn: routeTestSourceUnnamed, want: []string{"", ""}},
+		{name: "blank", fn: routeTestSourceBlank, want: []string{"_", "named"}},
+		{name: "closure", fn: routeTestSourceClosure(), want: []string{"closureID"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			names, resolved, ambiguous := e.resolveParamNames(reflect.ValueOf(tt.fn))
-			if ambiguous != "" {
-				t.Fatalf("unexpected ambiguity at %s", ambiguous)
-			}
-			if !resolved {
-				t.Fatal("parameter signature was not resolved from source")
-			}
-			if got := normalizeParamNames(names, len(tt.want)); !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("normalized parameter names = %#v, want %#v (raw names %#v)", got, tt.want, names)
+			names, resolved, ambiguous := resolveSourceParamNames(reflect.ValueOf(tt.fn))
+			if ambiguous != "" || !resolved || !reflect.DeepEqual(names, tt.want) {
+				t.Fatalf("source names = (%#v, %t, %q), want (%#v, true, empty)",
+					names, resolved, ambiguous, tt.want)
 			}
 		})
 	}
 }
 
-func TestRouteASTClosureAndSameNameRecovery(t *testing.T) {
-	e := routeTestNewEngine(t)
-	closure := routeTestMakeASTClosure()
-	names, resolved, ambiguous := e.resolveParamNames(reflect.ValueOf(closure))
-	if ambiguous != "" || !resolved || !reflect.DeepEqual(names, []string{"closureID"}) {
-		t.Fatalf("closure names = (%v, %v, %q), want ([closureID], true, empty)", names, resolved, ambiguous)
+func TestRouteSourceParamNameAmbiguity(t *testing.T) {
+	spans := []sourceParamSpan{
+		{start: 1, end: 5, names: []string{"outer"}},
+		{start: 1, end: 5, names: []string{"inner"}},
+	}
+	span, ambiguous := selectSourceParamSpan(spans, 3, "same.go")
+	if span != nil || ambiguous != "same.go:3" {
+		t.Fatalf("same-size spans = (%#v, %q), want ambiguous", span, ambiguous)
 	}
 
-	first, second := routeTestMakeASTSameName()
-	for i, fn := range []func(string) string{first, second} {
-		names, resolved, ambiguous = e.resolveParamNames(reflect.ValueOf(fn))
-		if ambiguous != "" || !resolved || !reflect.DeepEqual(names, []string{"id"}) {
-			t.Errorf("same-name closure %d names = (%v, %v, %q), want ([id], true, empty)", i, names, resolved, ambiguous)
-		}
+	spans = []sourceParamSpan{
+		{start: 1, end: 8, names: []string{"outer"}},
+		{start: 2, end: 4, names: []string{"inner"}},
+	}
+	span, ambiguous = selectSourceParamSpan(spans, 3, "nested.go")
+	if ambiguous != "" || span == nil || !reflect.DeepEqual(span.names, []string{"inner"}) {
+		t.Fatalf("nested spans = (%#v, %q), want inner", span, ambiguous)
+	}
+
+	span, ambiguous = selectSourceParamSpan(spans, 20, "nested.go")
+	if span != nil || ambiguous != "" {
+		t.Fatalf("outside spans = (%#v, %q), want no match", span, ambiguous)
 	}
 }
 
-func TestRouteASTFuncTypeAt(t *testing.T) {
-	t.Run("innermost closure", func(t *testing.T) {
-		e := routeTestNewEngine(t)
-		file := routeTestParseAST(t, e, "nested.go", `package fixture
-func outer(prefix string) func(int) string {
-	return func(value int) string { return prefix }
-}
-`)
-		for line, want := range map[int]string{2: "prefix", 3: "value"} {
-			funcType, ambiguous := e.funcTypeAt(file, line)
-			if ambiguous != "" || funcType == nil {
-				t.Fatalf("line %d resolved to (%v, %q)", line, funcType, ambiguous)
-			}
-			if got := funcType.Params.List[0].Names[0].Name; got != want {
-				t.Errorf("line %d parameter = %q, want %q", line, got, want)
-			}
-		}
-		if funcType, ambiguous := e.funcTypeAt(file, 99); funcType != nil || ambiguous != "" {
-			t.Fatalf("outside line resolved to (%v, %q), want (nil, empty)", funcType, ambiguous)
-		}
-		if len(e.astSpans) != 1 {
-			t.Fatalf("span cache size = %d, want 1", len(e.astSpans))
-		}
-	})
-
-	t.Run("same declaration name at different positions", func(t *testing.T) {
-		e := routeTestNewEngine(t)
-		file := routeTestParseAST(t, e, "same.go", `package fixture
-func same(first string) string { return first }
-func same(second int) int { return second }
-`)
-		for line, want := range map[int]string{2: "first", 3: "second"} {
-			funcType, ambiguous := e.funcTypeAt(file, line)
-			if ambiguous != "" || funcType == nil {
-				t.Fatalf("line %d resolved to (%v, %q)", line, funcType, ambiguous)
-			}
-			if got := funcType.Params.List[0].Names[0].Name; got != want {
-				t.Errorf("line %d parameter = %q, want %q", line, got, want)
-			}
-		}
-	})
-
-	t.Run("same line literals are ambiguous", func(t *testing.T) {
-		e := routeTestNewEngine(t)
-		file := routeTestParseAST(t, e, "ambiguous.go", `package fixture
-var handlers = []func(int){func(left int) {}, func(right int) {}}
-`)
-		funcType, ambiguous := e.funcTypeAt(file, 2)
-		if funcType != nil || ambiguous != "ambiguous.go:2" {
-			t.Fatalf("ambiguous line resolved to (%v, %q), want (nil, ambiguous.go:2)", funcType, ambiguous)
-		}
-	})
-}
-
-func TestRouteFindFuncTypeAtTieIsAmbiguous(t *testing.T) {
-	left := &ast.FuncType{}
-	right := &ast.FuncType{}
-	spans := []funcSpan{
-		{start: 1, end: 5, funcType: left},
-		{start: 3, end: 7, funcType: right},
+func TestRouteSourceParamNameMissingFile(t *testing.T) {
+	names, resolved, ambiguous := resolveSourceParamNames(reflect.ValueOf(routeTestSourceMissing))
+	if names != nil || resolved || ambiguous != "" {
+		t.Fatalf("missing source = (%#v, %t, %q), want unresolved", names, resolved, ambiguous)
 	}
-	_, ambiguous := findFuncTypeAt(spans, 4)
-	if !ambiguous {
-		t.Fatal("equal-size enclosing spans were not reported as ambiguous")
+}
+
+func TestRouteSourceParamNameDefensiveBranches(t *testing.T) {
+	if names, resolved, ambiguous := resolveSourceParamNames(reflect.Value{}); names != nil ||
+		resolved || ambiguous != "" {
+		t.Fatalf("invalid source value = (%#v, %t, %q), want unresolved", names, resolved, ambiguous)
+	}
+	if names := sourceParamNames(&ast.FuncType{}); names != nil {
+		t.Fatalf("parameterless source signature = %#v, want nil", names)
+	}
+
+	value := reflect.ValueOf(routeTestSourceNamed)
+	file, line := runtime.FuncForPC(value.Pointer()).FileLine(value.Pointer())
+	previous, loaded := sourceParamFileCache.Load(file)
+	t.Cleanup(func() {
+		if loaded {
+			sourceParamFileCache.Store(file, previous)
+		} else {
+			sourceParamFileCache.Delete(file)
+		}
+	})
+
+	sourceParamFileCache.Store(file, sourceParamFile{
+		spans:  []sourceParamSpan{{start: line + 10, end: line + 20}},
+		parsed: true,
+	})
+	if names, resolved, ambiguous := resolveSourceParamNames(value); names != nil ||
+		resolved || ambiguous != "" {
+		t.Fatalf("source line outside spans = (%#v, %t, %q), want unresolved",
+			names, resolved, ambiguous)
+	}
+
+	sourceParamFileCache.Store(file, sourceParamFile{
+		spans: []sourceParamSpan{
+			{start: line, end: line, names: []string{"left"}},
+			{start: line, end: line, names: []string{"right"}},
+		},
+		parsed: true,
+	})
+	names, resolved, ambiguous := resolveSourceParamNames(value)
+	if names != nil || resolved || ambiguous == "" {
+		t.Fatalf("ambiguous source line = (%#v, %t, %q), want ambiguous",
+			names, resolved, ambiguous)
+	}
+}
+
+func TestRouteGoTestBinaryDetection(t *testing.T) {
+	if !runningUnderGoTest() {
+		t.Fatal("go test binary was not detected")
+	}
+	tests := []struct {
+		name      string
+		testFlags bool
+		args      []string
+		want      bool
+	}{
+		{name: "flags", testFlags: true, want: true},
+		{name: "unix suffix", args: []string{"/tmp/pkg.test"}, want: true},
+		{name: "windows suffix", args: []string{`C:\tmp\pkg.test.exe`}, want: true},
+		{name: "test argument", args: []string{"custom", "-test.v"}, want: true},
+		{name: "production", args: []string{"server"}, want: false},
+		{name: "empty", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isGoTestBinary(tt.testFlags, tt.args); got != tt.want {
+				t.Fatalf("isGoTestBinary(%t, %#v) = %t, want %t", tt.testFlags, tt.args, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -860,22 +884,14 @@ func TestRouteOpenSelfDWARFRejectsUnreadableFiles(t *testing.T) {
 	}
 }
 
-func routeTestASTNamed(id string, count int) string { return id }
+func routeTestSourceNamed(id string, count int) string { return id }
 
-func routeTestASTUnnamed(string, int) string { return "ok" }
+func routeTestSourceUnnamed(string, int) string { return "ok" }
 
-func routeTestASTBlank(_ string, named int) int { return named }
+func routeTestSourceBlank(_ string, named int) int { return named }
 
-func routeTestMakeASTClosure() func(string) string {
-	return func(closureID string) string {
-		return closureID
-	}
-}
-
-func routeTestMakeASTSameName() (func(string) string, func(string) string) {
-	first := func(id string) string { return id }
-	second := func(id string) string { return id }
-	return first, second
+func routeTestSourceClosure() func(string) string {
+	return func(closureID string) string { return closureID }
 }
 
 //go:noinline
@@ -954,31 +970,6 @@ type routeTestExtendedWriter interface {
 }
 
 func routeTestCountMismatchHandler(id string, count int) string { return id }
-
-func routeTestAmbiguousHandlers() (func(string) string, func(string) string) {
-	return func(left string) string { return left }, func(right string) string { return right }
-}
-
-func routeTestCacheHandlerSource(t *testing.T, e *engine, fn any, declaration string) (string, int) {
-	t.Helper()
-	value := reflect.ValueOf(fn)
-	fun := runtime.FuncForPC(value.Pointer())
-	if fun == nil {
-		t.Fatal("runtime function metadata is unavailable")
-	}
-	file, line := fun.FileLine(value.Pointer())
-	source := "package fixture\n"
-	if line > 1 {
-		source += strings.Repeat("\n", line-2)
-	}
-	source += declaration + "\n"
-	parsed, err := parser.ParseFile(e.fest, file, source, parser.ParseComments)
-	if err != nil {
-		t.Fatalf("parse cached handler source: %v", err)
-	}
-	e.astFileMap[file] = parsed
-	return file, line
-}
 
 func TestRouteGenerationRejectsInvalidHandlers(t *testing.T) {
 	receiver := &routeTestMethodReceiver{}
@@ -1188,8 +1179,14 @@ func TestRouteUnsupportedReturnKindFailsWhenInvoked(t *testing.T) {
 	}
 }
 
+// routeTestDWARFKey returns the runtime position used by the DWARF index.
+func routeTestDWARFKey(fn any) string {
+	value := reflect.ValueOf(fn)
+	file, line := runtime.FuncForPC(value.Pointer()).FileLine(value.Pointer())
+	return file + colon + strconv.Itoa(line)
+}
+
 func TestRouteGenerationRejectsUnreliableParameterNames(t *testing.T) {
-	first, _ := routeTestAmbiguousHandlers()
 	tests := []struct {
 		name  string
 		fn    any
@@ -1197,53 +1194,26 @@ func TestRouteGenerationRejectsUnreliableParameterNames(t *testing.T) {
 		want  string
 	}{
 		{
-			name: "source ambiguity",
-			fn:   first,
-			want: "ambiguous parameter names",
-		},
-		{
-			name: "source names missing",
+			name: "DWARF names missing",
 			fn:   routeTestCountMismatchHandler,
 			setup: func(t *testing.T, e *engine, fn any) {
-				routeTestCacheHandlerSource(t, e, fn, "var fixture = 1")
 				e.dwarfIndex = map[string]dwarfParamNames{}
 			},
-			want: "parameter names are unavailable at runtime",
-		},
-		{
-			name: "source file unavailable",
-			fn:   routeTestSourceUnavailableHandler,
-			setup: func(t *testing.T, e *engine, fn any) {
-				// Model missing DWARF explicitly so this rejection does not depend
-				// on whether the test binary was built with debug information.
-				e.dwarfIndex = map[string]dwarfParamNames{}
-			},
-			want: "parameter names are unavailable at runtime",
+			want: "no usable DWARF parameter names",
 		},
 		{
 			name: "DWARF entry missing",
 			fn:   routeTestCountMismatchHandler,
 			setup: func(t *testing.T, e *engine, fn any) {
-				routeTestCacheHandlerSource(t, e, fn, "var fixture = 1")
 				e.dwarfIndex = map[string]dwarfParamNames{"missing.go:1": {names: []string{"id"}}}
 			},
-			want: "parameter names are unavailable at runtime",
-		},
-		{
-			name: "source count mismatch",
-			fn:   routeTestCountMismatchHandler,
-			setup: func(t *testing.T, e *engine, fn any) {
-				routeTestCacheHandlerSource(t, e, fn, "func fixture(id string) string { return id }")
-			},
-			want: "source input parameter count mismatch: got 1 names for 2 handler parameters",
+			want: "no usable DWARF parameter names",
 		},
 		{
 			name: "DWARF ambiguity",
 			fn:   routeTestCountMismatchHandler,
 			setup: func(t *testing.T, e *engine, fn any) {
-				file, line := routeTestCacheHandlerSource(t, e, fn, "var fixture = 1")
-				key := file + colon + strconv.Itoa(line)
-				e.dwarfIndex = map[string]dwarfParamNames{key: {ambiguous: true}}
+				e.dwarfIndex = map[string]dwarfParamNames{routeTestDWARFKey(fn): {ambiguous: true}}
 			},
 			want: "ambiguous parameter names",
 		},
@@ -1251,9 +1221,7 @@ func TestRouteGenerationRejectsUnreliableParameterNames(t *testing.T) {
 			name: "DWARF count mismatch",
 			fn:   routeTestCountMismatchHandler,
 			setup: func(t *testing.T, e *engine, fn any) {
-				file, line := routeTestCacheHandlerSource(t, e, fn, "var fixture = 1")
-				key := file + colon + strconv.Itoa(line)
-				e.dwarfIndex = map[string]dwarfParamNames{key: {names: []string{"id"}}}
+				e.dwarfIndex = map[string]dwarfParamNames{routeTestDWARFKey(fn): {names: []string{"id"}}}
 			},
 			want: "DWARF input parameter count mismatch: got 1 names for 2 handler parameters",
 		},
@@ -1261,19 +1229,13 @@ func TestRouteGenerationRejectsUnreliableParameterNames(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			e := routeTestNewEngine(t)
-			if tt.setup != nil {
-				tt.setup(t, e, tt.fn)
-			}
+			e.paramNameResolver = e.lookupParamNamesDWARF
+			tt.setup(t, e, tt.fn)
 			e.register(methodGet, "/names/:id", tt.fn)
 			routeTestRequirePanicMessage(t, tt.want, e.generateRoute)
 		})
 	}
 }
 
-// Keep this fixture last: //line intentionally gives the handler a source path
-// that does not exist so route generation exercises its sourceless fallback.
-// An unstripped test binary can recover the name through DWARF; the rejection
-// subtest injects an empty dwarfIndex to model a binary built with -s or -w.
-//
-//line gbl_source_unavailable.go:7
-func routeTestSourceUnavailableHandler(id string) string { return id }
+//line missing_source.go:7
+func routeTestSourceMissing(id string) string { return id }

@@ -8,12 +8,11 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"go/ast"
-	"go/token"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -50,18 +49,12 @@ type engine struct {
 	cfg *Config
 	// nil disables the CORS layer
 	cors *CorsConfig
-	// parsed source files for parameter names
-	astFileMap map[string]*ast.File
-	// per-file function line spans, collected once per file during name recovery
-	astSpans map[*ast.File][]funcSpan
-	// per-file line index built from astSpans for logarithmic handler lookup
-	astSpanIndex map[*ast.File]*funcSpanIndex
-	// file set backing astFileMap
-	fest *token.FileSet
-	// lazily built "<file>:<line>"->param names from the binary DWARF; the sourceless fallback
+	// lazily built "<file>:<line>"->param names from the binary DWARF.
 	dwarfIndex map[string]dwarfParamNames
 	// handler positions collected before generation so DWARF indexes only relevant entries
 	dwarfTargets map[string]struct{}
+	// paramNameResolver lets tests force the production DWARF path explicitly.
+	paramNameResolver func(reflect.Value) ([]string, bool, string)
 	// live server, published by Run; nil before publication
 	server *http.Server
 	// owns connections removed from net/http by Hijack
@@ -70,6 +63,8 @@ type engine struct {
 	cancelStreams context.CancelFunc
 
 	// sync primitives
+	// assemblyMu serializes the Run claim with every assembling mutation.
+	assemblyMu sync.RWMutex
 	// guards server publication only; net.Listen deliberately runs outside this lock
 	startMu sync.Mutex
 	// serializes shutdown attempts so Run can wait for an in-progress drain
@@ -107,10 +102,6 @@ func newEngine() *engine {
 	streamCtx, cancelStreams := context.WithCancel(context.Background())
 	return &engine{
 		roots:         make([]*routeNode, methodCount),
-		astFileMap:    make(map[string]*ast.File),
-		astSpans:      make(map[*ast.File][]funcSpan),
-		astSpanIndex:  make(map[*ast.File]*funcSpanIndex),
-		fest:          token.NewFileSet(),
 		logger:        newStdLogger(),
 		cfg:           defaultConfig(),
 		hijacks:       newHijackRegistry(),
@@ -157,8 +148,11 @@ func (e *engine) run() {
 	// Claim the engine before any startup work so concurrent callers cannot race
 	// into route generation or net.Listen and produce a port error instead of the
 	// single-use diagnostic.
-	if !e.runState.CompareAndSwap(runStateIdle, runStateStarting) {
-		panic("gbl.Run called twice; the engine serves only once")
+	e.assemblyMu.Lock()
+	claimed := e.runState.CompareAndSwap(runStateIdle, runStateStarting)
+	e.assemblyMu.Unlock()
+	if !claimed {
+		e.failStartup("gbl.Run called twice; the engine serves only once")
 	}
 	defer e.runState.Store(runStateStopped)
 
@@ -351,8 +345,11 @@ func (e *engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // can no longer take effect, so a wrong registration order fails fast instead of
 // being silently ignored. The panic bypasses failStartup because startup may
 // already be in progress and the caller's stack trace identifies the mistake.
-func (e *engine) assertAssembling(op string) {
+func (e *engine) assertAssembling(op string) func() {
+	e.assemblyMu.RLock()
 	if e.runState.Load() != runStateIdle {
+		e.assemblyMu.RUnlock()
 		panic("gbl." + op + " must be called before Run; the engine is read-only while serving")
 	}
+	return e.assemblyMu.RUnlock
 }

@@ -259,7 +259,7 @@ func rrEdgeParse(r *http.Request, keys any) (url.Values, filesMap, *bytes.Buffer
 		releaseBodyBuffer(body)
 	}
 	cleanupParsedMultipart(r)
-	return form, files, body, jsonMedia, err
+	return form.urlValues(), files, body, jsonMedia, err
 }
 
 func rrEdgeMultipart(t *testing.T, fields url.Values, upload []byte) ([]byte, string) {
@@ -487,37 +487,38 @@ func TestRequestResponseEdgeQueryAndKeySources(t *testing.T) {
 		})
 	}
 
-	count, set := requestKeySource(keys)
-	if count != 2 || len(set) != 2 {
-		t.Fatalf("set source = (%d, %#v), want two keys", count, set)
+	count, set, selected := requestKeySource(keys)
+	if count != 2 || len(set) != 2 || !selected {
+		t.Fatalf("set source = (%d, %#v, %t), want two selected keys", count, set, selected)
 	}
-	count, set = requestKeySource([]string{"name", "name", "tag"})
-	if count != 3 || len(set) != 2 {
-		t.Fatalf("slice source = (%d, %#v), want count 3 and two unique keys", count, set)
+	count, set, selected = requestKeySource([]string{"name", "name", "tag"})
+	if count != 3 || len(set) != 2 || !selected {
+		t.Fatalf("slice source = (%d, %#v, %t), want count 3 and two unique keys", count, set, selected)
 	}
-	count, set = requestKeySource("unsupported")
-	if count != 0 || set != nil {
-		t.Fatalf("unsupported source = (%d, %#v), want (0, nil)", count, set)
+	count, set, selected = requestKeySource("unsupported")
+	if count != 0 || set != nil || selected {
+		t.Fatalf("unsupported source = (%d, %#v, %t), want (0, nil, false)", count, set, selected)
 	}
 
 	r := httptest.NewRequest(http.MethodGet, "/?name=query&other=ignored", strings.NewReader("untouched"))
 	form, files, body, jsonMedia, err := parseRequestParameters(rrEdgeNewWriter(), r, methodGet, keys)
-	if err != nil || !reflect.DeepEqual(form, url.Values{"name": {"query"}}) || files != nil || body != nil || jsonMedia {
+	if err != nil || !reflect.DeepEqual(form.urlValues(), url.Values{"name": {"query"}}) ||
+		files != nil || body != nil || jsonMedia {
 		t.Fatalf("non-body parse = (%#v, %#v, %v, %v, %v)", form, files, body, jsonMedia, err)
 	}
 
 	r = httptest.NewRequest(http.MethodPost, "/?name=query&other=ignored", nil)
 	r.Header.Set(contentType, "text/plain")
-	form, _, _, _, err = rrEdgeParse(r, keys)
-	if err != nil || !reflect.DeepEqual(form, url.Values{"name": {"query"}}) {
-		t.Fatalf("unsupported-media query parse = (%#v, %v)", form, err)
+	values, _, _, _, err := rrEdgeParse(r, keys)
+	if err != nil || !reflect.DeepEqual(values, url.Values{"name": {"query"}}) {
+		t.Fatalf("unsupported-media query parse = (%#v, %v)", values, err)
 	}
 
 	r = httptest.NewRequest(http.MethodPost, "/?name=query", nil)
 	r.Header.Set(contentType, "text/plain")
-	form, _, _, _, err = rrEdgeParse(r, keys)
-	if err != nil || !reflect.DeepEqual(form, url.Values{"name": {"query"}}) {
-		t.Fatalf("unsupported-media single query parse = (%#v, %v)", form, err)
+	values, _, _, _, err = rrEdgeParse(r, keys)
+	if err != nil || !reflect.DeepEqual(values, url.Values{"name": {"query"}}) {
+		t.Fatalf("unsupported-media single query parse = (%#v, %v)", values, err)
 	}
 }
 
@@ -603,6 +604,103 @@ func TestRequestResponseEdgeParseInputErrors(t *testing.T) {
 			t.Fatalf("parse error = %v, want requestClientError", err)
 		}
 	})
+}
+
+func TestRequestResponseEdgeSelectedFormParserBranches(t *testing.T) {
+	keys := requestKeySet{"name": {}}
+	form, err := formValuesForSet([]byte("name=alice&noise=ignored"), keys)
+	if err != nil || !reflect.DeepEqual(form.urlValues(), url.Values{"name": {"alice"}}) {
+		releasePooledForm(form)
+		t.Fatalf("small selected form = (%#v, %v)", form, err)
+	}
+	releasePooledForm(form)
+	prefix := "name=alice&&noise=ignored&"
+	form, err = formValuesForSet([]byte(prefix+strings.Repeat("other=x&", 8)), keys)
+	if err != nil || !reflect.DeepEqual(form.urlValues(), url.Values{"name": {"alice"}}) {
+		releasePooledForm(form)
+		t.Fatalf("large selected form with empty pair = (%#v, %v)", form, err)
+	}
+	releasePooledForm(form)
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "semicolon", body: prefix + "bad;key=x&" + strings.Repeat("other=x&", 8)},
+		{name: "invalid key escape", body: prefix + "%zz=x&" + strings.Repeat("other=x&", 8)},
+		{name: "invalid value escape", body: prefix + "name=%zz&" + strings.Repeat("other=x&", 8)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := formValuesForSet([]byte(tc.body), keys); err == nil {
+				t.Fatal("malformed selected form succeeded")
+			}
+		})
+	}
+	form, err = formValuesForSet(nil, keys)
+	if err != nil || form == nil || len(form.values) != 0 {
+		t.Fatalf("empty selected form = (%#v, %v), want empty form", form, err)
+	}
+	releasePooledForm(form)
+
+	large := "name=alice&" + strings.Repeat("noise=x&", maxPooledFormBytes/4)
+	form, err = formValuesForSet([]byte(large), keys)
+	if err != nil || form.urlValues().Get("name") != "alice" || !form.large {
+		t.Fatalf("large selected form = (%#v, %v)", form, err)
+	}
+	releasePooledForm(form)
+}
+
+func TestPooledQuerySelectionBranches(t *testing.T) {
+	keys := requestKeySet{"name": {}}
+	r := &http.Request{URL: &url.URL{RawQuery: "&&name=alice&bad;key=x&%zz=x&name=%zz&other=x"}}
+	form := acquirePooledForm(len(keys))
+	form.parseQuery(r, keys)
+	if !reflect.DeepEqual(form.values, url.Values{"name": {"alice"}}) {
+		releasePooledForm(form)
+		t.Fatalf("selected query = %#v, want only valid name", form.values)
+	}
+	releasePooledForm(form)
+
+	form = acquirePooledForm(len(keys))
+	form.parseQuery(&http.Request{URL: &url.URL{}}, keys)
+	form.parseQuery(r, nil)
+	if len(form.values) != 0 {
+		releasePooledForm(form)
+		t.Fatalf("empty query selection = %#v, want empty", form.values)
+	}
+	releasePooledForm(form)
+
+	body, err := formValuesForSet([]byte("name=body"), keys)
+	if err != nil {
+		t.Fatalf("parse precedence body: %v", err)
+	}
+	query := "&&name=query&queryOnly=yes&bad;key=x&%zz=x&queryOnly=%zz&other=x"
+	body.mergeQuery(&http.Request{URL: &url.URL{RawQuery: query}},
+		requestKeySet{"name": {}, "queryOnly": {}})
+	want := url.Values{"name": {"body"}, "queryOnly": {"yes"}}
+	if !reflect.DeepEqual(body.values, want) {
+		releasePooledForm(body)
+		t.Fatalf("merged query = %#v, want %#v", body.values, want)
+	}
+	releasePooledForm(body)
+
+	form = acquirePooledForm(len(keys))
+	form.mergeQuery(&http.Request{URL: &url.URL{RawQuery: "name=%zz"}}, keys)
+	if len(form.values) != 0 {
+		releasePooledForm(form)
+		t.Fatalf("invalid query value was retained: %#v", form.values)
+	}
+	releasePooledForm(form)
+}
+
+func TestMergeSelectedFormInPlacePrecedence(t *testing.T) {
+	body := url.Values{"name": {"body"}}
+	query := url.Values{"name": {"query"}, "queryOnly": {"yes"}}
+	got := mergeSelectedFormInPlace(query, body)
+	want := url.Values{"name": {"body"}, "queryOnly": {"yes"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("merged selected form = %#v, want %#v", got, want)
+	}
 }
 
 func rrEdgeRunParse(t *testing.T, r *http.Request) (url.Values, filesMap, *bytes.Buffer, bool, error) {
@@ -871,6 +969,153 @@ type rrEdgeRecursiveForm struct {
 
 type rrEdgeCountForm struct {
 	Count int `json:"count"`
+}
+
+func TestRequestResponseEdgeFormAllocationLimit(t *testing.T) {
+	state := formBindState{allocations: maxFormPointerExpansion}
+	_, err := bindStructFieldsState(reflect.TypeFor[rrEdgeCountForm](),
+		structFieldsOf(reflect.TypeFor[rrEdgeCountForm]()), &nameSources{}, &state)
+	if err == nil || !strings.Contains(err.Error(), "form pointer expansion") {
+		t.Fatalf("allocation limit error = %v, want form pointer expansion rejection", err)
+	}
+	_, err = bindFormParameterDepth(reflect.TypeFor[*rrEdgeCountForm](), "count",
+		&nameSources{form: url.Values{"count": {"1"}}}, 0, &state)
+	if err == nil || !strings.Contains(err.Error(), "form pointer expansion") {
+		t.Fatalf("pointer allocation limit error = %v, want form pointer expansion rejection", err)
+	}
+}
+
+func TestInternalPoolReleaseBounds(t *testing.T) {
+	releaseJSONFields(nil)
+	fields := acquireJSONFields(maxPooledJSONFieldKeys + 1)
+	releaseJSONFields(fields)
+
+	releaseRequestReadTracker(nil)
+	tracker := acquireRequestReadTracker(http.NoBody)
+	releaseRequestReadTracker(tracker)
+
+	buffer := make([]byte, 0, maxPooledPathBytes+1)
+	pathPool := &buffer
+	releasePathBytes(pathPool, buffer)
+}
+
+func TestRequestResponseEdgeBindFormParameterIntoBranches(t *testing.T) {
+	t.Run("file header", func(t *testing.T) {
+		header := &multipart.FileHeader{Filename: "a.txt"}
+		dst := reflect.New(reflect.TypeFor[multipart.FileHeader]()).Elem()
+		err := bindFormParameterInto(dst, "file", &nameSources{
+			files: filesMap{"file": {header}},
+		}, 0, &formBindState{})
+		if err != nil || dst.Interface().(multipart.FileHeader).Filename != "a.txt" {
+			t.Fatalf("bound file header = (%#v, %v)", dst.Interface(), err)
+		}
+	})
+
+	t.Run("returning text pointer depth", func(t *testing.T) {
+		_, err := bindTextValueDepth(reflect.TypeFor[*int](), []string{"1"}, maxTypePointerDepth)
+		if err == nil || !strings.Contains(err.Error(), "recursive pointer type") {
+			t.Fatalf("text pointer depth error = %v", err)
+		}
+	})
+
+	t.Run("empty pointer setter", func(t *testing.T) {
+		dst := reflect.New(reflect.TypeFor[*int]()).Elem()
+		dst.Set(reflect.New(reflect.TypeFor[int]()))
+		if err := setTextValue(dst, nil); err != nil || !dst.IsNil() {
+			t.Fatalf("empty pointer setter = (%v, %v), want nil", dst, err)
+		}
+	})
+
+	t.Run("pointer depth", func(t *testing.T) {
+		dst := reflect.New(reflect.TypeFor[*int]()).Elem()
+		err := bindFormParameterInto(dst, "value", &nameSources{}, maxTypePointerDepth,
+			&formBindState{})
+		if err == nil || !strings.Contains(err.Error(), "recursive pointer type") {
+			t.Fatalf("pointer depth error = %v", err)
+		}
+	})
+
+	t.Run("recursive cycle", func(t *testing.T) {
+		typ := reflect.TypeFor[rrEdgeRecursiveForm]()
+		state := &formBindState{}
+		if err := state.push(typ); err != nil {
+			t.Fatal(err)
+		}
+		dst := reflect.New(reflect.TypeFor[*rrEdgeRecursiveForm]()).Elem()
+		if err := bindFormParameterInto(dst, "next", &nameSources{}, 0, state); err != nil ||
+			!dst.IsNil() {
+			t.Fatalf("recursive cycle = (%v, %v), want nil", dst, err)
+		}
+	})
+
+	t.Run("returning binder recursive cycle", func(t *testing.T) {
+		typ := reflect.TypeFor[rrEdgeRecursiveForm]()
+		state := &formBindState{}
+		if err := state.push(typ); err != nil {
+			t.Fatal(err)
+		}
+		value, err := bindFormParameterDepth(reflect.TypeFor[*rrEdgeRecursiveForm](), "next",
+			&nameSources{}, 0, state)
+		if err != nil || !value.IsNil() {
+			t.Fatalf("returning binder cycle = (%v, %v), want nil", value, err)
+		}
+	})
+
+	t.Run("recursive leaf probe error", func(t *testing.T) {
+		state := &formBindState{size: maxTypePointerDepth}
+		dst := reflect.New(reflect.TypeFor[*rrEdgeRecursiveForm]()).Elem()
+		err := bindFormParameterInto(dst, "next", &nameSources{}, 0, state)
+		if err == nil || !strings.Contains(err.Error(), "struct nesting exceeds") {
+			t.Fatalf("leaf probe error = %v", err)
+		}
+	})
+
+	t.Run("recursive without leaf", func(t *testing.T) {
+		dst := reflect.New(reflect.TypeFor[*rrEdgeRecursiveForm]()).Elem()
+		if err := bindFormParameterInto(dst, "next", &nameSources{}, 0,
+			&formBindState{}); err != nil || !dst.IsNil() {
+			t.Fatalf("missing recursive leaf = (%v, %v), want nil", dst, err)
+		}
+	})
+
+	t.Run("missing scalar pointer", func(t *testing.T) {
+		dst := reflect.New(reflect.TypeFor[*int]()).Elem()
+		if err := bindFormParameterInto(dst, "value", &nameSources{}, 0,
+			&formBindState{}); err != nil || !dst.IsNil() {
+			t.Fatalf("missing scalar pointer = (%v, %v), want nil", dst, err)
+		}
+	})
+
+	t.Run("pointer allocation limit", func(t *testing.T) {
+		state := &formBindState{allocations: maxFormPointerExpansion}
+		dst := reflect.New(reflect.TypeFor[*rrEdgeCountForm]()).Elem()
+		err := bindFormParameterInto(dst, "count", &nameSources{
+			form: url.Values{"count": {"1"}},
+		}, 0, state)
+		if err == nil || !strings.Contains(err.Error(), "form pointer expansion") {
+			t.Fatalf("pointer allocation error = %v", err)
+		}
+	})
+
+	t.Run("array length", func(t *testing.T) {
+		dst := reflect.New(reflect.TypeFor[[2]int]()).Elem()
+		err := bindFormParameterInto(dst, "pair", &nameSources{
+			form: url.Values{"pair": {"1"}},
+		}, 0, &formBindState{})
+		if err == nil || !strings.Contains(err.Error(), "array requires 2 values") {
+			t.Fatalf("array length error = %v", err)
+		}
+	})
+
+	t.Run("slice element", func(t *testing.T) {
+		dst := reflect.New(reflect.TypeFor[[]bool]()).Elem()
+		err := bindFormParameterInto(dst, "flags", &nameSources{
+			form: url.Values{"flags": {"bad"}},
+		}, 0, &formBindState{})
+		if err == nil || !strings.Contains(err.Error(), "slice index 0") {
+			t.Fatalf("slice element error = %v", err)
+		}
+	})
 }
 
 func TestRequestResponseEdgeFormBindingDepthAndRecursion(t *testing.T) {

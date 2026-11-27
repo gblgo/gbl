@@ -706,6 +706,20 @@ func TestResponsePipelineNoReturnPreservesContentType(t *testing.T) {
 	responseTestCheckResponse(t, rec, http.StatusCreated, "", "application/x-responseTest")
 }
 
+func TestResponsePipelineNoReturnUsesDefaultContentType(t *testing.T) {
+	e := responseTestNewEngine(t)
+	e.register(methodGet, "/responseTest", func(w http.ResponseWriter) {
+		w.Header().Set(contentType, "application/x-responseTest")
+		w.Header().Del(contentType)
+	})
+	e.generateRoute()
+	rec, escaped := responseTestServe(t, e, http.MethodGet, "/responseTest", "", "")
+	if escaped != nil {
+		t.Fatalf("pipeline leaked a panic: %v", escaped)
+	}
+	responseTestCheckResponse(t, rec, http.StatusOK, "", textPlainCharset)
+}
+
 func TestResponsePipelineInterfaceResultFlushCommitsImmediately(t *testing.T) {
 	e := responseTestNewEngine(t)
 	sink := &responseTestFlushWriter{responseTestWriter: responseTestNewWriter()}
@@ -723,8 +737,8 @@ func TestResponsePipelineInterfaceResultFlushCommitsImmediately(t *testing.T) {
 	if sink.finalStatus != http.StatusOK || sink.body.String() != "plain" {
 		t.Fatalf("response = (%d, %q), want (200, plain)", sink.finalStatus, sink.body.String())
 	}
-	if got := sink.header.Get(contentType); got != applicationJsonCharset {
-		t.Fatalf("Content-Type after immediate flush = %q, want provisional %q", got, applicationJsonCharset)
+	if got := sink.header.Get(contentType); got != empty {
+		t.Fatalf("Content-Type after immediate flush = %q, want no provisional JSON type", got)
 	}
 }
 
@@ -1532,6 +1546,24 @@ func TestResponsePipelineAbortAfterNextSuppressesStagedResult(t *testing.T) {
 	}
 	if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
 		t.Fatalf("response = (%d, %q), want empty 200", rec.Code, rec.Body.String())
+	}
+}
+
+func TestResponsePipelineAbortAfterNextCommitsStagedStatus(t *testing.T) {
+	e := responseTestNewEngine(t)
+	e.use(func(c *Context) {
+		c.Next()
+		c.writer.WriteHeader(http.StatusCreated)
+		c.Abort()
+	})
+	e.register(methodGet, "/responseTest", func() string { return "suppressed" })
+	e.generateRoute()
+	rec, escaped := responseTestServe(t, e, http.MethodGet, "/responseTest", "", "")
+	if escaped != nil {
+		t.Fatalf("pipeline leaked a panic: %v", escaped)
+	}
+	if rec.Code != http.StatusCreated || rec.Body.Len() != 0 {
+		t.Fatalf("response = (%d, %q), want empty 201", rec.Code, rec.Body.String())
 	}
 }
 

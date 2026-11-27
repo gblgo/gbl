@@ -408,6 +408,15 @@ func TestBindStructRejectsWrongCaseKeys(t *testing.T) {
 	}
 }
 
+func TestValidateFormPointerExpansionBoundsTraversal(t *testing.T) {
+	old := maxFormPointerExpansionSteps
+	maxFormPointerExpansionSteps = 1
+	t.Cleanup(func() { maxFormPointerExpansionSteps = old })
+	if err := validateFormPointerExpansion(reflect.TypeFor[bindTestNested]()); err == nil {
+		t.Fatal("pointer expansion traversal exceeded its step budget without an error")
+	}
+}
+
 func TestValidateFormPointerExpansionRejectsWideAcyclicTree(t *testing.T) {
 	leaf := reflect.TypeFor[struct{}]()
 	for range 16 {
@@ -572,6 +581,18 @@ func TestBindJSONSingleStructUsesExactFieldCase(t *testing.T) {
 	got := bindTestInterface(t, values[0]).(bindTestJSONStruct)
 	if !reflect.DeepEqual(got, bindTestJSONStruct{}) {
 		t.Fatalf("JSON struct field names must match exact bind names; got %#v, want zero value", got)
+	}
+}
+
+func TestBindJSONMultipleParametersUseExactStructFieldCase(t *testing.T) {
+	body := []byte(`{"payload":{"Name":"alice","Count":3},"id":1}`)
+	values, err := bindTestInject(t, func(payload bindTestJSONStruct, id int) {},
+		[]string{"payload", "id"}, nameSources{}, body, true)
+	if err != nil {
+		t.Fatalf("inject multi-parameter JSON struct: %v", err)
+	}
+	if got := bindTestInterface(t, values[0]); !reflect.DeepEqual(got, bindTestJSONStruct{}) {
+		t.Fatalf("multi-parameter JSON struct = %#v, want exact-case zero value", got)
 	}
 }
 

@@ -63,7 +63,7 @@ func Configure(fn func(*Config)) { defaultEngine.configure(fn) }
 // path takes effect without a separate switch. Once Run is claimed the
 // configuration is frozen and re-Configure panics.
 func (e *engine) configure(fn func(*Config)) {
-	e.assertAssembling("Configure")
+	defer e.assertAssembling("Configure")()
 	next := *e.cfg
 	if fn != nil {
 		callbackCfg := next

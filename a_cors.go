@@ -100,7 +100,7 @@ func SetCorsConfig(cc *CorsConfig) {
 
 // useCors installs the CORS configuration on this engine.
 func (e *engine) useCors(cc *CorsConfig) {
-	e.assertAssembling("SetCorsConfig")
+	defer e.assertAssembling("SetCorsConfig")()
 	if cc != nil {
 		if err := cc.validate(); err != nil {
 			e.failStartup(err)
@@ -263,19 +263,21 @@ func (ch *corsHandler) matchOrigin(origin string) (string, bool) {
 	return empty, false
 }
 
+// allowsMethod applies the same configured method policy to preflight and simple requests.
+func (ch *corsHandler) allowsMethod(method string) bool {
+	if len(ch.config.AllowedMethods) <= corsLinearScanLimit {
+		return containsFold(ch.config.AllowedMethods, method)
+	}
+	return containsInMap(ch.allowedMethodsMap, method)
+}
+
 // handlePreflight answers a CORS preflight request. ServeHTTP has already added
 // the request-method and request-header Vary fields before any rejection branch.
 func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	header := w.Header()
 	requestMethod := r.Header.Get(accessControlRequestMethod)
 
-	var methodAllowed bool
-	if len(ch.config.AllowedMethods) <= corsLinearScanLimit {
-		methodAllowed = containsFold(ch.config.AllowedMethods, requestMethod)
-	} else {
-		methodAllowed = containsInMap(ch.allowedMethodsMap, requestMethod)
-	}
-	if !methodAllowed {
+	if !ch.allowsMethod(requestMethod) {
 		http.Error(w, corsMethodNotAllowed, http.StatusForbidden)
 		return
 	}
@@ -347,6 +349,12 @@ func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, corsOriginNotAllowed, http.StatusForbidden)
 			return
 		}
+		ch.engine.serveHTTP(w, r)
+		return
+	}
+
+	// Simple cross-origin requests do not preflight, so enforce methods here too.
+	if !preflight && !ch.allowsMethod(r.Method) {
 		ch.engine.serveHTTP(w, r)
 		return
 	}

@@ -128,6 +128,15 @@ func TestSafeLogContainsSinkPanic(t *testing.T) {
 	safeLog(func() { panic("logger boom") })
 }
 
+func TestPackageLogFunctionsContainSinkPanic(t *testing.T) {
+	old := defaultEngine.logger
+	defaultEngine.logger = &logTestPanicLogger{}
+	t.Cleanup(func() { defaultEngine.logger = old })
+	Info("info")
+	Warn("warn")
+	Error("error")
+}
+
 func TestFailStartupPreservesReasonWhenLoggerPanics(t *testing.T) {
 	e := newEngine()
 	t.Cleanup(e.cancelStreams)

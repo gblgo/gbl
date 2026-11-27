@@ -126,6 +126,7 @@ func requestTestParse(t *testing.T, r *http.Request, keys []string) (url.Values,
 	t.Helper()
 	form, files, body, jsonMedia, err := parseRequestParameters(httptest.NewRecorder(), r, methodPost, keys)
 	t.Cleanup(func() {
+		releasePooledForm(form)
 		if body != nil {
 			releaseBodyBuffer(body)
 		}
@@ -133,7 +134,7 @@ func requestTestParse(t *testing.T, r *http.Request, keys []string) (url.Values,
 			_ = r.MultipartForm.RemoveAll()
 		}
 	})
-	return form, files, body, jsonMedia, err
+	return form.urlValues(), files, body, jsonMedia, err
 }
 
 func requestTestMultipartBody(tb testing.TB, fields url.Values, uploads ...requestTestUpload) []byte {
@@ -245,11 +246,7 @@ func TestRequestURLEncodedFormAndPostForm(t *testing.T) {
 				"bodyOnly":  {"yes"},
 				"tag":       {"a", "b"},
 			}
-			wantPost := url.Values{
-				"name":     {"body"},
-				"bodyOnly": {"yes"},
-				"tag":      {"a", "b"},
-			}
+			wantPost := wantForm
 			if !reflect.DeepEqual(form, wantForm) {
 				t.Fatalf("merged form = %#v, want %#v", form, wantForm)
 			}
@@ -302,7 +299,7 @@ func TestRequestMultipartFormAndPostForm(t *testing.T) {
 	}
 }
 
-func TestRequestFormMapsDoNotAliasWithoutQuery(t *testing.T) {
+func TestRequestURLEncodedFormAndPostFormShareSelectedView(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/form", strings.NewReader("name=body&tag=a&tag=b"))
 	r.Header.Set(contentType, xWwwFormUrlencoded)
 	_, _, _, _, err := requestTestParse(t, r, []string{"name", "tag"})
@@ -313,20 +310,20 @@ func TestRequestFormMapsDoNotAliasWithoutQuery(t *testing.T) {
 		t.Fatalf("Request.Form/PostForm must both be populated: form=%#v post=%#v", r.Form, r.PostForm)
 	}
 	r.Form.Set("formOnly", "value")
-	if got := r.PostForm.Get("formOnly"); got != "" {
-		t.Fatalf("mutating Request.Form changed Request.PostForm to %q; maps must not alias", got)
+	if got := r.PostForm.Get("formOnly"); got != "value" {
+		t.Fatalf("shared Request.Form/PostForm value = %q, want value", got)
 	}
 	r.PostForm.Set("postOnly", "value")
-	if got := r.Form.Get("postOnly"); got != "" {
-		t.Fatalf("mutating Request.PostForm changed Request.Form to %q; maps must not alias", got)
+	if got := r.Form.Get("postOnly"); got != "value" {
+		t.Fatalf("shared Request.PostForm/Form value = %q, want value", got)
 	}
 	r.Form["tag"][0] = "form"
-	if got := r.PostForm["tag"][0]; got != "a" {
-		t.Fatalf("mutating Request.Form value slice changed Request.PostForm to %q", got)
+	if got := r.PostForm["tag"][0]; got != "form" {
+		t.Fatalf("shared Request.Form/PostForm slice value = %q, want form", got)
 	}
 	r.PostForm["tag"][1] = "post"
-	if got := r.Form["tag"][1]; got != "b" {
-		t.Fatalf("mutating Request.PostForm value slice changed Request.Form to %q", got)
+	if got := r.Form["tag"][1]; got != "post" {
+		t.Fatalf("shared Request.PostForm/Form slice value = %q, want post", got)
 	}
 }
 
@@ -363,10 +360,11 @@ func TestRequestBodyMethodPolicy(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse non-body method: %v", err)
 			}
+			t.Cleanup(func() { releasePooledForm(form) })
 			if counter.reads != 0 {
 				t.Fatalf("body reads = %d, want 0 for %s", counter.reads, method)
 			}
-			if form.Get("id") != "7" || files != nil || body != nil || jsonMedia {
+			if form.urlValues().Get("id") != "7" || files != nil || body != nil || jsonMedia {
 				t.Fatalf("non-body parse = form %#v, files %#v, body %v, json %v", form, files, body, jsonMedia)
 			}
 		})
@@ -380,7 +378,8 @@ func TestRequestBodyMethodPolicy(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse body method: %v", err)
 			}
-			if counter.reads == 0 || form.Get("id") != "7" {
+			t.Cleanup(func() { releasePooledForm(form) })
+			if counter.reads == 0 || form.urlValues().Get("id") != "7" {
 				t.Fatalf("body method parse reads=%d form=%#v", counter.reads, form)
 			}
 		})
@@ -692,6 +691,107 @@ func TestRequestMultipartCleanupAfterContextRequestReplacement(t *testing.T) {
 		t.Fatalf("response = %d %q, want 200 original.txt", recorder.Code, recorder.Body.String())
 	}
 	requestTestAssertTempDirEmpty(t, tempDir)
+}
+
+func TestRequestFormExposesOnlyBoundFields(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPost, "/parse?name=query&tracking=query",
+		strings.NewReader("name=body&avatar=alice&noise=ignored"))
+	r.Header.Set(contentType, xWwwFormUrlencoded)
+	form, _, _, _, err := parseRequestParameters(httptest.NewRecorder(), r,
+		methodPost, []string{"name"})
+	if err != nil {
+		t.Fatalf("parse selected form: %v", err)
+	}
+	t.Cleanup(func() { releasePooledForm(form) })
+	if !reflect.DeepEqual(form.urlValues(), url.Values{"name": {"body"}}) {
+		t.Fatalf("selected form = %#v, want only body-winning name", form.urlValues())
+	}
+	if !reflect.DeepEqual(r.PostForm, url.Values{"name": {"body"}}) {
+		t.Fatalf("PostForm = %#v, want only bound body fields", r.PostForm)
+	}
+	if !reflect.DeepEqual(r.Form, form.urlValues()) {
+		t.Fatalf("Request.Form = %#v, want selected binding view %#v", r.Form, form.urlValues())
+	}
+}
+
+func TestRequestPooledFormIsClearedAfterRequest(t *testing.T) {
+	e := newEngine()
+	t.Cleanup(e.cancelStreams)
+	var captured url.Values
+	e.register(methodPost, "/pooled", func(r *http.Request, name string) string {
+		captured = r.Form
+		return captured.Get("name")
+	})
+	e.generateRoute()
+	r := httptest.NewRequest(http.MethodPost, "/pooled", strings.NewReader("name=alice"))
+	r.Header.Set(contentType, xWwwFormUrlencoded)
+	recorder := httptest.NewRecorder()
+	e.ServeHTTP(recorder, r)
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "alice" {
+		t.Fatalf("pooled form response = (%d, %q)", recorder.Code, recorder.Body.String())
+	}
+	if len(captured) != 0 || captured.Get("name") != empty {
+		t.Fatalf("pooled form survived request cleanup: %#v", captured)
+	}
+}
+
+func TestRequestPooledQueryEmptyAndUnsupportedBranches(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/query?id=1", nil)
+	form, _, _, _, err := parseRequestParameters(httptest.NewRecorder(), r, methodGet, nil)
+	if err != nil || form != nil {
+		t.Fatalf("non-body parse without keys = (%#v, %v), want nil", form, err)
+	}
+
+	r = httptest.NewRequest(http.MethodPost, "/form", nil)
+	r.Body = nil
+	r.Header.Set(contentType, xWwwFormUrlencoded)
+	form, _, _, _, err = parseRequestParameters(httptest.NewRecorder(), r,
+		methodPost, []string{"name"})
+	if err != nil || form == nil || len(form.values) != 0 || r.Form == nil || r.PostForm == nil {
+		t.Fatalf("empty selective form = (%#v, %v)", form, err)
+	}
+	releasePooledForm(form)
+
+	r = httptest.NewRequest(http.MethodPost, "/query?other=1", nil)
+	r.Header.Set(contentType, "text/plain")
+	form, _, _, _, err = parseRequestParameters(httptest.NewRecorder(), r,
+		methodPost, []string{"name"})
+	if err != nil || form != nil {
+		t.Fatalf("unsupported media without selected query = (%#v, %v), want nil", form, err)
+	}
+}
+
+func TestMultipartReadTrackerRestoresOriginalBody(t *testing.T) {
+	r, _ := requestTestNewMultipart(t, "/upload", url.Values{"name": {"alice"}}, requestTestUpload{
+		field: "file", filename: "a.txt", body: []byte("content"),
+	})
+	original := r.Body
+	form, _, _, _, err := parseRequestParameters(httptest.NewRecorder(), r,
+		methodPost, []string{"name", "file"})
+	if err != nil {
+		t.Fatalf("parse multipart: %v", err)
+	}
+	if r.Body != original {
+		t.Fatalf("Request.Body was not restored after multipart parsing")
+	}
+	if form == nil || form.values.Get("name") != "alice" {
+		t.Fatalf("multipart form = %#v", form)
+	}
+	releasePooledForm(form)
+}
+
+func TestMultipartStorageErrorsRemainInternal(t *testing.T) {
+	pathErr := &os.PathError{Op: "create", Path: "upload.tmp", Err: errors.New("disk full")}
+	err := classifyMultipartParseError(pathErr)
+	var internal *requestInternalError
+	if !errors.As(err, &internal) {
+		t.Fatalf("storage error = %T, want requestInternalError", err)
+	}
+	status, body := requestErrorResponse(err)
+	if status != http.StatusInternalServerError ||
+		body != http.StatusText(http.StatusInternalServerError) {
+		t.Fatalf("storage response = (%d, %q), want generic 500", status, body)
+	}
 }
 
 func TestRequestParseErrorClassification(t *testing.T) {

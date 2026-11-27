@@ -102,10 +102,10 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	c := newContext(rw, r, pathParams, rh, method, e.logger)
 	defer c.recycle()
 
-	// Return-value handlers expose a provisional media type before middleware or
-	// the handler can flush. Serialization replaces it immediately after staging;
-	// interface returns defer an in-handler flush until that replacement is known.
-	if rh.t.NumOut() > 0 {
+	// Concrete return-value handlers expose a provisional media type before
+	// middleware or the handler can flush. Interface returns stay unset because
+	// only the runtime value can determine a truthful type.
+	if rh.contentType != empty {
 		rw.Header().Set(contentType, rh.contentType)
 	}
 
@@ -114,7 +114,7 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	c.Next()
 
-	if !c.handled && rw.headed() && !rw.flushed() {
+	if rw.headed() && !rw.flushed() && !rw.written() && !rw.hijacked() {
 		rw.writeHeader()
 	}
 

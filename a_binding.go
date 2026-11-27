@@ -47,8 +47,8 @@ type (
 	// present, else the Go field name with its first letter lowercased. Thus, a
 	// lowercase request key binds to an exported PascalCase field without a tag.
 	structField struct {
-		// index is the field position in the reflected struct
-		index int
+		// index is the field path through any promoted anonymous structs.
+		index []int
 		// name is the exact request key for this field
 		name string
 		// typ is the reflected field type
@@ -74,10 +74,11 @@ type (
 		// parameter type, decided once here so the request path injects without
 		// re-running the reflection package interface-satisfaction probe.
 		writerOK []bool
-		// validatableIndexes is the subset of businessIndexes whose type (or its
-		// pointer) implements Validatable, precomputed here so a handler that does
-		// not validate pays no per-request reflection or interface boxing.
-		validatableIndexes []int
+		// validatableIndexes identifies business parameters that implement
+		// Validatable. validatablePointers is parallel and records whether the
+		// addressable value must be used to avoid boxing a struct copy per request.
+		validatableIndexes  []int
+		validatablePointers []bool
 		// queryKeys is the set of exact query names consumed by this handler.
 		queryKeys requestKeySet
 		// jsonKeys lists the top-level members needed by multi-parameter JSON handlers.
@@ -91,7 +92,7 @@ type (
 		// needsNames is true when at least one business or file parameter must be
 		// matched against the request by its handler parameter name. A lone struct
 		// or pointer-to-struct is self-describing: its fields come from reflection,
-		// so it binds correctly even when source names are unavailable.
+		// so it binds correctly even when DWARF names are unavailable.
 		needsNames bool
 	}
 )
@@ -188,37 +189,55 @@ const maxTypePointerDepth = 64
 // can allocate for an empty form request.
 const maxFormPointerExpansion = 4096
 
-// validateFormPointerExpansion rejects acyclic pointer-to-struct trees whose
-// empty-form allocation would grow exponentially. Recursive pointers already
-// allocate lazily and therefore contribute no eager expansion here.
+// maxFormPointerExpansionSteps bounds startup graph traversal independently of node count.
+var maxFormPointerExpansionSteps = maxFormPointerExpansion * 8
+
+// validateFormPointerExpansion rejects pointer-to-struct trees whose empty-form
+// allocation would grow exponentially. Recursive back-edges contribute no eager
+// nodes, while non-recursive branches inside a recursive root still count.
 func validateFormPointerExpansion(t reflect.Type) error {
 	memo := make(map[reflect.Type]int)
-	var expansion func(reflect.Type) int
-	expansion = func(current reflect.Type) int {
+	active := make(map[reflect.Type]bool)
+	steps := 0
+	var expansion func(reflect.Type) (int, bool)
+	expansion = func(current reflect.Type) (int, bool) {
+		steps++
+		if steps > maxFormPointerExpansionSteps {
+			return maxFormPointerExpansion + 1, true
+		}
 		pointers := 0
 		for current.Kind() == reflect.Pointer {
 			pointers++
 			current = current.Elem()
 		}
-		if current.Kind() != reflect.Struct || isRecursiveStruct(current) {
-			return 0
+		if current.Kind() != reflect.Struct {
+			return 0, false
+		}
+		if active[current] {
+			return 0, true
 		}
 		if count, ok := memo[current]; ok {
-			return count
+			return count, false
 		}
+		active[current] = true
 		total := pointers
+		cyclic := false
 		for _, field := range structFieldsOf(current) {
-			count := expansion(field.typ)
+			count, childCyclic := expansion(field.typ)
+			cyclic = cyclic || childCyclic
 			if count > maxFormPointerExpansion || total > maxFormPointerExpansion-count {
 				total = maxFormPointerExpansion + 1
 				break
 			}
 			total += count
 		}
-		memo[current] = total
-		return total
+		delete(active, current)
+		if !cyclic {
+			memo[current] = total
+		}
+		return total, cyclic
 	}
-	if count := expansion(t); count > maxFormPointerExpansion {
+	if count, _ := expansion(t); count > maxFormPointerExpansion {
 		return fmt.Errorf("form pointer expansion for %s exceeds %d nodes", t, maxFormPointerExpansion)
 	}
 	return nil
@@ -238,8 +257,8 @@ func derefType(t reflect.Type) (reflect.Type, bool) {
 
 // selfDescribing reports whether a business parameter can be bound without its
 // handler parameter name. A struct — or any pointer chain leading to one — names
-// its values by field, which reflection supplies even when the source file is
-// unavailable at runtime; every other kind (scalar, slice, map, interface and
+// its values by field, which reflection supplies even when DWARF is unavailable
+// at runtime; every other kind (scalar, slice, map, interface and
 // pointer to those) is matched against the request by the parameter name.
 func selfDescribing(t reflect.Type) bool {
 	terminal, ok := derefType(t)
@@ -307,8 +326,12 @@ func buildBindPlan(rt reflect.Type) (bindPlan, error) {
 			if !selfDescribing(t) {
 				plan.needsNames = true
 			}
-			if t.Implements(validatableType) || reflect.PointerTo(t).Implements(validatableType) {
+			if t.Kind() != reflect.Pointer && reflect.PointerTo(t).Implements(validatableType) {
 				plan.validatableIndexes = append(plan.validatableIndexes, i)
+				plan.validatablePointers = append(plan.validatablePointers, true)
+			} else if t.Implements(validatableType) {
+				plan.validatableIndexes = append(plan.validatableIndexes, i)
+				plan.validatablePointers = append(plan.validatablePointers, false)
 			}
 		case classFiles:
 			plan.needsParse = true
@@ -459,19 +482,19 @@ func validateStructBindNames(t reflect.Type) error {
 	return actual.(structBindValidation).err
 }
 
-// computeStructBindNameError checks the direct form-binding view and the promoted
-// JSON view. Direct fields share one flat request namespace, so none may dominate
-// another there. Promoted fields use depth and explicit-tag dominance instead.
+// computeStructBindNameError checks the promoted form/JSON binding view.
+// Shallower fields dominate deeper embedded members; equal-depth conflicts fail
+// unless one exact name has a single explicit-tag claimant.
 func computeStructBindNameError(t reflect.Type) error {
-	fields := structFieldsOf(t)
-	seen := make(map[string]bindFieldCandidate, len(fields))
-	for _, field := range fields {
-		candidate := bindFieldCandidate{
-			name:  field.name,
-			path:  t.Field(field.index).Name,
-			depth: 1,
+	seen := make(map[string]bindFieldCandidate, t.NumField())
+	for i := range t.NumField() {
+		field := t.Field(i)
+		if !bindableStructField(field) {
+			continue
 		}
-		folded := foldBindName(candidate.name)
+		name, _ := structFieldBindName(field)
+		candidate := bindFieldCandidate{name: name, path: field.Name, depth: 1}
+		folded := foldBindName(name)
 		if previous, exists := seen[folded]; exists {
 			return bindFieldConflictError(t, []bindFieldCandidate{previous, candidate})
 		}
@@ -888,32 +911,72 @@ func structFieldBindName(field reflect.StructField) (string, bool) {
 	return lowerFirst(field.Name), false
 }
 
-// computeStructFields lists a struct type exported fields in declaration
-// order. Every exported field of a freshly allocated value is settable, so the
-// per-request CanSet/PkgPath checks in bindStruct collapse to this cached slice.
-// The bind key is the JSON tag name when present, else the Go field name with
-// its first letter lowercased — so a lowercase request key binds to an exported
-// PascalCase field without a tag. `json:"-"` drops the field entirely.
-// buildBindPlan rejects duplicate or folded names; this low-level list stays
-// declarative for direct binder callers.
+// computeStructFields flattens the effective form-binding view once at startup.
+// Anonymous structs promote their members, shallow fields dominate deeper ones,
+// and an explicit tag wins an equal-depth untagged claim with the same name.
 func computeStructFields(t reflect.Type) []structField {
-	n := t.NumField()
-	fields := make([]structField, 0, n)
-	for i := range n {
-		field := t.Field(i)
-		if field.PkgPath != empty {
-			continue
-		}
-		if tag, ok := field.Tag.Lookup("json"); ok && tag == "-" {
-			continue
-		}
-		name, _ := structFieldBindName(field)
-		fields = append(fields, structField{
-			index: i,
-			name:  name,
-			typ:   field.Type,
-		})
+	type embeddedType struct {
+		typ   reflect.Type
+		index []int
+		depth int
 	}
+	type candidate struct {
+		name   string
+		index  []int
+		typ    reflect.Type
+		depth  int
+		tagged bool
+	}
+
+	queue := []embeddedType{{typ: t}}
+	visited := make(map[reflect.Type]bool)
+	var candidates []candidate
+	for len(queue) > 0 {
+		embedded := queue[0]
+		queue = queue[1:]
+		if visited[embedded.typ] {
+			continue
+		}
+		visited[embedded.typ] = true
+		for i := range embedded.typ.NumField() {
+			field := embedded.typ.Field(i)
+			if !bindableStructField(field) {
+				continue
+			}
+			fieldType := field.Type
+			if field.Anonymous && fieldType.Kind() == reflect.Pointer {
+				fieldType = fieldType.Elem()
+			}
+			name, tagged := structFieldBindName(field)
+			index := append(slices.Clone(embedded.index), i)
+			if field.Anonymous && !tagged && fieldType.Kind() == reflect.Struct {
+				queue = append(queue, embeddedType{typ: fieldType, index: index, depth: embedded.depth + 1})
+				continue
+			}
+			candidates = append(candidates, candidate{
+				name: name, index: index, typ: field.Type,
+				depth: embedded.depth + 1, tagged: tagged,
+			})
+		}
+	}
+
+	winners := make(map[string]candidate, len(candidates))
+	for _, field := range candidates {
+		key := foldBindName(field.name)
+		previous, exists := winners[key]
+		if !exists || field.depth < previous.depth ||
+			(field.depth == previous.depth && field.tagged && !previous.tagged &&
+				field.name == previous.name) {
+			winners[key] = field
+		}
+	}
+	fields := make([]structField, 0, len(winners))
+	for _, field := range winners {
+		fields = append(fields, structField{index: field.index, name: field.name, typ: field.typ})
+	}
+	slices.SortFunc(fields, func(a, b structField) int {
+		return slices.Compare(a.index, b.index)
+	})
 	return fields
 }
 
@@ -921,49 +984,131 @@ func computeStructFields(t reflect.Type) []structField {
 // named by keys. Duplicate names keep the last value, matching encoding/json map
 // semantics, and the returned slices alias body until binding completes.
 func decodeJSONFields(body []byte, keys []string) (map[string]json.RawMessage, error) {
-	return decodeJSONFieldsSet(body, newRequestKeySet(keys))
+	return decodeJSONFieldsList(body, keys)
 }
 
-// decodeJSONFieldsSet is the request-path variant; keys was built at route
-// generation time, so member matching is a constant-time map lookup.
+// maxPooledJSONFieldKeys bounds retained multi-parameter JSON field maps.
+const maxPooledJSONFieldKeys = 64
+
+// pooledJSONFields owns one request-scoped raw-member map.
+type pooledJSONFields struct {
+	values map[string]json.RawMessage
+	large  bool
+}
+
+// jsonFieldsPool reuses maps whose RawMessage values alias the request body only during binding.
+var jsonFieldsPool = sync.Pool{
+	New: func() any {
+		return &pooledJSONFields{values: make(map[string]json.RawMessage)}
+	},
+}
+
+// acquireJSONFields clears a pooled field map before decoding.
+func acquireJSONFields(keyCount int) *pooledJSONFields {
+	fields := jsonFieldsPool.Get().(*pooledJSONFields)
+	clear(fields.values)
+	fields.large = keyCount > maxPooledJSONFieldKeys
+	return fields
+}
+
+// releaseJSONFields drops body aliases and pools only bounded maps.
+func releaseJSONFields(fields *pooledJSONFields) {
+	if fields == nil {
+		return
+	}
+	clear(fields.values)
+	if !fields.large {
+		jsonFieldsPool.Put(fields)
+	}
+}
+
+// decodeJSONFieldsList is the direct-call variant with a fresh map.
+func decodeJSONFieldsList(body []byte, keys []string) (map[string]json.RawMessage, error) {
+	fields := make(map[string]json.RawMessage, len(keys))
+	if err := decodeJSONFieldsListInto(body, keys, fields); err != nil {
+		return nil, err
+	}
+	return fields, nil
+}
+
+// decodeJSONFieldsSet adapts the startup key set for direct callers.
 func decodeJSONFieldsSet(body []byte, keys requestKeySet) (map[string]json.RawMessage, error) {
+	list := make([]string, 0, len(keys))
+	for key := range keys {
+		list = append(list, key)
+	}
+	return decodeJSONFieldsList(body, list)
+}
+
+// jsonKeyIndex matches an unescaped JSON key against the startup key slice.
+func jsonKeyIndex(keys []string, raw []byte) int {
+	for i, key := range keys {
+		if len(key) != len(raw) {
+			continue
+		}
+		matched := true
+		for j := range len(raw) {
+			if key[j] != raw[j] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return i
+		}
+	}
+	return -1
+}
+
+// decodeJSONFieldsListInto fills a caller-owned map for the request binding path.
+func decodeJSONFieldsListInto(body []byte, keys []string,
+	fields map[string]json.RawMessage) error {
 	if !json.Valid(body) {
-		return nil, fmt.Errorf("invalid JSON body: %w", json.Unmarshal(body, &json.RawMessage{}))
+		return fmt.Errorf("invalid JSON body: %w", json.Unmarshal(body, &json.RawMessage{}))
 	}
 
 	index := skipJSONSpace(body, 0)
 	if index+4 <= len(body) && bytes.Equal(body[index:index+4], []byte("null")) {
-		return nil, multipleRequireError
+		return multipleRequireError
 	}
 	if body[index] != '{' {
-		return nil, errors.New("invalid JSON body: expected an object")
+		return errors.New("invalid JSON body: expected an object")
 	}
 
-	fields := make(map[string]json.RawMessage, len(keys))
 	index = skipJSONSpace(body, index+1)
 	for body[index] != '}' {
 		keyStart := index
 		index = scanJSONStringEnd(body, index)
-		var name string
-		// The whole object is already valid, so unmarshalling a JSON string into
-		// a Go string cannot fail.
-		_ = json.Unmarshal(body[keyStart:index], &name)
+		rawKey := body[keyStart+1 : index-1]
+		keyIndex := jsonKeyIndex(keys, rawKey)
+		if bytes.IndexByte(rawKey, '\\') >= 0 {
+			// Escaped keys are uncommon; standard decoding preserves exact JSON semantics.
+			var name string
+			_ = json.Unmarshal(body[keyStart:index], &name)
+			keyIndex = -1
+			for i, key := range keys {
+				if key == name {
+					keyIndex = i
+					break
+				}
+			}
+		}
 		index = skipJSONSpace(body, index)
 		index = skipJSONSpace(body, index+1)
 		valueStart := index
 		index = skipJSONValueEnd(body, index)
-		if _, ok := keys[name]; ok {
-			fields[name] = body[valueStart:index]
+		if keyIndex >= 0 {
+			fields[keys[keyIndex]] = body[valueStart:index]
 		}
 		index = skipJSONSpace(body, index)
 		switch body[index] {
 		case ',':
 			index = skipJSONSpace(body, index+1)
 		case '}':
-			return fields, nil
+			return nil
 		}
 	}
-	return fields, nil
+	return nil
 }
 
 // skipJSONSpace returns the first non-whitespace position at or after index.
@@ -1049,7 +1194,7 @@ func injectedParameters(
 	c.src = nameSources{path: c.params, form: form, files: files}
 	src := &c.src
 
-	var jsonFields map[string]json.RawMessage
+	var jsonFields *pooledJSONFields
 
 	for i := range plan.types {
 		t := plan.types[i]
@@ -1101,22 +1246,22 @@ func injectedParameters(
 			// the JSON object by parameter name. Decode only after path precedence
 			// has failed for the first parameter that actually needs JSON.
 			if len(plan.businessIndexes) > 1 && jsonFields == nil {
-				var err error
-				jsonFields, err = decodeJSONFieldsSet(body, plan.jsonKeySet)
-				if err != nil {
+				jsonFields = acquireJSONFields(len(plan.jsonKeySet))
+				defer releaseJSONFields(jsonFields)
+				if err := decodeJSONFieldsListInto(body, plan.jsonKeys, jsonFields.values); err != nil {
 					return err
 				}
 			}
 			raw := body
 			found := true
 			if len(plan.businessIndexes) > 1 {
-				raw, found = jsonFields[name]
+				raw, found = jsonFields.values[name]
 			}
 			var v reflect.Value
 			if found {
 				var decoded reflect.Value
 				var err error
-				if len(plan.businessIndexes) == 1 && selfDescribing(t) {
+				if selfDescribing(t) {
 					decoded, err = decodeJSONExactStruct(t, raw)
 				} else {
 					decoded, err = decodeJSON(t, raw)
@@ -1147,15 +1292,6 @@ func injectedParameters(
 		params[i] = v
 	}
 
-	for i, v := range params {
-		if !v.IsValid() {
-			return fmt.Errorf("parameter %q was not initialized", paramNameAt(names, i))
-		}
-		if !v.Type().AssignableTo(plan.types[i]) {
-			return fmt.Errorf("parameter %q type mismatch: got %s, want %s",
-				paramNameAt(names, i), v.Type(), plan.types[i])
-		}
-	}
 	return nil
 }
 
@@ -1261,6 +1397,8 @@ type formBindState struct {
 	active [maxTypePointerDepth]reflect.Type
 	// size is the number of active entries.
 	size int
+	// allocations bounds eager struct and pointer construction per request.
+	allocations int
 }
 
 // contains reports whether t is already active on the current branch.
@@ -1275,6 +1413,15 @@ func (s *formBindState) push(t reflect.Type) error {
 	}
 	s.active[s.size] = t
 	s.size++
+	return nil
+}
+
+// allocate records one eager form value and rejects explosive request-time trees.
+func (s *formBindState) allocate() error {
+	s.allocations++
+	if s.allocations > maxFormPointerExpansion {
+		return fmt.Errorf("form pointer expansion exceeds %d nodes", maxFormPointerExpansion)
+	}
 	return nil
 }
 
@@ -1363,6 +1510,11 @@ func bindFormParameterDepth(t reflect.Type, name string, src *nameSources, depth
 				}
 			}
 		}
+		if terminal, ok := derefType(t); ok && terminal.Kind() == reflect.Struct {
+			if err := state.allocate(); err != nil {
+				return reflect.Value{}, err
+			}
+		}
 		value, err := bindFormParameterDepth(t.Elem(), name, src, depth+1, state)
 		if err != nil {
 			return reflect.Value{}, err
@@ -1418,6 +1570,94 @@ func bindFormParameterDepth(t reflect.Type, name string, src *nameSources, depth
 	}
 }
 
+// bindFormParameterInto writes a bound value directly into an existing destination.
+func bindFormParameterInto(dst reflect.Value, name string, src *nameSources, depth int,
+	state *formBindState) error {
+	t := dst.Type()
+	if isFileHeaderType(t) {
+		headers, _ := src.filesGet(name)
+		value, _ := bindFileHeaders(t, headers)
+		dst.Set(value)
+		return nil
+	}
+
+	if t.Kind() == reflect.Pointer {
+		if depth >= maxTypePointerDepth {
+			return fmt.Errorf("recursive pointer type: %s", t)
+		}
+		if terminal, ok := derefType(t); ok && terminal.Kind() == reflect.Struct &&
+			isRecursiveStruct(terminal) {
+			if state.contains(terminal) {
+				dst.SetZero()
+				return nil
+			}
+			hasLeaf, err := hasStructLeafSource(terminal, src, state)
+			if err != nil {
+				return err
+			}
+			if !hasLeaf {
+				dst.SetZero()
+				return nil
+			}
+		}
+		if _, ok := src.pathGet(name); !ok {
+			if _, ok = src.formGet(name); !ok {
+				if _, ok = src.filesGet(name); !ok && !selfDescribing(t) {
+					dst.SetZero()
+					return nil
+				}
+			}
+		}
+		if terminal, ok := derefType(t); ok && terminal.Kind() == reflect.Struct {
+			if err := state.allocate(); err != nil {
+				return err
+			}
+		}
+		if dst.IsNil() {
+			dst.Set(reflect.New(t.Elem()))
+		}
+		return bindFormParameterInto(dst.Elem(), name, src, depth+1, state)
+	}
+
+	if t.Kind() == reflect.Struct {
+		return bindStructFieldsInto(dst, structFieldsOf(t), src, state)
+	}
+
+	values, _ := src.formGet(name)
+	if t.Kind() == reflect.Array || t.Kind() == reflect.Slice {
+		if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 {
+			if len(values) == 0 {
+				dst.SetZero()
+				return nil
+			}
+			data := values[0]
+			dst.Set(reflect.MakeSlice(t, len(data), len(data)))
+			for i := range len(data) {
+				dst.Index(i).SetUint(uint64(data[i]))
+			}
+			return nil
+		}
+		if len(values) == 0 {
+			dst.SetZero()
+			return nil
+		}
+		if t.Kind() == reflect.Array {
+			if len(values) != t.Len() {
+				return fmt.Errorf("array requires %d values, got %d", t.Len(), len(values))
+			}
+		} else {
+			dst.Set(reflect.MakeSlice(t, len(values), len(values)))
+		}
+		for i, text := range values {
+			if err := setTextValue(dst.Index(i), []string{text}); err != nil {
+				return fmt.Errorf("%s index %d: %w", t.Kind(), i, err)
+			}
+		}
+		return nil
+	}
+	return setTextValue(dst, values)
+}
+
 // bindStruct fills an exported-field struct from form and path values, matching
 // each field's exact bind name (JSON tag, or the field name with its first letter
 // lowercased). The field list is cached per type, so nested structs cost no
@@ -1434,42 +1674,60 @@ func bindStructFields(t reflect.Type, fields []structField,
 	return bindStructFieldsState(t, fields, src, &state)
 }
 
-// bindStructFieldsState binds one branch of a nested struct. Re-entering a type
-// already on this branch is a recursion guard, not a reason to reject repeated
-// sibling fields of the same type.
+// fieldByIndex resolves a promoted field path and allocates nil embedded pointers.
+func fieldByIndex(root reflect.Value, index []int) reflect.Value {
+	current := root
+	for _, position := range index[:len(index)-1] {
+		next := current.Field(position)
+		if next.Kind() == reflect.Pointer {
+			if next.IsNil() {
+				next.Set(reflect.New(next.Type().Elem()))
+			}
+			next = next.Elem()
+		}
+		current = next
+	}
+	return current.Field(index[len(index)-1])
+}
+
+// bindStructFieldsState allocates one root value and binds fields directly into it.
 func bindStructFieldsState(t reflect.Type, fields []structField, src *nameSources,
 	state *formBindState) (reflect.Value, error) {
-	if state.contains(t) {
-		return reflect.Zero(t), nil
-	}
-	if err := state.push(t); err != nil {
+	result := reflect.New(t).Elem()
+	if err := bindStructFieldsInto(result, fields, src, state); err != nil {
 		return reflect.Value{}, err
 	}
+	return result, nil
+}
+
+// bindStructFieldsInto binds nested fields without allocating temporary field values.
+func bindStructFieldsInto(result reflect.Value, fields []structField, src *nameSources,
+	state *formBindState) error {
+	t := result.Type()
+	if state.contains(t) {
+		return nil
+	}
+	if err := state.push(t); err != nil {
+		return err
+	}
 	defer state.pop()
+	if err := state.allocate(); err != nil {
+		return err
+	}
 
-	result := reflect.New(t).Elem()
 	for _, field := range fields {
-		dst := result.Field(field.index)
-
-		// Bind names come from the JSON tag when present, else the Go field
-		// name with its first letter lowercased; matching is exact. Path wins
-		// over query/form values.
+		dst := fieldByIndex(result, field.index)
 		if pathValue, ok := src.pathGet(field.name); ok {
-			value, err := bindTextValue(field.typ, []string{pathValue})
-			if err != nil {
-				return reflect.Value{}, fmt.Errorf("path field %q: %w", field.name, err)
+			if err := setTextValue(dst, []string{pathValue}); err != nil {
+				return fmt.Errorf("path field %q: %w", field.name, err)
 			}
-			dst.Set(value)
 			continue
 		}
-
-		value, err := bindFormParameterDepth(field.typ, field.name, src, 0, state)
-		if err != nil {
-			return reflect.Value{}, fmt.Errorf("field %q: %w", field.name, err)
+		if err := bindFormParameterInto(dst, field.name, src, 0, state); err != nil {
+			return fmt.Errorf("field %q: %w", field.name, err)
 		}
-		dst.Set(value)
 	}
-	return result, nil
+	return nil
 }
 
 // isFileHeaderType reports whether t is one of the four accepted file
@@ -1881,62 +2139,80 @@ func bindTextValue(t reflect.Type, values []string) (reflect.Value, error) {
 
 // bindTextValueDepth bounds pointer recursion for path and scalar binding.
 func bindTextValueDepth(t reflect.Type, values []string, depth int) (reflect.Value, error) {
-	if t.Kind() == reflect.Pointer {
-		if depth >= maxTypePointerDepth {
-			return reflect.Value{}, fmt.Errorf("recursive pointer type: %s", t)
-		}
-		if len(values) == 0 {
-			return reflect.Zero(t), nil
-		}
-		value, err := bindTextValueDepth(t.Elem(), values, depth+1)
-		if err != nil {
-			return reflect.Value{}, err
-		}
-		return wrapPointer(t, value), nil
-	}
-
 	if len(values) == 0 {
 		return reflect.Zero(t), nil
 	}
+	if t.Kind() == reflect.Pointer && depth >= maxTypePointerDepth {
+		return reflect.Value{}, fmt.Errorf("recursive pointer type: %s", t)
+	}
 	result := reflect.New(t).Elem()
+	if err := setTextValueDepth(result, values, depth); err != nil {
+		return reflect.Value{}, err
+	}
+	return result, nil
+}
 
-	// Scalar parameters use the first value. Repeated values should use slices/arrays.
+// setTextValue writes a scalar or scalar pointer directly into an existing field.
+func setTextValue(dst reflect.Value, values []string) error {
+	return setTextValueDepth(dst, values, 0)
+}
+
+// setTextValueDepth avoids allocating a temporary reflect.Value for every struct field.
+func setTextValueDepth(dst reflect.Value, values []string, depth int) error {
+	if dst.Kind() == reflect.Pointer {
+		if depth >= maxTypePointerDepth {
+			return fmt.Errorf("recursive pointer type: %s", dst.Type())
+		}
+		if len(values) == 0 {
+			dst.SetZero()
+			return nil
+		}
+		if dst.IsNil() {
+			dst.Set(reflect.New(dst.Type().Elem()))
+		}
+		return setTextValueDepth(dst.Elem(), values, depth+1)
+	}
+	if len(values) == 0 {
+		dst.SetZero()
+		return nil
+	}
+
 	value := values[0]
-	switch t.Kind() {
+	switch dst.Kind() {
 	case reflect.String:
-		result.SetString(value)
+		dst.SetString(value)
 	case reflect.Bool:
 		v, err := strconv.ParseBool(value)
 		if err != nil {
-			return reflect.Value{}, err
+			return err
 		}
-		result.SetBool(v)
+		dst.SetBool(v)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		v, err := strconv.ParseInt(value, 10, t.Bits())
+		v, err := strconv.ParseInt(value, 10, dst.Type().Bits())
 		if err != nil {
-			return reflect.Value{}, err
+			return err
 		}
-		result.SetInt(v)
+		dst.SetInt(v)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		v, err := strconv.ParseUint(value, 10, t.Bits())
+		v, err := strconv.ParseUint(value, 10, dst.Type().Bits())
 		if err != nil {
-			return reflect.Value{}, err
+			return err
 		}
-		result.SetUint(v)
+		dst.SetUint(v)
 	case reflect.Float32, reflect.Float64:
-		v, err := strconv.ParseFloat(value, t.Bits())
+		v, err := strconv.ParseFloat(value, dst.Type().Bits())
 		if err != nil {
-			return reflect.Value{}, err
+			return err
 		}
-		result.SetFloat(v)
+		dst.SetFloat(v)
 	case reflect.Complex64, reflect.Complex128:
-		v, err := strconv.ParseComplex(value, t.Bits())
+		v, err := strconv.ParseComplex(value, dst.Type().Bits())
 		if err != nil {
-			return reflect.Value{}, err
+			return err
 		}
-		result.SetComplex(v)
+		dst.SetComplex(v)
 	default:
-		return reflect.Value{}, fmt.Errorf("unsupported parameter type: %s", t)
+		return fmt.Errorf("unsupported parameter type: %s", dst.Type())
 	}
-	return result, nil
+	return nil
 }

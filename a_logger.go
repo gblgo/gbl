@@ -176,20 +176,26 @@ func SetLogger(l Logger) { defaultEngine.setLogger(l) }
 // and calling it through the framework API is the intended use — no need
 // to keep or fetch a reference. msg describes the event, followed by
 // alternating key/value pairs (see Logger).
-func Info(msg string, keysAndValues ...any) { defaultEngine.logger.Info(msg, keysAndValues...) }
+func Info(msg string, keysAndValues ...any) {
+	safeLog(func() { defaultEngine.logger.Info(msg, keysAndValues...) })
+}
 
 // Warn logs at warn level through the Logger installed on the default engine.
-func Warn(msg string, keysAndValues ...any) { defaultEngine.logger.Warn(msg, keysAndValues...) }
+func Warn(msg string, keysAndValues ...any) {
+	safeLog(func() { defaultEngine.logger.Warn(msg, keysAndValues...) })
+}
 
 // Error logs at error level through the Logger installed on the default engine.
-func Error(msg string, keysAndValues ...any) { defaultEngine.logger.Error(msg, keysAndValues...) }
+func Error(msg string, keysAndValues ...any) {
+	safeLog(func() { defaultEngine.logger.Error(msg, keysAndValues...) })
+}
 
 // setLogger installs a Logger on this engine. It is safe to call at any point
 // during assembling, before or after routes and middleware are registered; nil
 // and typed-nil pointers are rejected. Once Run is claimed the logger is frozen
 // like every other assembling input, and calling this again panics.
 func (e *engine) setLogger(l Logger) {
-	e.assertAssembling("SetLogger")
+	defer e.assertAssembling("SetLogger")()
 	if l == nil {
 		e.failStartup("gbl: SetLogger requires a non-nil Logger")
 	}

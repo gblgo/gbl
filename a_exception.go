@@ -35,7 +35,7 @@ func RegisterPanicProcessor(p PanicProcessor) {
 
 // setPanicProcessor installs the panic renderer on this engine.
 func (e *engine) setPanicProcessor(p PanicProcessor) {
-	e.assertAssembling("RegisterPanicProcessor")
+	defer e.assertAssembling("RegisterPanicProcessor")()
 	e.panicProcessor = p
 }
 
