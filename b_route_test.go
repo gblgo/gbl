@@ -672,6 +672,23 @@ func TestRouteSourceParamNameMissingFile(t *testing.T) {
 	}
 }
 
+func TestRouteSourceParamNameTrimpathFallback(t *testing.T) {
+	file := modulePath + "/a_paramNames.go"
+	sourceParamFileCache.Delete(file)
+	t.Cleanup(func() { sourceParamFileCache.Delete(file) })
+	spans, parsed := sourceSpansForFile(file)
+	if !parsed || len(spans) == 0 {
+		t.Fatalf("trimpath source fallback = (%d spans, %t), want parsed source", len(spans), parsed)
+	}
+
+	missing := modulePath + "/does-not-exist.go"
+	sourceParamFileCache.Delete(missing)
+	t.Cleanup(func() { sourceParamFileCache.Delete(missing) })
+	if spans, parsed := sourceSpansForFile(missing); parsed || len(spans) != 0 {
+		t.Fatalf("missing trimpath source = (%d spans, %t), want unresolved", len(spans), parsed)
+	}
+}
+
 func TestRouteSourceParamNameDefensiveBranches(t *testing.T) {
 	if names, resolved, ambiguous := resolveSourceParamNames(reflect.Value{}); names != nil ||
 		resolved || ambiguous != "" {

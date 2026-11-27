@@ -10,6 +10,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -135,14 +136,23 @@ func selectSourceParamSpan(spans []sourceParamSpan, line int, file string) (*sou
 	return &spans[best], empty
 }
 
-// sourceSpansForFile parses and caches one source file without retaining its AST.
+// sourceSpansForFile parses and caches one source file, resolving trimpath module paths locally when possible.
 func sourceSpansForFile(file string) ([]sourceParamSpan, bool) {
 	if cached, ok := sourceParamFileCache.Load(file); ok {
 		result := cached.(sourceParamFile)
 		return result.spans, result.parsed
 	}
-	fset := token.NewFileSet()
-	parsed, err := parser.ParseFile(fset, file, nil, 0)
+	fSet := token.NewFileSet()
+	sourcePath := file
+	if strings.HasPrefix(file, modulePath+slash) {
+		if workingDir, err := os.Getwd(); err == nil {
+			local := filepath.Join(workingDir, filepath.FromSlash(strings.TrimPrefix(file, modulePath+slash)))
+			if _, err := os.Stat(local); err == nil {
+				sourcePath = local
+			}
+		}
+	}
+	parsed, err := parser.ParseFile(fSet, sourcePath, nil, 0)
 	if err != nil {
 		result := sourceParamFile{}
 		actual, _ := sourceParamFileCache.LoadOrStore(file, result)
@@ -161,8 +171,8 @@ func sourceSpansForFile(file string) ([]sourceParamSpan, bool) {
 			return true
 		}
 		spans = append(spans, sourceParamSpan{
-			start: fset.Position(node.Pos()).Line,
-			end:   fset.Position(node.End()).Line,
+			start: fSet.Position(node.Pos()).Line,
+			end:   fSet.Position(node.End()).Line,
 			names: sourceParamNames(fnType),
 		})
 		return true
