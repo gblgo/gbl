@@ -5,6 +5,7 @@
 package gbl
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http/httptest"
 	"reflect"
@@ -32,9 +33,7 @@ var fuzzJSONFilterTypes = []reflect.Type{
 	reflect.TypeFor[map[string]any](),
 }
 
-// FuzzFilterExactJSONValueNoPanic rejects non-JSON inputs and requires every
-// filtered result to remain valid JSON. The fuzz engine treats any panic as a
-// failure.
+// FuzzFilterExactJSONValueNoPanic requires valid JSON output, input immutability, and an exact-field fixed point.
 func FuzzFilterExactJSONValueNoPanic(f *testing.F) {
 	f.Add([]byte(`{}`), uint8(0))
 	f.Add([]byte(`{"value":1,"unknown":{"nested":[true,null,"x"]}}`), uint8(0))
@@ -48,10 +47,18 @@ func FuzzFilterExactJSONValueNoPanic(f *testing.F) {
 			t.Skip()
 		}
 		typ := fuzzJSONFilterTypes[int(kind)%len(fuzzJSONFilterTypes)]
+		original := bytes.Clone(data)
 		filtered := filterExactJSONValue(data, typ)
+		if !bytes.Equal(data, original) {
+			t.Fatalf("filterExactJSONValue mutated input: before=%q after=%q", original, data)
+		}
 		if !json.Valid(filtered) {
 			t.Fatalf("filterExactJSONValue produced invalid JSON for type %v: input=%q output=%q",
 				typ, data, filtered)
+		}
+		if jsonNeedsExactFilter(filtered, typ) {
+			t.Fatalf("filterExactJSONValue did not reach an exact-field fixed point: input=%q output=%q",
+				data, filtered)
 		}
 	})
 }

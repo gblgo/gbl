@@ -131,6 +131,17 @@ type CorrectnessShallow struct {
 	CorrectnessLeft
 }
 
+// CorrectnessPromotedEmbedded contributes fields without claiming its own form key.
+type CorrectnessPromotedEmbedded struct {
+	Value int `json:"value"`
+}
+
+// CorrectnessEmbeddedNameCollision has a direct tag matching the embedded type name.
+type CorrectnessEmbeddedNameCollision struct {
+	CorrectnessPromotedEmbedded
+	Other string `json:"correctnessPromotedEmbedded"`
+}
+
 // CorrectnessDeep carries the embedded value through another struct level.
 type CorrectnessDeep struct {
 	CorrectnessEmbedding
@@ -165,6 +176,21 @@ type CorrectnessTagPriority struct {
 
 // correctnessHiddenInt is an unexported anonymous non-struct embedding.
 type correctnessHiddenInt int
+
+type correctnessHiddenEmbedded struct {
+	Value int `json:"value"`
+}
+
+// CorrectnessHiddenPointerEmbedding cannot allocate its unexported embedded pointer.
+type CorrectnessHiddenPointerEmbedding struct {
+	*correctnessHiddenEmbedded
+}
+
+type correctnessEndlessPointer *correctnessEndlessPointer
+
+type correctnessEndlessPointerHolder struct {
+	Next correctnessEndlessPointer
+}
 
 // CorrectnessHiddenFields mixes unexported fields with one visible member.
 type CorrectnessHiddenFields struct {
@@ -679,6 +705,24 @@ func TestBuildBindPlanRejectsAmbiguousStructFields(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBindStructEmbeddedTypeNameDoesNotConflictWithDirectTag(t *testing.T) {
+	typ := reflect.TypeFor[CorrectnessEmbeddedNameCollision]()
+	if _, err := buildBindPlan(reflect.FuncOf([]reflect.Type{typ}, nil, false)); err != nil {
+		t.Fatalf("embedded type name caused a false conflict: %v", err)
+	}
+	value, err := bindStruct(typ, &nameSources{form: url.Values{
+		"value":                       {"9"},
+		"correctnessPromotedEmbedded": {"label"},
+	}})
+	if err != nil {
+		t.Fatalf("bind embedded name collision: %v", err)
+	}
+	got := value.Interface().(CorrectnessEmbeddedNameCollision)
+	if got.Value != 9 || got.Other != "label" {
+		t.Fatalf("bound embedded name collision = %#v", got)
 	}
 }
 

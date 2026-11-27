@@ -65,6 +65,9 @@ type (
 		types []reflect.Type
 		// classes is parallel to types and records each injection strategy
 		classes []paramClass
+		// pathBindable is parallel to types and records whether a whole path value
+		// can bind the parameter. Structs bind their fields instead of their outer name.
+		pathBindable []bool
 		// structFields is parallel to types and caches top-level struct fields
 		structFields [][]structField
 		// businessIndexes identifies parameters bound from request data
@@ -83,8 +86,8 @@ type (
 		queryKeys requestKeySet
 		// jsonKeys lists the top-level members needed by multi-parameter JSON handlers.
 		jsonKeys []string
-		// jsonKeySet provides constant-time lookup for jsonKeys.
-		jsonKeySet requestKeySet
+		// jsonKeySet maps accepted members to canonical startup names.
+		jsonKeySet map[string]string
 		// needsParse records whether request data must be parsed
 		needsParse bool
 		// hasSSE is true when any parameter declares gbl.SSEWriter.
@@ -207,6 +210,9 @@ func validateFormPointerExpansion(t reflect.Type) error {
 		}
 		pointers := 0
 		for current.Kind() == reflect.Pointer {
+			if pointers >= maxTypePointerDepth {
+				return maxFormPointerExpansion + 1, true
+			}
 			pointers++
 			current = current.Elem()
 		}
@@ -298,6 +304,7 @@ func buildBindPlan(rt reflect.Type) (bindPlan, error) {
 	plan := bindPlan{
 		types:        make([]reflect.Type, n),
 		classes:      make([]paramClass, n),
+		pathBindable: make([]bool, n),
 		structFields: make([][]structField, n),
 	}
 	visited := make(map[reflect.Type]bool)
@@ -313,6 +320,7 @@ func buildBindPlan(rt reflect.Type) (bindPlan, error) {
 				return plan, fmt.Errorf("recursive pointer type: %s", t)
 			}
 			plan.businessIndexes = append(plan.businessIndexes, i)
+			plan.pathBindable[i] = !selfDescribing(t)
 			plan.needsParse = true
 			if err := validateFormPointerExpansion(t); err != nil {
 				return plan, err
@@ -374,9 +382,9 @@ func (p *bindPlan) prepareKeys(names []string) {
 			if _, exists := p.jsonKeySet[name]; !exists {
 				p.jsonKeys = append(p.jsonKeys, name)
 				if p.jsonKeySet == nil {
-					p.jsonKeySet = make(requestKeySet)
+					p.jsonKeySet = make(map[string]string)
 				}
-				p.jsonKeySet[name] = struct{}{}
+				p.jsonKeySet[name] = name
 			}
 		}
 	}
@@ -487,12 +495,21 @@ func validateStructBindNames(t reflect.Type) error {
 // unless one exact name has a single explicit-tag claimant.
 func computeStructBindNameError(t reflect.Type) error {
 	seen := make(map[string]bindFieldCandidate, t.NumField())
-	for i := range t.NumField() {
-		field := t.Field(i)
+	for field := range t.Fields() {
 		if !bindableStructField(field) {
 			continue
 		}
-		name, _ := structFieldBindName(field)
+		if field.Anonymous && !field.IsExported() && field.Type.Kind() == reflect.Pointer {
+			if terminal, ok := derefType(field.Type); ok && terminal.Kind() == reflect.Struct {
+				return fmt.Errorf("struct %s has an unexported anonymous pointer %s that cannot be allocated", t, field.Name)
+			}
+		}
+		name, tagged := structFieldBindName(field)
+		if field.Anonymous && !tagged {
+			if terminal, ok := derefType(field.Type); ok && terminal.Kind() == reflect.Struct {
+				continue
+			}
+		}
 		candidate := bindFieldCandidate{name: name, path: field.Name, depth: 1}
 		folded := foldBindName(name)
 		if previous, exists := seen[folded]; exists {
@@ -1033,35 +1050,29 @@ func decodeJSONFieldsList(body []byte, keys []string) (map[string]json.RawMessag
 
 // decodeJSONFieldsSet adapts the startup key set for direct callers.
 func decodeJSONFieldsSet(body []byte, keys requestKeySet) (map[string]json.RawMessage, error) {
-	list := make([]string, 0, len(keys))
+	canonical := make(map[string]string, len(keys))
 	for key := range keys {
-		list = append(list, key)
+		canonical[key] = key
 	}
-	return decodeJSONFieldsList(body, list)
+	fields := make(map[string]json.RawMessage, len(keys))
+	if err := decodeJSONFieldsMapInto(body, canonical, fields); err != nil {
+		return nil, err
+	}
+	return fields, nil
 }
 
-// jsonKeyIndex matches an unescaped JSON key against the startup key slice.
-func jsonKeyIndex(keys []string, raw []byte) int {
-	for i, key := range keys {
-		if len(key) != len(raw) {
-			continue
-		}
-		matched := true
-		for j := range len(raw) {
-			if key[j] != raw[j] {
-				matched = false
-				break
-			}
-		}
-		if matched {
-			return i
-		}
-	}
-	return -1
-}
-
-// decodeJSONFieldsListInto fills a caller-owned map for the request binding path.
+// decodeJSONFieldsListInto fills a caller-owned map for direct list callers.
 func decodeJSONFieldsListInto(body []byte, keys []string,
+	fields map[string]json.RawMessage) error {
+	canonical := make(map[string]string, len(keys))
+	for _, key := range keys {
+		canonical[key] = key
+	}
+	return decodeJSONFieldsMapInto(body, canonical, fields)
+}
+
+// decodeJSONFieldsMapInto fills a caller-owned map using canonical startup names.
+func decodeJSONFieldsMapInto(body []byte, keys map[string]string,
 	fields map[string]json.RawMessage) error {
 	if !json.Valid(body) {
 		return fmt.Errorf("invalid JSON body: %w", json.Unmarshal(body, &json.RawMessage{}))
@@ -1080,25 +1091,18 @@ func decodeJSONFieldsListInto(body []byte, keys []string,
 		keyStart := index
 		index = scanJSONStringEnd(body, index)
 		rawKey := body[keyStart+1 : index-1]
-		keyIndex := jsonKeyIndex(keys, rawKey)
-		if bytes.IndexByte(rawKey, '\\') >= 0 {
+		name, matched := keys[string(rawKey)]
+		if !matched && bytes.IndexByte(rawKey, '\\') >= 0 {
 			// Escaped keys are uncommon; standard decoding preserves exact JSON semantics.
-			var name string
 			_ = json.Unmarshal(body[keyStart:index], &name)
-			keyIndex = -1
-			for i, key := range keys {
-				if key == name {
-					keyIndex = i
-					break
-				}
-			}
+			name, matched = keys[name]
 		}
 		index = skipJSONSpace(body, index)
 		index = skipJSONSpace(body, index+1)
 		valueStart := index
 		index = skipJSONValueEnd(body, index)
-		if keyIndex >= 0 {
-			fields[keys[keyIndex]] = body[valueStart:index]
+		if matched {
+			fields[name] = body[valueStart:index]
 		}
 		index = skipJSONSpace(body, index)
 		switch body[index] {
@@ -1195,6 +1199,13 @@ func injectedParameters(
 	src := &c.src
 
 	var jsonFields *pooledJSONFields
+	if jsonMedia && len(plan.businessIndexes) > 1 {
+		defer func() {
+			if jsonFields != nil {
+				releaseJSONFields(jsonFields)
+			}
+		}()
+	}
 
 	for i := range plan.types {
 		t := plan.types[i]
@@ -1232,13 +1243,17 @@ func injectedParameters(
 
 		// classBind: a business parameter, resolved from request data. Path
 		// parameters take priority over query/body for scalar arguments too.
-		if pathValue, ok := src.pathGet(name); ok {
-			v, err := bindTextValue(t, []string{pathValue})
-			if err != nil {
-				return fmt.Errorf("path parameter %q: %w", name, err)
+		// Self-describing structs bind their fields and ignore an outer path value
+		// that happens to share the handler parameter name.
+		if plan.pathBindable[i] {
+			if pathValue, ok := src.pathGet(name); ok {
+				v, err := bindTextValue(t, []string{pathValue})
+				if err != nil {
+					return fmt.Errorf("path parameter %q: %w", name, err)
+				}
+				params[i] = v
+				continue
 			}
-			params[i] = v
-			continue
 		}
 
 		if jsonMedia {
@@ -1247,8 +1262,7 @@ func injectedParameters(
 			// has failed for the first parameter that actually needs JSON.
 			if len(plan.businessIndexes) > 1 && jsonFields == nil {
 				jsonFields = acquireJSONFields(len(plan.jsonKeySet))
-				defer releaseJSONFields(jsonFields)
-				if err := decodeJSONFieldsListInto(body, plan.jsonKeys, jsonFields.values); err != nil {
+				if err := decodeJSONFieldsMapInto(body, plan.jsonKeySet, jsonFields.values); err != nil {
 					return err
 				}
 			}
@@ -1631,10 +1645,9 @@ func bindFormParameterInto(dst reflect.Value, name string, src *nameSources, dep
 				return nil
 			}
 			data := values[0]
-			dst.Set(reflect.MakeSlice(t, len(data), len(data)))
-			for i := range len(data) {
-				dst.Index(i).SetUint(uint64(data[i]))
-			}
+			slice := reflect.MakeSlice(t, len(data), len(data))
+			copy(slice.Bytes(), data)
+			dst.Set(slice)
 			return nil
 		}
 		if len(values) == 0 {
@@ -1780,16 +1793,17 @@ func decodeJSON(t reflect.Type, data []byte) (reflect.Value, error) {
 }
 
 // decodeJSONExactStruct applies the binding subsystem's exact member names to a
-// lone struct parameter. Valid objects are filtered recursively before the
-// standard decoder runs, preserving its pointer, slice, map, optional-field and
-// UnmarshalTypeError behavior. Types with their own JSON decoder keep ownership
-// of their representation.
+// lone business parameter, including structs nested in top-level containers.
+// Valid values are filtered recursively before the standard decoder runs,
+// preserving its pointer, slice, map, optional-field and UnmarshalTypeError
+// behavior. Types with their own JSON decoder keep ownership of their
+// representation.
 func decodeJSONExactStruct(t reflect.Type, data []byte) (reflect.Value, error) {
 	if t == nil {
 		return reflect.Value{}, errors.New("nil JSON target type")
 	}
 	terminal, ok := derefType(t)
-	if ok && terminal.Kind() == reflect.Struct && !hasCustomJSONDecoder(terminal) && json.Valid(data) {
+	if ok && !hasCustomJSONDecoder(terminal) && json.Valid(data) {
 		if jsonNeedsExactFilter(data, terminal) {
 			data = filterExactJSONValue(data, terminal)
 		}

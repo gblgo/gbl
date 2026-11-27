@@ -921,6 +921,20 @@ func TestRequestResponseEdgeFilterExactJSONValue(t *testing.T) {
 	if err != nil || value.Interface().(rrEdgeJSONExact).Value != 2 {
 		t.Fatalf("exact struct decode = (%v, %v), want value 2", value, err)
 	}
+	sliceValue, err := decodeJSONExactStruct(reflect.TypeFor[[]rrEdgeJSONItem](), []byte(`[{"Value":9}]`))
+	if err != nil {
+		t.Fatalf("exact slice decode: %v", err)
+	}
+	if got := sliceValue.Interface().([]rrEdgeJSONItem)[0].Value; got != 0 {
+		t.Fatalf("top-level slice bound wrong-case field: got %d, want 0", got)
+	}
+	mapValue, err := decodeJSONExactStruct(reflect.TypeFor[map[string]rrEdgeJSONItem](), []byte(`{"item":{"Value":9}}`))
+	if err != nil {
+		t.Fatalf("exact map decode: %v", err)
+	}
+	if got := mapValue.Interface().(map[string]rrEdgeJSONItem)["item"].Value; got != 0 {
+		t.Fatalf("top-level map bound wrong-case field: got %d, want 0", got)
+	}
 	_, err = decodeJSONExactStruct(reflect.TypeFor[rrEdgeJSONExact](), []byte(`{"value":"bad","value":2}`))
 	var typeErr *json.UnmarshalTypeError
 	if !errors.As(err, &typeErr) {

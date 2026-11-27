@@ -49,3 +49,29 @@ func TestFilterExactJSONValueDeepAllocationCount(t *testing.T) {
 		}
 	}
 }
+
+func TestContextValidatablePointerModeAvoidsBoxing(t *testing.T) {
+	value := ctxTestValidatable{Name: "value"}
+	addressable := reflect.ValueOf(&value).Elem()
+	var target Validatable
+	var ok bool
+	allocations := testing.AllocsPerRun(100, func() {
+		target, ok = asValidatableMode(addressable, true)
+	})
+	if allocations != 0 {
+		t.Fatalf("pointer-mode validation allocations = %v, want 0", allocations)
+	}
+	if !ok || target != &value {
+		t.Fatalf("pointer-mode target = (%v, %t), want original pointer", target, ok)
+	}
+	if target, ok := asValidatableMode(reflect.Value{}, true); ok || target != nil {
+		t.Fatalf("invalid pointer-mode value = (%v, %t), want (nil, false)", target, ok)
+	}
+	if target, ok := asValidatableMode(reflect.ValueOf(value), true); ok || target != nil {
+		t.Fatalf("unaddressable pointer-mode value = (%v, %t), want (nil, false)", target, ok)
+	}
+	plain := struct{ Name string }{}
+	if target, ok := asValidatableMode(reflect.ValueOf(&plain).Elem(), true); ok || target != nil {
+		t.Fatalf("plain pointer-mode value = (%v, %t), want (nil, false)", target, ok)
+	}
+}
