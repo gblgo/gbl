@@ -207,7 +207,7 @@ func TestPublicShutdownBeforeRun(t *testing.T) {
 
 func TestPublicHTTPVerbRegistrations(t *testing.T) {
 	e := publicTestUseDefaultEngine(t)
-	e.logger = routeTestDiscardLogger{}
+	logTestStoreLogger(e, routeTestDiscardLogger{})
 	tests := []struct {
 		name     string
 		method   httpMethod
@@ -246,7 +246,7 @@ func TestPublicHTTPVerbRegistrations(t *testing.T) {
 
 func TestPublicSizeSettersRejectNonPositiveValues(t *testing.T) {
 	e := publicTestUseDefaultEngine(t)
-	e.logger = routeTestDiscardLogger{}
+	logTestStoreLogger(e, routeTestDiscardLogger{})
 	oldBodyLimit := maxBodySize.Load()
 	oldFileLimit := maxFileMemory.Load()
 	oldUploadLimit := maxUploadFileSize.Load()
@@ -307,7 +307,7 @@ func TestPublicNilConfigurationAndPanicProcessor(t *testing.T) {
 
 func TestPublicAssemblingAPIsFreezeAfterRunClaim(t *testing.T) {
 	e := publicTestUseDefaultEngine(t)
-	e.logger = routeTestDiscardLogger{}
+	logTestStoreLogger(e, routeTestDiscardLogger{})
 	oldBodyLimit := maxBodySize.Load()
 	oldFileLimit := maxFileMemory.Load()
 	oldUploadLimit := maxUploadFileSize.Load()

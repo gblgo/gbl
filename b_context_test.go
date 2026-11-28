@@ -453,10 +453,10 @@ func TestContextAbortWithStatusJSON(t *testing.T) {
 
 func TestContextAbortWithStatusJSONSerializationFailure(t *testing.T) {
 	e := responseTestNewEngine(t)
-	var captured *Context
+	aborted := false
 	handlerCalled := false
 	e.use(func(c *Context) {
-		captured = c
+		defer func() { aborted = c.Aborted() }()
 		c.AbortWithStatusJSON(http.StatusBadRequest, make(chan int))
 	})
 	e.register(methodGet, "/ctxTest", func() { handlerCalled = true })
@@ -467,10 +467,7 @@ func TestContextAbortWithStatusJSONSerializationFailure(t *testing.T) {
 		t.Fatalf("pipeline leaked a panic: %v", escaped)
 	}
 	responseTestCheckResponse(t, rec, http.StatusInternalServerError, responseSerializationFailed, textPlainCharset)
-	if captured == nil {
-		t.Fatal("middleware context was not captured")
-	}
-	if !captured.Aborted() {
+	if !aborted {
 		t.Error("serialization failure did not abort the context")
 	}
 	if handlerCalled {

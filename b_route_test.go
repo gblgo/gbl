@@ -6,6 +6,7 @@ package gbl
 
 import (
 	"debug/dwarf"
+	"errors"
 	"fmt"
 	"go/ast"
 	"net/http"
@@ -27,7 +28,7 @@ func (routeTestDiscardLogger) Error(string, ...any) {}
 func routeTestNewEngine(t *testing.T) *engine {
 	t.Helper()
 	e := newEngine()
-	e.logger = routeTestDiscardLogger{}
+	logTestStoreLogger(e, routeTestDiscardLogger{})
 	t.Cleanup(e.cancelStreams)
 	t.Cleanup(e.hijacks.closeAll)
 	return e
@@ -104,12 +105,12 @@ func TestRouteMethodOf(t *testing.T) {
 		ok    bool
 	}{
 		{"GET", methodGet, true},
-		{"get", methodGet, true},
-		{"HeAd", methodHead, true},
+		{"get", 0, false},
+		{"HeAd", 0, false},
 		{"POST", methodPost, true},
-		{"put", methodPut, true},
+		{"put", 0, false},
 		{"PATCH", methodPatch, true},
-		{"delete", methodDelete, true},
+		{"delete", 0, false},
 		{"OPTIONS", methodOptions, true},
 		{"", 0, false},
 		{" TRACE", 0, false},
@@ -126,10 +127,103 @@ func TestRouteMethodOf(t *testing.T) {
 		})
 	}
 	for method, name := range methodNames {
-		got, ok := methodOf(strings.ToLower(name))
-		if !ok || got != httpMethod(method) {
+		if got, ok := methodOf(name); !ok || got != httpMethod(method) {
 			t.Errorf("method table entry %d (%q) did not round-trip: (%d, %v)", method, name, got, ok)
 		}
+		if got, ok := methodOf(strings.ToLower(name)); ok || got != 0 {
+			t.Errorf("lowercase method %q was accepted: (%d, %v)", strings.ToLower(name), got, ok)
+		}
+	}
+}
+
+func TestRouteServeHTTPNormalizesPathBeforeMiddleware(t *testing.T) {
+	e := routeTestNewEngine(t)
+	var middlewarePath, handlerPath, requestURI, rawPath string
+	e.use(func(c *Context) {
+		middlewarePath = c.Request.URL.Path
+		requestURI = c.Request.RequestURI
+		rawPath = c.Request.URL.RawPath
+		c.Next()
+	})
+	e.register(methodGet, "/users/:id", func(id string) string {
+		handlerPath = "/users/" + id
+		return id
+	})
+	e.generateRoute()
+
+	const target = "//users/%34%32//"
+	request := httptest.NewRequest(http.MethodGet, target, nil)
+	if request.URL.RawPath == empty {
+		t.Fatal("normalization fixture did not retain an encoded RawPath")
+	}
+	recorder := httptest.NewRecorder()
+	e.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "42" {
+		t.Fatalf("normalized response = %d %q, want 200 42", recorder.Code, recorder.Body.String())
+	}
+	if middlewarePath != "/users/42" || handlerPath != "/users/42" {
+		t.Fatalf("middleware/handler paths = %q/%q, want /users/42", middlewarePath, handlerPath)
+	}
+	if requestURI != target {
+		t.Fatalf("RequestURI = %q, want original request target", requestURI)
+	}
+	if rawPath != empty {
+		t.Fatalf("normalized RawPath = %q, want empty", rawPath)
+	}
+}
+
+func TestNormalizeRequestPathDirectBranches(t *testing.T) {
+	encoded := httptest.NewRequest(http.MethodGet, "/users/a%2Fb", nil)
+	if err := normalizeRequestPath(encoded); !errors.Is(err, errRequestPathEncodedSlash) {
+		t.Fatalf("normalize encoded slash = %v, want errRequestPathEncodedSlash", err)
+	}
+
+	empty := httptest.NewRequest(http.MethodGet, "///", nil)
+	if err := normalizeRequestPath(empty); err != nil || empty.URL.Path != slash {
+		t.Fatalf("normalize empty segments = (%q, %v), want /", empty.URL.Path, err)
+	}
+
+	long := "/" + strings.Repeat("aa/", maxRoutePathSegments-1) + "aa"
+	if pathExceedsSegmentLimit(long) {
+		t.Fatal("path with exactly the maximum segment count was rejected")
+	}
+}
+
+func TestRouteServeHTTPRejectsEncodedSlashAndExcessiveSegments(t *testing.T) {
+	for _, target := range []string{"/users/a%2Fb", "/users/a%2fb"} {
+		t.Run(target, func(t *testing.T) {
+			e := routeTestNewEngine(t)
+			called := false
+			e.register(methodGet, "/users/:id", func() string { called = true; return "unexpected" })
+			e.generateRoute()
+			recorder := routeTestServe(e, http.MethodGet, target)
+			if recorder.Code != http.StatusBadRequest || called {
+				t.Fatalf("encoded slash response = %d, called=%t", recorder.Code, called)
+			}
+		})
+	}
+
+	t.Run("too many segments", func(t *testing.T) {
+		e := routeTestNewEngine(t)
+		called := false
+		e.use(func(c *Context) { called = true; c.Next() })
+		e.register(methodGet, "/root/:id", func() string { return "unexpected" })
+		e.generateRoute()
+		target := "/" + strings.Repeat("a/", maxRoutePathSegments) + "a"
+		recorder := routeTestServe(e, http.MethodGet, target)
+		if recorder.Code != http.StatusRequestURITooLong || called {
+			t.Fatalf("excessive path response = %d, middleware called=%t", recorder.Code, called)
+		}
+	})
+}
+
+func TestRouteServeHTTPRejectsNonCanonicalMethod(t *testing.T) {
+	e := routeTestNewEngine(t)
+	e.register(methodGet, "/method", func() string { return "unexpected" })
+	e.generateRoute()
+	recorder := routeTestServe(e, "get", "/method")
+	if recorder.Code != http.StatusNotImplemented {
+		t.Fatalf("lowercase method response = %d, want 501", recorder.Code)
 	}
 }
 
@@ -272,6 +366,23 @@ func TestRouteMatchNormalizesRequestPaths(t *testing.T) {
 				t.Fatalf("GET %s = (%d, %q), want (200, %q)", tt.path, recorder.Code, recorder.Body.String(), tt.want)
 			}
 		})
+	}
+
+	matched, params := e.matchNode(methodGet, "//static//path/", nil)
+	if params != nil {
+		releasePathParams(params)
+	}
+	if matched == nil {
+		t.Fatal("direct matchNode did not normalize a static path")
+	}
+
+	deep := "//" + strings.Repeat("a/", maxRoutePathSegments) + "a/"
+	matched, params = e.matchNode(methodGet, deep, nil)
+	if params != nil {
+		releasePathParams(params)
+	}
+	if matched != nil {
+		t.Fatal("direct matchNode accepted an excessive non-normalized path")
 	}
 }
 
@@ -674,16 +785,30 @@ func TestRouteSourceParamNameMissingFile(t *testing.T) {
 
 func TestRouteSourceParamNameTrimpathFallback(t *testing.T) {
 	file := modulePath + "/a_paramNames.go"
+	previousFile, fileLoaded := sourceParamFileCache.Load(file)
 	sourceParamFileCache.Delete(file)
-	t.Cleanup(func() { sourceParamFileCache.Delete(file) })
+	t.Cleanup(func() {
+		if fileLoaded {
+			sourceParamFileCache.Store(file, previousFile)
+		} else {
+			sourceParamFileCache.Delete(file)
+		}
+	})
 	spans, parsed := sourceSpansForFile(file)
 	if !parsed || len(spans) == 0 {
 		t.Fatalf("trimpath source fallback = (%d spans, %t), want parsed source", len(spans), parsed)
 	}
 
 	missing := modulePath + "/does-not-exist.go"
+	previousMissing, missingLoaded := sourceParamFileCache.Load(missing)
 	sourceParamFileCache.Delete(missing)
-	t.Cleanup(func() { sourceParamFileCache.Delete(missing) })
+	t.Cleanup(func() {
+		if missingLoaded {
+			sourceParamFileCache.Store(missing, previousMissing)
+		} else {
+			sourceParamFileCache.Delete(missing)
+		}
+	})
 	if spans, parsed := sourceSpansForFile(missing); parsed || len(spans) != 0 {
 		t.Fatalf("missing trimpath source = (%d spans, %t), want unresolved", len(spans), parsed)
 	}
@@ -768,9 +893,10 @@ func TestRouteGoTestBinaryDetection(t *testing.T) {
 		want      bool
 	}{
 		{name: "flags", testFlags: true, want: true},
-		{name: "unix suffix", args: []string{"/tmp/pkg.test"}, want: true},
-		{name: "windows suffix", args: []string{`C:\tmp\pkg.test.exe`}, want: true},
-		{name: "test argument", args: []string{"custom", "-test.v"}, want: true},
+		{name: "unix suffix", args: []string{"/tmp/pkg.test"}, want: false},
+		{name: "windows suffix", args: []string{`C:\tmp\pkg.test.exe`}, want: false},
+		{name: "test argument", args: []string{"custom", "-test.v"}, want: false},
+		{name: "test prefix without flag", args: []string{"-test.run=Example"}, want: false},
 		{name: "production", args: []string{"server"}, want: false},
 		{name: "empty", want: false},
 	}

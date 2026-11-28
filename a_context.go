@@ -436,6 +436,7 @@ func (c *Context) invokeHandler() {
 		// it is echoed as the 400 body: whoever wrote it owns what it discloses.
 		if vErr := validateBusiness(in, rh.plan.validatableIndexes,
 			rh.plan.validatablePointers); vErr != nil {
+			safeLog(func() { c.logger.Error("request validation failed", "error", vErr) })
 			abort(http.StatusBadRequest, vErr.Error())
 			return
 		}

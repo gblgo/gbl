@@ -236,7 +236,7 @@ func TestPrintBannerPrefersBannerLogger(t *testing.T) {
 	e := newEngine()
 	defer e.cancelStreams()
 	logger := &bannerTestBannerLogger{bannerTestLogger: &bannerTestLogger{}}
-	e.logger = logger
+	logTestStoreLogger(e, logger)
 	cfg := defaultConfig()
 	addr := bannerTestAddr(":9801")
 	block := e.renderBanner(cfg, addr)
@@ -258,7 +258,7 @@ func TestPrintBannerFallsBackToSingleInfoRecord(t *testing.T) {
 	e := newEngine()
 	defer e.cancelStreams()
 	logger := &bannerTestLogger{}
-	e.logger = logger
+	logTestStoreLogger(e, logger)
 	cfg := defaultConfig()
 	addr := bannerTestAddr("127.0.0.1:9801")
 	block := e.renderBanner(cfg, addr)

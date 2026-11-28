@@ -38,8 +38,8 @@ type engine struct {
 
 	// user hook that renders panic values
 	panicProcessor PanicProcessor
-	// sink for internal logs; never nil
-	logger Logger
+	// sink for internal logs; published atomically and never nil in production
+	logger atomic.Pointer[loggerHolder]
 	// lifetime shared by every SSE stream and canceled when shutdown starts
 	streamCtx context.Context
 
@@ -104,9 +104,8 @@ var defaultEngine = newEngine()
 // use it to stand up an isolated instance.
 func newEngine() *engine {
 	streamCtx, cancelStreams := context.WithCancel(context.Background())
-	return &engine{
+	e := &engine{
 		roots:         make([]*routeNode, methodCount),
-		logger:        newStdLogger(),
 		cfg:           defaultConfig(),
 		hijacks:       newHijackRegistry(),
 		streamCtx:     streamCtx,
@@ -114,6 +113,8 @@ func newEngine() *engine {
 		startDone:     make(chan struct{}),
 		shutdownMu:    make(chan struct{}, 1),
 	}
+	e.logger.Store(newLoggerHolder(newStdLogger()))
+	return e
 }
 
 // Run starts the single public engine on the configured address and blocks
@@ -234,7 +235,7 @@ func (e *engine) run() {
 			defer cancel()
 			if err := e.shutdown(ctx); err != nil {
 				safeLog(func() {
-					e.logger.Warn("graceful shutdown failed; forcing connections closed", "error", err)
+					e.currentLogger().Warn("graceful shutdown failed; forcing connections closed", "error", err)
 				})
 				_ = server.Close()
 				e.hijacks.closeAll()
@@ -375,6 +376,6 @@ func (e *engine) failAssembling(op string) {
 		panic(reason)
 	}
 	defer e.assemblyFailure.Store(false)
-	safeLog(func() { e.logger.Error("assembly rejected", "reason", reason) })
+	safeLog(func() { e.currentLogger().Error("assembly rejected", "reason", reason) })
 	panic(reason)
 }

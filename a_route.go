@@ -77,9 +77,8 @@ var methodNames = [methodCount]string{
 }
 
 // methodOf resolves an HTTP method name, reporting false when GBL does not
-// implement that verb at all. HTTP methods are ASCII tokens, so an ASCII fold
-// preserves the lenient lowercase behavior without allocating an upper-cased
-// copy on every request.
+// implement that verb at all. HTTP methods are case-sensitive tokens, so only
+// their exact wire spelling is accepted.
 func methodOf(name string) (httpMethod, bool) {
 	switch len(name) {
 	case len(nameMethodGet):
@@ -112,22 +111,9 @@ func methodOf(name string) (httpMethod, bool) {
 	return 0, false
 }
 
-// equalMethodName compares an ASCII HTTP token case-insensitively without
-// allocating. Non-ASCII bytes cannot match a supported method name.
+// equalMethodName compares the case-sensitive HTTP method token without allocating.
 func equalMethodName(name, upper string) bool {
-	if len(name) != len(upper) {
-		return false
-	}
-	for i := range len(name) {
-		c := name[i]
-		if c >= 'a' && c <= 'z' {
-			c -= 'a' - 'A'
-		}
-		if c != upper[i] {
-			return false
-		}
-	}
-	return true
+	return name == upper
 }
 
 // isBodyMethod reports whether GBL parses a request body for this method.

@@ -72,8 +72,14 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		// not a routing failure and 405 would be the wrong answer.
 		abort(http.StatusNotImplemented, http.StatusText(http.StatusNotImplemented))
 	}
-
-	rh, pathParams := e.matchNode(method, r.URL.Path, nil)
+	rh, pathParams, err := e.matchRequestNode(method, r, nil)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errRequestPathTooManySegments) {
+			status = http.StatusRequestURITooLong
+		}
+		abort(status, http.StatusText(status))
+	}
 
 	// An unregistered HEAD borrows the GET route: ordinary handlers run normally
 	// and net/http drops the body, while SSE routes only commit their headers.
@@ -89,17 +95,18 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	logger := e.currentLogger()
 	// Apply the body boundary before middleware runs. Parameter parsing and raw
 	// handlers prepare the body again, but the marker makes that check idempotent;
 	// a middleware replacement is still limited before application code consumes it.
 	if method.isBodyMethod() {
 		if err := prepareRequestBody(w, r); err != nil {
-			writeRequestError(err, e.logger)
+			writeRequestError(err, logger)
 			return
 		}
 	}
 
-	c := newContext(rw, r, pathParams, rh, method, e.logger)
+	c := newContext(rw, r, pathParams, rh, method, logger)
 	defer c.recycle()
 
 	// Concrete return-value handlers expose a provisional media type before
@@ -186,7 +193,7 @@ func writeRequestError(err error, loggers ...Logger) {
 	}
 	status, body := requestErrorResponse(err)
 	if status == http.StatusInternalServerError {
-		logger := defaultEngine.logger
+		logger := defaultEngine.currentLogger()
 		if len(loggers) > 0 && loggers[0] != nil {
 			logger = loggers[0]
 		}

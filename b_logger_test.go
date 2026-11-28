@@ -100,11 +100,49 @@ func logTestAppend(value any) (line string, recovered any) {
 	return b.String(), nil
 }
 
+// logTestStoreLogger installs a logger without taking the assembly lock. A nil
+// logger stores a nil holder so fallback behavior can be tested explicitly.
+func logTestStoreLogger(e *engine, logger Logger) {
+	if logger == nil {
+		e.logger.Store(nil)
+		return
+	}
+	e.logger.Store(newLoggerHolder(logger))
+}
+
+// logTestReplaceLogger installs a test logger and restores the exact atomic
+// holder afterwards, including when the test fails or panics.
+func logTestReplaceLogger(t *testing.T, e *engine, logger Logger) {
+	t.Helper()
+	previous := e.logger.Load()
+	logTestStoreLogger(e, logger)
+	t.Cleanup(func() { e.logger.Store(previous) })
+}
+
+func TestEngineCurrentLoggerTracksAtomicHolder(t *testing.T) {
+	e := newEngine()
+	t.Cleanup(e.cancelStreams)
+	first := &logTestCaptureLogger{}
+	second := &logTestCaptureLogger{}
+	logTestStoreLogger(e, first)
+	if got := e.currentLogger(); got != first {
+		t.Fatalf("currentLogger = %v, want first logger", got)
+	}
+	logTestStoreLogger(e, second)
+	if got := e.currentLogger(); got != second {
+		t.Fatalf("currentLogger after replacement = %v, want second logger", got)
+	}
+	logTestStoreLogger(e, nil)
+	if got := e.currentLogger(); got != nil {
+		t.Fatalf("currentLogger with nil holder = %v, want nil", got)
+	}
+}
+
 func TestSetLoggerRejectsNilValues(t *testing.T) {
 	e := newEngine()
 	t.Cleanup(e.cancelStreams)
 	original := &logTestCaptureLogger{}
-	e.logger = original
+	logTestStoreLogger(e, original)
 	var typedNil *logTestCaptureLogger
 	for _, tc := range []struct {
 		name   string
@@ -117,7 +155,7 @@ func TestSetLoggerRejectsNilValues(t *testing.T) {
 			if recovered := logTestPanicValue(func() { e.setLogger(tc.logger) }); recovered == nil {
 				t.Fatalf("SetLogger accepted %s", tc.name)
 			}
-			if e.logger != original {
+			if e.currentLogger() != original {
 				t.Fatalf("SetLogger(%s) replaced the installed logger", tc.name)
 			}
 		})
@@ -129,9 +167,7 @@ func TestSafeLogContainsSinkPanic(t *testing.T) {
 }
 
 func TestPackageLogFunctionsContainSinkPanic(t *testing.T) {
-	old := defaultEngine.logger
-	defaultEngine.logger = &logTestPanicLogger{}
-	t.Cleanup(func() { defaultEngine.logger = old })
+	logTestReplaceLogger(t, defaultEngine, &logTestPanicLogger{})
 	Info("info")
 	Warn("warn")
 	Error("error")
@@ -140,7 +176,7 @@ func TestPackageLogFunctionsContainSinkPanic(t *testing.T) {
 func TestFailStartupPreservesReasonWhenLoggerPanics(t *testing.T) {
 	e := newEngine()
 	t.Cleanup(e.cancelStreams)
-	e.logger = &logTestPanicLogger{}
+	logTestStoreLogger(e, &logTestPanicLogger{})
 	reason := errors.New("original startup failure")
 	if recovered := logTestPanicValue(func() { e.failStartup(reason) }); recovered != reason {
 		t.Fatalf("failStartup panic = %v, want original reason %v", recovered, reason)
@@ -160,7 +196,10 @@ func TestLogLineFormatAndOddPairs(t *testing.T) {
 		{name: "odd trailing value", level: "ERROR", msg: "failed", kv: []any{"reason", "boom", 7}, want: "ERROR failed reason=boom 7"},
 		{name: "single dangling value", level: "INFO", msg: "event", kv: []any{"tail"}, want: "INFO event tail"},
 		{name: "scalar keys and nil", level: "INFO", msg: "values", kv: []any{1, true, "missing", nil}, want: "INFO values 1=true missing=<nil>"},
-		{name: "message is verbatim", level: "INFO", msg: "two words", kv: []any{"key", "two words"}, want: "INFO two words key=two words"},
+		{name: "message is verbatim", level: "INFO", msg: "two words", kv: []any{"key", "two words"}, want: "INFO two words key=\"two words\""},
+		{name: "quoted keys and values", level: "WARN", msg: "fields", kv: []any{"key with space", `a="b"`, "empty", ""}, want: `WARN fields "key with space"="a=\"b\"" empty=""`},
+		{name: "equals cannot forge a field", level: "ERROR", msg: "failed", kv: []any{"key", "a=b"}, want: `ERROR failed key="a=b"`},
+		{name: "controls before quote stay escaped", level: "WARN", msg: "safe", kv: []any{"key", "pre\n\"post\x1b"}, want: `WARN safe key="pre\n\"post\x1b"`},
 	}
 
 	for _, tt := range tests {
@@ -180,7 +219,7 @@ func TestAppendLogValueScalars(t *testing.T) {
 	}{
 		{name: "nil", value: nil, want: "<nil>"},
 		{name: "string", value: "hello", want: "hello"},
-		{name: "empty string", value: "", want: ""},
+		{name: "empty string", value: "", want: `""`},
 		{name: "bool true", value: true, want: "true"},
 		{name: "bool false", value: false, want: "false"},
 		{name: "int", value: int(-42), want: "-42"},
@@ -199,7 +238,7 @@ func TestAppendLogValueScalars(t *testing.T) {
 		{name: "positive infinity", value: math.Inf(1), want: "+Inf"},
 		{name: "negative infinity", value: math.Inf(-1), want: "-Inf"},
 		{name: "NaN", value: math.NaN(), want: "NaN"},
-		{name: "slice fallback", value: []int{1, 2}, want: "[1 2]"},
+		{name: "slice fallback", value: []int{1, 2}, want: `"[1 2]"`},
 		{name: "struct fallback", value: struct{ A string }{"x"}, want: "{x}"},
 		{name: "duration fallback", value: 1500 * time.Millisecond, want: "1.5s"},
 	}
@@ -222,9 +261,9 @@ func TestAppendLogValueInterfacesAndPrecedence(t *testing.T) {
 		value any
 		want  string
 	}{
-		{name: "error", value: errors.New("read failed"), want: "read failed"},
-		{name: "custom error", value: logTestError{text: "custom failure"}, want: "custom failure"},
-		{name: "stringer", value: logTestStringer{text: "string value"}, want: "string value"},
+		{name: "error", value: errors.New("read failed"), want: `"read failed"`},
+		{name: "custom error", value: logTestError{text: "custom failure"}, want: `"custom failure"`},
+		{name: "stringer", value: logTestStringer{text: "string value"}, want: `"string value"`},
 		{name: "error precedes stringer", value: logTestErrorStringer{}, want: "error-value"},
 		{name: "formatter", value: logTestFormatter{text: "value"}, want: "formatted<value>"},
 		{name: "formatter precedes error and Stringer", value: logTestFormatterErrorStringer{}, want: "formatter-value"},
@@ -249,13 +288,14 @@ func TestAppendLogValueTypedNilAndPanickingMethods(t *testing.T) {
 	tests := []struct {
 		name  string
 		value any
+		want  string
 	}{
-		{name: "typed nil Stringer", value: nilStringer},
-		{name: "typed nil error", value: nilError},
-		{name: "typed nil Formatter", value: nilFormatter},
-		{name: "panicking Stringer", value: &logTestPanicStringer{}},
-		{name: "panicking error", value: &logTestPanicError{}},
-		{name: "panicking Formatter", value: &logTestPanicFormatter{}},
+		{name: "typed nil Stringer", value: nilStringer, want: "prefix:<nil>"},
+		{name: "typed nil error", value: nilError, want: "prefix:<nil>"},
+		{name: "typed nil Formatter", value: nilFormatter, want: "prefix:<nil>"},
+		{name: "panicking Stringer", value: &logTestPanicStringer{}, want: `prefix:"%!v(PANIC=String method: stringer boom)"`},
+		{name: "panicking error", value: &logTestPanicError{}, want: `prefix:"%!v(PANIC=Error method: error boom)"`},
+		{name: "panicking Formatter", value: &logTestPanicFormatter{}, want: `prefix:"%!v(PANIC=Format method: formatter boom)"`},
 	}
 
 	for _, tt := range tests {
@@ -264,9 +304,8 @@ func TestAppendLogValueTypedNilAndPanickingMethods(t *testing.T) {
 			if recovered != nil {
 				t.Errorf("appendLogValue panicked: %v", recovered)
 			}
-			want := "prefix:" + fmt.Sprint(tt.value)
-			if got != want {
-				t.Errorf("appendLogValue() = %q, want fmt.Sprint-compatible %q", got, want)
+			if got != tt.want {
+				t.Errorf("appendLogValue() = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -320,7 +359,7 @@ func TestAssemblingFailureLoggerReentryDoesNotRecurse(t *testing.T) {
 	defer e.cancelStreams()
 	e.runState.Store(runStateRunning)
 	logger := &logTestReentrantAssemblyLogger{engine: e}
-	e.logger = logger
+	logTestStoreLogger(e, logger)
 
 	if recovered := logTestPanicValue(func() { e.use(func(*Context) {}) }); recovered == nil {
 		t.Fatal("post-Run assembly did not panic")
@@ -354,7 +393,7 @@ func TestStdLoggerEscapesControlCharacters(t *testing.T) {
 
 	logger.Info("line\nbreak", "key\r\n", "value\\literal\x1b[31m", "error", errors.New("bad\nline"))
 
-	want := "INFO line\\nbreak key\\r\\n=value\\\\literal\\x1b[31m error=bad\\nline\n"
+	want := "INFO line\\nbreak \"key\\r\\n\"=value\\\\literal\\x1b[31m error=\"bad\\nline\"\n"
 	if got := out.String(); got != want {
 		t.Fatalf("stdLogger output = %q, want %q", got, want)
 	}
@@ -368,9 +407,9 @@ func TestStdLoggerDoesNotPanicForPanickingValues(t *testing.T) {
 		log  func(stdLogger)
 		want string
 	}{
-		{name: "Info", log: func(l stdLogger) { l.Info("event", "value", &logTestPanicStringer{}) }, want: "INFO event value=%!v(PANIC=String method: stringer boom)\n"},
-		{name: "Warn", log: func(l stdLogger) { l.Warn("event", "value", &logTestPanicError{}) }, want: "WARN event value=%!v(PANIC=Error method: error boom)\n"},
-		{name: "Error", log: func(l stdLogger) { l.Error("event", "value", &logTestPanicFormatter{}) }, want: "ERROR event value=%!v(PANIC=Format method: formatter boom)\n"},
+		{name: "Info", log: func(l stdLogger) { l.Info("event", "value", &logTestPanicStringer{}) }, want: "INFO event value=\"%!v(PANIC=String method: stringer boom)\"\n"},
+		{name: "Warn", log: func(l stdLogger) { l.Warn("event", "value", &logTestPanicError{}) }, want: "WARN event value=\"%!v(PANIC=Error method: error boom)\"\n"},
+		{name: "Error", log: func(l stdLogger) { l.Error("event", "value", &logTestPanicFormatter{}) }, want: "ERROR event value=\"%!v(PANIC=Format method: formatter boom)\"\n"},
 		{name: "typed nil error", log: func(l stdLogger) { l.Error("event", "value", nilError) }, want: "ERROR event value=<nil>\n"},
 		{name: "typed nil Stringer", log: func(l stdLogger) { l.Info("event", "value", nilStringer) }, want: "INFO event value=<nil>\n"},
 	}
@@ -444,17 +483,17 @@ func TestNewStdLoggerUsesPrivateSink(t *testing.T) {
 }
 
 func TestSetLoggerRoutesLevelsAndRejectsNil(t *testing.T) {
-	previous := defaultEngine.logger
+	previous := defaultEngine.logger.Load()
 	previousRunState := defaultEngine.runState.Load()
 	defaultEngine.runState.Store(runStateIdle)
 	t.Cleanup(func() {
-		defaultEngine.logger = previous
+		defaultEngine.logger.Store(previous)
 		defaultEngine.runState.Store(previousRunState)
 	})
 
 	first := &logTestCaptureLogger{}
 	SetLogger(first)
-	if defaultEngine.logger != first {
+	if defaultEngine.currentLogger() != first {
 		t.Fatal("SetLogger did not install the supplied logger")
 	}
 	Info("info event", "key", 1)
@@ -463,7 +502,7 @@ func TestSetLoggerRoutesLevelsAndRejectsNil(t *testing.T) {
 	if recovered := logTestPanicValue(func() { SetLogger(nil) }); recovered == nil {
 		t.Fatal("SetLogger(nil) did not panic")
 	}
-	if defaultEngine.logger != first {
+	if defaultEngine.currentLogger() != first {
 		t.Fatal("rejected SetLogger(nil) replaced the working logger")
 	}
 
@@ -491,11 +530,12 @@ func TestSetLoggerRoutesLevelsAndRejectsNil(t *testing.T) {
 }
 
 func TestSetLoggerIsFrozenAfterRunClaim(t *testing.T) {
-	previous := defaultEngine.logger
+	previous := defaultEngine.logger.Load()
+	previousLogger := defaultEngine.currentLogger()
 	previousRunState := defaultEngine.runState.Load()
 	defaultEngine.runState.Store(runStateRunning)
 	t.Cleanup(func() {
-		defaultEngine.logger = previous
+		defaultEngine.logger.Store(previous)
 		defaultEngine.runState.Store(previousRunState)
 	})
 
@@ -503,7 +543,7 @@ func TestSetLoggerIsFrozenAfterRunClaim(t *testing.T) {
 	if recovered != "gbl.SetLogger must be called before Run; the engine is read-only while serving" {
 		t.Fatalf("SetLogger panic = %#v", recovered)
 	}
-	if defaultEngine.logger != previous {
+	if defaultEngine.currentLogger() != previousLogger {
 		t.Fatal("rejected SetLogger changed the logger")
 	}
 }
@@ -512,11 +552,11 @@ func TestEngineSetLoggerRejectsNilAndFailStartup(t *testing.T) {
 	e := newEngine()
 	defer e.cancelStreams()
 	initial := &logTestCaptureLogger{}
-	e.logger = initial
+	logTestStoreLogger(e, initial)
 	if recovered := logTestPanicValue(func() { e.setLogger(nil) }); recovered == nil {
 		t.Fatal("engine.setLogger(nil) did not panic")
 	}
-	if e.logger != initial {
+	if e.currentLogger() != initial {
 		t.Fatal("rejected engine.setLogger(nil) replaced the logger")
 	}
 

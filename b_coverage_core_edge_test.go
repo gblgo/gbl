@@ -117,6 +117,31 @@ func TestCoreEdgeAcquireParamsGrowsAndClears(t *testing.T) {
 	}
 }
 
+func TestCoreEdgeParamsPoolDropsOversizedSlice(t *testing.T) {
+	originalNew := paramsPool.New
+	paramsPool = sync.Pool{New: func() any {
+		params := make([]reflect.Value, 0, 1)
+		return &params
+	}}
+	t.Cleanup(func() { paramsPool = sync.Pool{New: originalNew} })
+
+	buf, params := acquireParams(maxPooledParamsCapacity + 1)
+	if cap(params) < maxPooledParamsCapacity+1 {
+		t.Fatalf("acquired params capacity = %d, want at least %d", cap(params), maxPooledParamsCapacity+1)
+	}
+	params[0] = reflect.ValueOf("request value")
+	releaseParams(buf, params)
+	if params[0].IsValid() {
+		t.Fatal("oversized params slice retained a request value")
+	}
+
+	probeBuf, probe := acquireParams(1)
+	defer releaseParams(probeBuf, probe)
+	if cap(probe) != 1 {
+		t.Fatalf("pool reused oversized params capacity %d, want bounded capacity 1", cap(probe))
+	}
+}
+
 func TestCoreEdgeAppendStructQueryKeysVisitedAndDeref(t *testing.T) {
 	keys := make(requestKeySet)
 	visited := make(map[reflect.Type]bool)

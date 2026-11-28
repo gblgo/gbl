@@ -45,12 +45,13 @@ const (
 // Logger metadata like any other event.
 func (e *engine) printBanner(cfg *Config, addr net.Addr) {
 	block := e.renderBanner(cfg, addr)
-	if bl, ok := e.logger.(BannerLogger); ok {
+	logger := e.currentLogger()
+	if bl, ok := logger.(BannerLogger); ok {
 		safeLog(func() { bl.Banner(block) })
 	} else {
-		safeLog(func() { e.logger.Info(block) })
+		safeLog(func() { logger.Info(block) })
 	}
-	safeLog(func() { e.logger.Info(startupSuccessMessage) })
+	safeLog(func() { logger.Info(startupSuccessMessage) })
 }
 
 // renderBanner assembles the display block: the logo, then an aligned status
