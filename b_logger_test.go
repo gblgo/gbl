@@ -303,6 +303,33 @@ func TestSetLoggerFailureLogsOutsideAssemblyLock(t *testing.T) {
 	}
 }
 
+type logTestReentrantAssemblyLogger struct {
+	engine *engine
+	calls  int
+}
+
+func (*logTestReentrantAssemblyLogger) Info(string, ...any) {}
+func (*logTestReentrantAssemblyLogger) Warn(string, ...any) {}
+func (l *logTestReentrantAssemblyLogger) Error(string, ...any) {
+	l.calls++
+	l.engine.use(func(*Context) {})
+}
+
+func TestAssemblingFailureLoggerReentryDoesNotRecurse(t *testing.T) {
+	e := newEngine()
+	defer e.cancelStreams()
+	e.runState.Store(runStateRunning)
+	logger := &logTestReentrantAssemblyLogger{engine: e}
+	e.logger = logger
+
+	if recovered := logTestPanicValue(func() { e.use(func(*Context) {}) }); recovered == nil {
+		t.Fatal("post-Run assembly did not panic")
+	}
+	if logger.calls != 1 {
+		t.Fatalf("assembly failure logger calls = %d, want 1", logger.calls)
+	}
+}
+
 func TestStdLoggerLevelsAndBanner(t *testing.T) {
 	var out bytes.Buffer
 	logger := stdLogger{l: log.New(&out, "", 0)}
@@ -325,9 +352,9 @@ func TestStdLoggerEscapesControlCharacters(t *testing.T) {
 	var out bytes.Buffer
 	logger := stdLogger{l: log.New(&out, "", 0)}
 
-	logger.Info("line\nbreak", "key\r\n", "value\x1b[31m", "error", errors.New("bad\nline"))
+	logger.Info("line\nbreak", "key\r\n", "value\\literal\x1b[31m", "error", errors.New("bad\nline"))
 
-	want := "INFO line\\nbreak key\\r\\n=value\\x1b[31m error=bad\\nline\n"
+	want := "INFO line\\nbreak key\\r\\n=value\\\\literal\\x1b[31m error=bad\\nline\n"
 	if got := out.String(); got != want {
 		t.Fatalf("stdLogger output = %q, want %q", got, want)
 	}
