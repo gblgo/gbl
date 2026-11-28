@@ -139,6 +139,14 @@ func TestEngineConfigureMergesOverlappingUpdates(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	done := make(chan any, 1)
+	released := false
+	releaseConfigure := func() {
+		if !released {
+			close(release)
+			released = true
+		}
+	}
+	t.Cleanup(releaseConfigure)
 	go func() {
 		defer func() { done <- recover() }()
 		e.configure(func(c *Config) {
@@ -147,11 +155,20 @@ func TestEngineConfigureMergesOverlappingUpdates(t *testing.T) {
 			<-release
 		})
 	}()
-	<-entered
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("overlapping Configure did not enter its callback")
+	}
 	e.configure(func(c *Config) { c.ReadTimeout = 2 * time.Second })
-	close(release)
-	if recovered := <-done; recovered != nil {
-		t.Fatalf("overlapping Configure panicked: %v", recovered)
+	releaseConfigure()
+	select {
+	case recovered := <-done:
+		if recovered != nil {
+			t.Fatalf("overlapping Configure panicked: %v", recovered)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("overlapping Configure did not finish after release")
 	}
 	if e.cfg.Port != "8080" || e.cfg.ReadTimeout != 2*time.Second {
 		t.Fatalf("overlapping Configure lost updates: %#v", e.cfg)

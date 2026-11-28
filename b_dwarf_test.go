@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"sync"
 	"testing"
@@ -241,6 +242,79 @@ func TestBuildDWARFIndexFromDataScopesAndDuplicates(t *testing.T) {
 	dwarfTestCheckEntry(t, index, otherKey, []string{"other"}, false)
 }
 
+func TestBuildDWARFIndexFromDataAbstractOrigin(t *testing.T) {
+	file := dwarfTestAbsoluteName(t, "abstract-origin.go")
+	originAttr := dwarfTestAttr{attr: dwarf.AttrAbstractOrigin, form: dwarfTestFormSecOffset, val: int64(0)}
+	concrete := dwarfTestSubprogramWithAttrs([]dwarfTestAttr{originAttr})
+	duplicate := dwarfTestSubprogramWithAttrs([]dwarfTestAttr{originAttr})
+	abstract := dwarfTestSubprogram(1, 20,
+		dwarfTestParameter(dwarfTestName("first")),
+		dwarfTestParameter(),
+		dwarfTestParameter(dwarfTestName("third")),
+	)
+	unit := dwarfTestUnit{version: 4, files: []string{file}, dies: []*dwarfTestDIE{concrete, abstract, duplicate}}
+
+	// Resolve the forward reference only after the synthetic DIE layout exists.
+	// DW_FORM_sec_offset has a fixed width, so rebuilding with the discovered
+	// offset preserves every DIE position.
+	reader := dwarfTestData(t, unit).Reader()
+	var origin dwarf.Offset
+	for {
+		entry, err := reader.Next()
+		if err != nil || entry == nil {
+			t.Fatalf("locate abstract origin: entry=%v err=%v", entry, err)
+		}
+		if entry.Tag != dwarf.TagSubprogram {
+			continue
+		}
+		hasDeclLine := false
+		for _, field := range entry.Field {
+			if field.Attr == dwarf.AttrDeclLine {
+				hasDeclLine = true
+			}
+		}
+		if hasDeclLine {
+			origin = entry.Offset
+			break
+		}
+	}
+	concrete.attrs[0].val = int64(origin)
+	duplicate.attrs[0].val = int64(origin)
+	data := dwarfTestData(t, unit)
+	key := file + ":20"
+	for _, targets := range []map[string]struct{}{nil, {key: {}}} {
+		index := buildDWARFIndexFromData(data, targets)
+		if len(index) != 1 {
+			t.Fatalf("abstract-origin index = %v, want one deduplicated entry", index)
+		}
+		dwarfTestCheckEntry(t, index, key, []string{"first", "", "third"}, false)
+	}
+}
+
+func TestDwarfSubprogramOriginCyclesAndMissingTargetsAreBounded(t *testing.T) {
+	first := &dwarf.Entry{Field: []dwarf.Field{{Attr: dwarf.AttrAbstractOrigin, Val: dwarf.Offset(1)}}}
+	second := &dwarf.Entry{Field: []dwarf.Field{{Attr: dwarf.AttrAbstractOrigin, Val: dwarf.Offset(0)}}}
+	firstInfo := &dwarfSubprogramInfo{entry: first}
+	secondInfo := &dwarfSubprogramInfo{entry: second}
+	byOffset := map[dwarf.Offset]*dwarfSubprogramInfo{0: firstInfo, 1: secondInfo}
+	if _, ok := dwarfSubprogramKey(firstInfo, byOffset); ok {
+		t.Fatal("cyclic AbstractOrigin produced a source position")
+	}
+	if names := dwarfSubprogramNames(firstInfo, byOffset); names != nil {
+		t.Fatalf("cyclic AbstractOrigin names = %#v, want nil", names)
+	}
+
+	missing := &dwarfSubprogramInfo{entry: &dwarf.Entry{Field: []dwarf.Field{
+		{Attr: dwarf.AttrAbstractOrigin, Val: dwarf.Offset(99)},
+	}}}
+	if _, ok := dwarfSubprogramKey(missing, byOffset); ok {
+		t.Fatal("missing AbstractOrigin target produced a source position")
+	}
+	if names := dwarfSubprogramNames(missing, byOffset); names != nil {
+		t.Fatalf("missing AbstractOrigin names = %#v, want nil", names)
+	}
+}
+
 func TestBuildDWARFIndexFromDataMalformed(t *testing.T) {
 	file := dwarfTestAbsoluteName(t, "malformed.go")
 	parameter := dwarfTestParameter(dwarfTestName("mustNotBeIndexed"))
@@ -323,6 +397,73 @@ func TestBuildDWARFIndexFromDataMalformed(t *testing.T) {
 	})
 }
 
+func TestOpenMachOFatSelectsCurrentArchitecture(t *testing.T) {
+	cpu, ok := machoCPUForArch(runtime.GOARCH)
+	if !ok {
+		t.Skipf("fat Mach-O selection is not defined for GOARCH %s", runtime.GOARCH)
+	}
+	other := macho.CpuAmd64
+	if cpu == macho.CpuAmd64 {
+		other = macho.CpuArm64
+	}
+	path := filepath.Join(t.TempDir(), "fat.macho")
+	if err := os.WriteFile(path, dwarfTestFatMachO(t, []macho.Cpu{other, cpu}), 0o600); err != nil {
+		t.Fatalf("write fat Mach-O fixture: %v", err)
+	}
+	opened, err := openMachO(path)
+	if err != nil {
+		t.Fatalf("open fat Mach-O: %v", err)
+	}
+	defer opened.Close()
+	selected, ok := opened.(*fatMachOFile)
+	if !ok {
+		t.Fatalf("openMachO returned %T, want fatMachOFile", opened)
+	}
+	if selected.Cpu != cpu {
+		t.Fatalf("selected Mach-O CPU = %v, want current GOARCH CPU %v", selected.Cpu, cpu)
+	}
+	if _, err := selected.DWARF(); err == nil {
+		t.Fatal("thin fixture without debug sections unexpectedly produced DWARF")
+	}
+}
+
+func TestMachoCPUForArch(t *testing.T) {
+	tests := []struct {
+		arch string
+		cpu  macho.Cpu
+		ok   bool
+	}{
+		{arch: "amd64", cpu: macho.CpuAmd64, ok: true},
+		{arch: "arm64", cpu: macho.CpuArm64, ok: true},
+		{arch: "386", cpu: macho.Cpu386, ok: true},
+		{arch: "arm", cpu: macho.CpuArm, ok: true},
+		{arch: "mips", cpu: 0, ok: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.arch, func(t *testing.T) {
+			cpu, ok := machoCPUForArch(tt.arch)
+			if cpu != tt.cpu || ok != tt.ok {
+				t.Fatalf("machoCPUForArch(%q) = (%v, %t), want (%v, %t)", tt.arch, cpu, ok, tt.cpu, tt.ok)
+			}
+		})
+	}
+}
+
+func TestOpenMachOForArchRejectsUnsupportedAndMissingSlices(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "amd64.macho")
+	if err := os.WriteFile(path, dwarfTestFatMachO(t, []macho.Cpu{macho.CpuAmd64}), 0o600); err != nil {
+		t.Fatalf("write fat Mach-O fixture: %v", err)
+	}
+	if opened, err := openMachOForArch(path, "mips"); err == nil {
+		_ = opened.Close()
+		t.Fatal("unsupported Mach-O architecture unexpectedly opened")
+	}
+	if opened, err := openMachOForArch(path, "arm64"); err == nil {
+		_ = opened.Close()
+		t.Fatal("missing Mach-O architecture slice unexpectedly opened")
+	}
+}
+
 func TestOpenSelfDWARFContainerErrors(t *testing.T) {
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "missing.exe")
@@ -401,7 +542,7 @@ func dwarfTestBuildFixtureData(ctx context.Context) (*dwarf.Data, dwarfFixturePo
 	}
 	executable := filepath.Join(dir, "fixture.exe")
 	cmd := exec.CommandContext(ctx, "go", "build",
-		"-gcflags=all=-l",
+		"-gcflags=-l",
 		"-ldflags=-s=false -w=false -compressdwarf=false",
 		"-o", executable, source,
 	)
@@ -783,11 +924,59 @@ func dwarfTestELFWithoutDWARF(t *testing.T) []byte {
 	return dwarfTestEncode(t, header)
 }
 
+func dwarfTestMachOHeader(t *testing.T, cpu macho.Cpu) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	if err := binary.Write(&out, binary.BigEndian, macho.FileHeader{
+		Magic: macho.Magic64,
+		Cpu:   cpu,
+		Type:  macho.TypeExec,
+	}); err != nil {
+		t.Fatalf("encode Mach-O header: %v", err)
+	}
+	out.Write([]byte{0, 0, 0, 0}) // Reserved field required by the 64-bit header.
+	return out.Bytes()
+}
+
+func dwarfTestFatMachO(t *testing.T, cpus []macho.Cpu) []byte {
+	t.Helper()
+	const align = uint32(12)
+	headerSize := 8 + len(cpus)*binary.Size(macho.FatArchHeader{})
+	offset := (headerSize + (1 << align) - 1) &^ ((1 << align) - 1)
+	thin := make([][]byte, len(cpus))
+	offsets := make([]int, len(cpus))
+	for i, cpu := range cpus {
+		thin[i] = dwarfTestMachOHeader(t, cpu)
+		offset = (offset + (1 << align) - 1) &^ ((1 << align) - 1)
+		offsets[i] = offset
+		offset += len(thin[i])
+	}
+	var out bytes.Buffer
+	if err := binary.Write(&out, binary.BigEndian, macho.MagicFat); err != nil {
+		t.Fatal(err)
+	}
+	if err := binary.Write(&out, binary.BigEndian, uint32(len(cpus))); err != nil {
+		t.Fatal(err)
+	}
+	for i, cpu := range cpus {
+		if err := binary.Write(&out, binary.BigEndian, macho.FatArchHeader{
+			Cpu: cpu, Offset: uint32(offsets[i]), Size: uint32(len(thin[i])), Align: align,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out.Grow(offset)
+	for i, image := range thin {
+		if out.Len() > offsets[i] {
+			t.Fatalf("fat Mach-O offset %d overlaps preceding image", offsets[i])
+		}
+		out.Write(make([]byte, offsets[i]-out.Len()))
+		out.Write(image)
+	}
+	return out.Bytes()
+}
+
 func dwarfTestMachOWithoutDWARF(t *testing.T) []byte {
 	t.Helper()
-	return dwarfTestEncode(t, macho.FileHeader{
-		Magic: macho.Magic64,
-		Cpu:   macho.CpuAmd64,
-		Type:  macho.TypeExec,
-	})
+	return dwarfTestMachOHeader(t, macho.CpuAmd64)
 }

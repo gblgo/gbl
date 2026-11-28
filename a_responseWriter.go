@@ -6,6 +6,7 @@ package gbl
 
 import (
 	"bufio"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -183,6 +184,22 @@ func (rw *pooledResponseWriter) Write(data []byte) (int, error) {
 	return n, err
 }
 
+// WriteString preserves Write's state-machine semantics while avoiding a
+// string-to-byte conversion when the underlying writer supports io.StringWriter.
+func (rw *pooledResponseWriter) WriteString(data string) (int, error) {
+	if rw.hijackedStatus {
+		return 0, http.ErrHijacked
+	}
+	rw.writtenStatus = true
+	rw.writeHeader()
+	if len(data) > 0 && !bodyAllowedForStatus(rw.status()) {
+		return 0, http.ErrBodyNotAllowed
+	}
+	n, err := io.WriteString(rw.w, data)
+	rw.bytesWritten += n
+	return n, err
+}
+
 // status reports the response code as it stands or was sent: the recorded one
 // once WriteHeader has run, otherwise net/http implicit 200 default.
 func (rw *pooledResponseWriter) status() int {
@@ -192,8 +209,8 @@ func (rw *pooledResponseWriter) status() int {
 	return http.StatusOK
 }
 
-// bodyAllowedForStatus mirrors the net/http rule that informational, 204, 205 and
-// 304 responses cannot carry a body.
+// bodyAllowedForStatus rejects bodies for informational responses and the three
+// final statuses whose RFC semantics forbid a response body.
 func bodyAllowedForStatus(code int) bool {
 	return code >= http.StatusOK && code != http.StatusNoContent &&
 		code != http.StatusResetContent && code != http.StatusNotModified
@@ -204,6 +221,11 @@ func resetRepresentationHeaders(header http.Header) {
 	header.Del(contentEncoding)
 	header.Del("Content-Length")
 	header.Del("Etag")
+	header.Del("Content-Range")
+	header.Del("Content-MD5")
+	header.Del("Digest")
+	header.Del("Content-Digest")
+	header.Del("Repr-Digest")
 }
 
 // size reports how many body bytes have been written so far.
@@ -240,6 +262,9 @@ func (rw *pooledResponseWriter) writeHeader() {
 	if !rw.headedStatus {
 		rw.headedStatus = true
 		rw.statusCode = http.StatusOK
+	}
+	if rw.statusCode == http.StatusResetContent {
+		rw.Header().Del("Content-Length")
 	}
 	rw.w.WriteHeader(rw.statusCode)
 }
@@ -291,9 +316,14 @@ func supportsFlush(w http.ResponseWriter) bool {
 }
 
 // Hijack forwards connection ownership when the underlying sink supports it.
+// An explicitly staged final status is committed first; a bare hijack does not
+// invent a 200 response.
 func (rw *pooledResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if rw.hijackedStatus {
 		return nil, nil, http.ErrHijacked
+	}
+	if rw.headedStatus && !rw.flushedStatus {
+		rw.writeHeader()
 	}
 	conn, buffered, err := http.NewResponseController(rw.w).Hijack()
 	if err != nil {

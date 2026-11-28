@@ -68,6 +68,28 @@ func TestDecodeJSONFieldsListIntoAllocations(t *testing.T) {
 	}
 }
 
+func TestDecodeJSONFieldsTableIntoAllocations(t *testing.T) {
+	body := []byte(`{"id":42,"name":"alice","enabled":true,"city":"GZ","country":"CN","email":"a@example.com","phone":"1","status":"ok","role":"user","noise":"ignored"}`)
+	keys := []string{"id", "name", "enabled", "city", "country", "email", "phone", "status", "role"}
+	table := buildJSONKeyTable(keys)
+	if table == nil {
+		t.Fatal("JSON key table was not built for a large parameter list")
+	}
+	fields := acquireJSONFields(len(keys))
+	defer releaseJSONFields(fields)
+	var decodeErr error
+	allocations := testing.AllocsPerRun(100, func() {
+		clear(fields.values)
+		decodeErr = decodeJSONFieldsInto(body, keys, table, fields.values)
+	})
+	if decodeErr != nil {
+		t.Fatalf("decode JSON fields through table: %v", decodeErr)
+	}
+	if allocations != 0 {
+		t.Fatalf("JSON key-table field selection allocations = %.0f, want 0", allocations)
+	}
+}
+
 func TestContextValidatablePointerModeAvoidsBoxing(t *testing.T) {
 	value := ctxTestValidatable{Name: "value"}
 	addressable := reflect.ValueOf(&value).Elem()

@@ -44,29 +44,16 @@ var goTestBinary bool
 // runningUnderGoTest reports whether the current process is a Go test binary.
 func runningUnderGoTest() bool {
 	goTestBinaryOnce.Do(func() {
-		goTestBinary = isGoTestBinary(flag.Lookup("test.v") != nil, os.Args)
+		goTestBinary = flag.Lookup("test.v") != nil
 	})
 	return goTestBinary
 }
 
-// isGoTestBinary recognizes standard and custom-named Go test binaries.
-func isGoTestBinary(testFlags bool, args []string) bool {
-	if testFlags {
-		return true
-	}
-	if len(args) == 0 {
-		return false
-	}
-	name := args[0]
-	if strings.HasSuffix(name, ".test") || strings.HasSuffix(name, ".test.exe") {
-		return true
-	}
-	for _, arg := range args[1:] {
-		if strings.HasPrefix(arg, "-test.") {
-			return true
-		}
-	}
-	return false
+// isGoTestBinary recognizes only the positive testing-runtime flag. Executable
+// names and argv prefixes are not reliable because production programs can use
+// the same strings.
+func isGoTestBinary(testFlags bool, _ []string) bool {
+	return testFlags
 }
 
 // resolveParamNames uses DWARF in production and permits source recovery only in tests.

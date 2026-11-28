@@ -5,9 +5,16 @@
 package gbl
 
 import (
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
+)
+
+var (
+	errRequestPathTooManySegments = errors.New("request path has too many segments")
+	errRequestPathEncodedSlash    = errors.New("request path contains an encoded slash")
 )
 
 // routeNode is one segment in a method routing tree. A path is matched by
@@ -191,6 +198,62 @@ func normalizePathBytes(dst []byte, segments []string) []byte {
 	return dst
 }
 
+// normalizeRequestPath gives routing and middleware the same path view while
+// preserving RequestURI as the original request target for logging.
+func normalizeRequestPath(r *http.Request) error {
+	if hasEncodedPathSlash(r.URL.RawPath) {
+		return errRequestPathEncodedSlash
+	}
+	if len(r.URL.Path) > maxRoutePathSegments*2 && pathExceedsSegmentLimit(r.URL.Path) {
+		return errRequestPathTooManySegments
+	}
+	if r.URL.Path == slash || isNormalized(r.URL.Path) {
+		return nil
+	}
+
+	bufPool := segmentPool.Get().(*[]string)
+	segments, _ := splitPathIntoLimited((*bufPool)[:0], r.URL.Path)
+	pathBuf := pathBufPool.Get().(*[]byte)
+	normalized := normalizePathBytes((*pathBuf)[:0], segments)
+	if len(normalized) == 0 {
+		normalized = append(normalized, '/')
+	}
+	path := string(normalized)
+	releasePathBytes(pathBuf, normalized)
+	releaseSegments(bufPool, segments)
+	r.URL.Path = path
+	r.URL.RawPath = empty
+	return nil
+}
+
+func pathExceedsSegmentLimit(path string) bool {
+	segments := 0
+	for i := 0; i < len(path); {
+		if path[i] == '/' {
+			i++
+			continue
+		}
+		segments++
+		if segments > maxRoutePathSegments {
+			return true
+		}
+		for i < len(path) && path[i] != '/' {
+			i++
+		}
+	}
+	return false
+}
+
+func hasEncodedPathSlash(rawPath string) bool {
+	for i := 0; i+2 < len(rawPath); i++ {
+		if rawPath[i] == '%' && rawPath[i+1] == '2' &&
+			(rawPath[i+2] == 'f' || rawPath[i+2] == 'F') {
+			return true
+		}
+	}
+	return false
+}
+
 // releasePathBytes pools bounded normalization storage.
 func releasePathBytes(bufPool *[]byte, buffer []byte) {
 	if cap(buffer) > maxPooledPathBytes {
@@ -217,6 +280,48 @@ func splitPathInto(dst []string, path string) []string {
 	}
 }
 
+// splitPathIntoLimited stops before allocating a segment beyond the router's
+// maximum depth. The boolean reports whether the whole path fit.
+func splitPathIntoLimited(dst []string, path string) ([]string, bool) {
+	for {
+		for len(path) > 0 && path[0] == '/' {
+			path = path[1:]
+		}
+		if len(path) == 0 {
+			return dst, true
+		}
+		if len(dst) >= maxRoutePathSegments {
+			return dst, false
+		}
+		var segment string
+		segment, path, _ = strings.Cut(path, slash)
+		dst = append(dst, segment)
+	}
+}
+
+// matchRequestNode preserves the exact-static fast path while ensuring every
+// path that reaches middleware has already been normalized.
+func (e *engine) matchRequestNode(method httpMethod, r *http.Request,
+	params map[string]string) (*routeHandler, map[string]string, error) {
+	if hasEncodedPathSlash(r.URL.RawPath) {
+		return nil, params, errRequestPathEncodedSlash
+	}
+	path := r.URL.Path
+	if handler, ok := e.staticRoutes[method][path]; ok {
+		return handler, params, nil
+	}
+	if method == methodHead {
+		if handler, ok := e.staticRoutes[methodGet][path]; ok {
+			return handler, params, nil
+		}
+	}
+	if err := normalizeRequestPath(r); err != nil {
+		return nil, params, err
+	}
+	handler, params := e.matchNode(method, r.URL.Path, params)
+	return handler, params, nil
+}
+
 // matchNode finds the handler registered for method and path, filling params
 // with any bound path-variable values along the way. It returns nil when the
 // method has no tree yet or nothing under it matches. params may be nil; the
@@ -240,7 +345,11 @@ func (e *engine) matchNode(
 
 	if len(statics) > 0 && !isNormalized(path) {
 		segmentBuf := segmentPool.Get().(*[]string)
-		segments := splitPathInto((*segmentBuf)[:0], path)
+		segments, ok := splitPathIntoLimited((*segmentBuf)[:0], path)
+		if !ok {
+			releaseSegments(segmentBuf, segments)
+			return nil, params
+		}
 		pathBuf := pathBufPool.Get().(*[]byte)
 		normalized := normalizePathBytes((*pathBuf)[:0], segments)
 		handler, ok := statics[string(normalized)]
@@ -261,8 +370,8 @@ func (e *engine) matchNode(
 		params = pathParamsPool.Get().(map[string]string)
 	}
 	bufPool := segmentPool.Get().(*[]string)
-	segments := splitPathInto((*bufPool)[:0], path)
-	if len(segments) > maxRoutePathSegments {
+	segments, ok := splitPathIntoLimited((*bufPool)[:0], path)
+	if !ok {
 		releaseSegments(bufPool, segments)
 		return nil, params
 	}

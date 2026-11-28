@@ -43,9 +43,9 @@ func (b *requestStreamingChunkBody) Close() error {
 	return nil
 }
 
-func TestPrepareRequestBodyNormalizesBodyMethods(t *testing.T) {
+func TestPrepareRequestBodyAcceptsOnlyCanonicalBodyMethods(t *testing.T) {
 	requestTestLimits(t, 4, 8, 128)
-	for _, method := range []string{"post", "put", "patch", "PoSt", "pUt", "pAtCh"} {
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch} {
 		t.Run(method, func(t *testing.T) {
 			body := &requestStreamingChunkBody{chunks: []string{"data"}}
 			r := httptest.NewRequest(method, "/", body)
@@ -56,6 +56,19 @@ func TestPrepareRequestBodyNormalizesBodyMethods(t *testing.T) {
 			}
 			if body.reads != 0 {
 				t.Fatalf("body reads = %d, want 0 before rejection", body.reads)
+			}
+		})
+	}
+	for _, method := range []string{"post", "PoSt", "pUt", "pAtCh"} {
+		t.Run(method+" is not a body method", func(t *testing.T) {
+			body := &requestStreamingChunkBody{chunks: []string{"data"}}
+			r := httptest.NewRequest(method, "/", body)
+			r.ContentLength = 5
+			if err := prepareRequestBody(httptest.NewRecorder(), r); err != nil {
+				t.Fatalf("prepareRequestBody(%q) = %v, want nil", method, err)
+			}
+			if r.Body != body || body.reads != 0 {
+				t.Fatalf("non-canonical method body was prepared or read: body=%p reads=%d", r.Body, body.reads)
 			}
 		})
 	}
@@ -117,7 +130,7 @@ func TestRawUnknownBodyStreamsFirstChunkAndBoundsReads(t *testing.T) {
 
 func TestRawKnownOversizeBodyIsRejectedBeforeHandler(t *testing.T) {
 	requestTestLimits(t, 8, 8, 128)
-	for _, method := range []string{"post", "put", "patch"} {
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch} {
 		t.Run(method, func(t *testing.T) {
 			called := false
 			e := requestTestEngine(t, method, "/raw", func(*http.Request) string {

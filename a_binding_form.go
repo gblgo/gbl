@@ -466,7 +466,7 @@ func bindTextValue(t reflect.Type, values []string) (reflect.Value, error) {
 // bindTextValueDepth bounds pointer recursion for path and scalar binding.
 func bindTextValueDepth(t reflect.Type, values []string, depth int) (reflect.Value, error) {
 	if len(values) == 0 {
-		return reflect.Zero(t), nil
+		return reflect.New(t).Elem(), nil
 	}
 	if t.Kind() == reflect.Pointer && depth >= maxTypePointerDepth {
 		return reflect.Value{}, fmt.Errorf("recursive pointer type: %s", t)

@@ -668,6 +668,122 @@ func TestCORSVarySurvivesHandlerOverride(t *testing.T) {
 	}
 }
 
+func TestCORSPolicyHeadersCannotBeOverriddenAtCommit(t *testing.T) {
+	for _, mode := range []string{"writeback", "write", "write-string", "flush", "status"} {
+		t.Run(mode, func(t *testing.T) {
+			e := newEngine()
+			t.Cleanup(e.cancelStreams)
+			e.use(func(c *Context) {
+				overwrite := func() {
+					c.writer.Header().Set(accessControlAllowOrigin, "https://attacker.example")
+					c.writer.Header().Set(accessControlAllowCredentials, "false")
+					c.writer.Header().Set(accessControlExposeHeaders, "X-Attacker")
+				}
+				overwrite()
+				c.Next()
+				overwrite()
+				switch mode {
+				case "write":
+					_, _ = c.writer.Write([]byte("direct"))
+					c.Abort()
+				case "write-string":
+					_, _ = io.WriteString(c.writer, "direct")
+					c.Abort()
+				case "flush":
+					_ = http.NewResponseController(c.writer).Flush()
+					c.Abort()
+				case "status":
+					c.writer.WriteHeader(http.StatusAccepted)
+					c.Abort()
+				}
+			})
+			e.register(methodGet, "/test", func() string { return "ok" })
+			e.useCors(mwTestCORSConfig())
+			e.generateRoute()
+
+			rec := mwTestCORSRequest(e.buildHandler(), http.MethodGet, "https://app.example.test", nil)
+			if got := rec.Header().Get(accessControlAllowOrigin); got != "https://app.example.test" {
+				t.Errorf("Allow-Origin = %q, want configured origin", got)
+			}
+			if got := rec.Header().Get(accessControlAllowCredentials); got != headerTrue {
+				t.Errorf("Allow-Credentials = %q, want true", got)
+			}
+			if got := rec.Header().Get(accessControlExposeHeaders); got != "X-Response-Id, X-Rate-Limit" {
+				t.Errorf("Expose-Headers = %q, want configured list", got)
+			}
+		})
+	}
+
+	t.Run("disabled policy headers are removed", func(t *testing.T) {
+		e := newEngine()
+		t.Cleanup(e.cancelStreams)
+		e.use(func(c *Context) {
+			c.Next()
+			c.writer.Header().Set(accessControlAllowCredentials, headerTrue)
+			c.writer.Header().Set(accessControlExposeHeaders, "X-Attacker")
+			_, _ = io.WriteString(c.writer, "direct")
+			c.Abort()
+		})
+		e.register(methodGet, "/test", func() string { return "ok" })
+		config := mwTestCORSConfig()
+		config.AllowCredentials = false
+		config.ExposedHeaders = nil
+		e.useCors(config)
+		e.generateRoute()
+
+		rec := mwTestCORSRequest(e.buildHandler(), http.MethodGet, "https://app.example.test", nil)
+		if rec.Header().Get(accessControlAllowCredentials) != empty || rec.Header().Get(accessControlExposeHeaders) != empty {
+			t.Fatalf("disabled policy headers survived commit: %v", rec.Header())
+		}
+	})
+}
+
+func TestCORSPreflightRepeatedHeaderLines(t *testing.T) {
+	newRequest := func(handler http.Handler, lines ...string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodOptions, "http://example.test/test", nil)
+		req.Header.Set(headerOrigin, "https://app.example.test")
+		req.Header.Set(accessControlRequestMethod, http.MethodPost)
+		for _, line := range lines {
+			req.Header.Add(accessControlRequestHeaders, line)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	t.Run("forbidden header on a later line", func(t *testing.T) {
+		rec := newRequest(mwTestCORSHandler(t, mwTestCORSConfig()), "Content-Type", "X-Forbidden")
+		if rec.Code != http.StatusForbidden || rec.Body.String() != corsHeaderNotAllowed+"\n" {
+			t.Fatalf("repeated header response = %d %q, want 403 header rejection", rec.Code, rec.Body.String())
+		}
+	})
+
+	allowed := make([]string, corsMaxPreflightHeaders+1)
+	for i := range allowed {
+		allowed[i] = fmt.Sprintf("X-Header-%d", i)
+	}
+	config := mwTestCORSConfig()
+	config.AllowedHeaders = allowed
+	handler := mwTestCORSHandler(t, config)
+	split := corsMaxPreflightHeaders/2 + 1
+	first := strings.Join(allowed[:split], ",")
+	second := strings.Join(allowed[split:corsMaxPreflightHeaders], ",")
+
+	t.Run("exactly 128 across lines", func(t *testing.T) {
+		rec := newRequest(handler, first, second)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("128-header response = %d %q, want 204", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("129 across lines", func(t *testing.T) {
+		rec := newRequest(handler, first, second+","+allowed[corsMaxPreflightHeaders])
+		if rec.Code != http.StatusForbidden || rec.Body.String() != corsHeaderNotAllowed+"\n" {
+			t.Fatalf("129-header response = %d %q, want 403 header rejection", rec.Code, rec.Body.String())
+		}
+	})
+}
+
 func TestCORSPreflightAllowLists(t *testing.T) {
 	for _, size := range []int{2, corsLinearScanLimit + 1} {
 		t.Run(fmt.Sprintf("list size %d", size), func(t *testing.T) {

@@ -88,6 +88,37 @@ func TestMiddlewareEdgeCompressSequentialResponsesStayIsolated(t *testing.T) {
 	}
 }
 
+func TestMiddlewareEdgeCompressResetsWriterBeforePooling(t *testing.T) {
+	var captured *gzip.Writer
+	var staged []byte
+	coverageSeamReplace(t, &gzipWriteAndClose, func(w io.WriteCloser, data []byte) (error, error) {
+		captured = w.(*gzip.Writer)
+		return writeGzipAndClose(w, data)
+	})
+	e := mwTestNewEngine(t, func() string { return strings.Repeat("compressible reset payload\n", 128) },
+		func(c *Context) {
+			c.Next()
+			staged = c.bytes
+		},
+		Compress(DefaultCompression),
+	)
+	rec := mwTestGzipResponse(e, encodingGzip)
+	if rec.Header().Get(contentEncoding) != encodingGzip || captured == nil || len(staged) == 0 {
+		t.Fatalf("compression did not produce a captured writer: header=%q writer=%p staged=%d", rec.Header().Get(contentEncoding), captured, len(staged))
+	}
+	before := bytes.Clone(staged)
+	if _, err := captured.Write([]byte("after pooling")); err != nil {
+		t.Fatalf("pooled gzip writer was not reset after Close: %v", err)
+	}
+	if err := captured.Close(); err != nil {
+		t.Fatalf("close reset gzip writer: %v", err)
+	}
+	captured.Reset(io.Discard)
+	if !bytes.Equal(staged, before) {
+		t.Fatal("pooled gzip writer retained the released response buffer")
+	}
+}
+
 func TestMiddlewareEdgeCompressWriterFailures(t *testing.T) {
 	writeFailure := errors.New("injected gzip write failure")
 	closeFailure := errors.New("injected gzip close failure")

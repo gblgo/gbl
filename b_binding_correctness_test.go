@@ -1057,14 +1057,16 @@ func TestFilterExactJSONValueContainersAndOrder(t *testing.T) {
 func TestRecursivePointerAllocatesForLeafSources(t *testing.T) {
 	typ := reflect.TypeFor[*CorrectnessRecursiveNode]()
 	for _, tc := range []struct {
-		name string
-		src  nameSources
-		want int
+		name    string
+		src     nameSources
+		want    int
+		wantNil bool
 	}{
 		{name: "form leaf", src: nameSources{form: url.Values{"value": {"7"}}}, want: 7},
+		{name: "zero leaf is still present", src: nameSources{form: url.Values{"value": {"0"}}}},
 		{name: "path leaf", src: nameSources{path: map[string]string{"value": "8"}}, want: 8},
-		{name: "no leaf"},
-		{name: "recursive edge is not a leaf", src: nameSources{form: url.Values{"next": {"present"}}}},
+		{name: "no leaf", wantNil: true},
+		{name: "recursive edge is not a leaf", src: nameSources{form: url.Values{"next": {"present"}}}, wantNil: true},
 		{name: "cycle is stopped", src: nameSources{form: url.Values{"value": {"9"}, "next": {"present"}}}, want: 9},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1072,7 +1074,7 @@ func TestRecursivePointerAllocatesForLeafSources(t *testing.T) {
 			if err != nil {
 				t.Fatalf("bind recursive pointer: %v", err)
 			}
-			if tc.want == 0 {
+			if tc.wantNil {
 				if !value.IsNil() {
 					t.Fatalf("recursive pointer without a leaf = %#v, want nil", value.Interface())
 				}

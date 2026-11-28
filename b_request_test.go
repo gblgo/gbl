@@ -62,7 +62,7 @@ func (*requestTestReadCounter) Close() error { return nil }
 func requestTestEngine(t *testing.T, method, path string, fn any, names []string, middleware ...HandlerFunc) *engine {
 	t.Helper()
 	e := newEngine()
-	e.logger = requestTestLogger{}
+	logTestStoreLogger(e, requestTestLogger{})
 	t.Cleanup(e.cancelStreams)
 
 	m, ok := methodOf(method)
@@ -677,6 +677,33 @@ func TestRequestRawUnknownBodyEnforcesLimitWhileStreaming(t *testing.T) {
 	}
 }
 
+func TestMultipartBoundaryFast(t *testing.T) {
+	if boundary, ok := multipartBoundaryFast("multipart/form-data; boundary=abc-123"); !ok || boundary != "abc-123" {
+		t.Fatalf("fast boundary = (%q, %t), want abc-123", boundary, ok)
+	}
+	for _, header := range []string{
+		"Multipart/Form-Data; boundary=abc",
+		`multipart/form-data; boundary="abc"`,
+		"multipart/form-data; boundary=",
+		"multipart/form-data; boundary=bad;boundary",
+	} {
+		if boundary, ok := multipartBoundaryFast(header); ok {
+			t.Fatalf("multipartBoundaryFast(%q) = %q, want fallback", header, boundary)
+		}
+	}
+}
+
+func TestMultipartReplayBody(t *testing.T) {
+	body := &multipartReplayBody{data: []byte("abc")}
+	data, err := io.ReadAll(body)
+	if err != nil || string(data) != "abc" {
+		t.Fatalf("replay read = (%q, %v), want abc", data, err)
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("replay Close: %v", err)
+	}
+}
+
 func TestRequestMultipartMemoryThresholdAndCleanup(t *testing.T) {
 	requestTestLimits(t, 4096, 1, 128)
 	tempDir := requestTestIsolateTempDir(t)
@@ -721,6 +748,19 @@ func TestRequestMultipartFileLimitCleansSpilledFiles(t *testing.T) {
 		requestTestAssertTempDirEmpty(t, tempDir)
 	})
 
+	t.Run("pre-scan rejects before multipart parser", func(t *testing.T) {
+		requestTestLimits(t, 4096, 1, 8)
+		tempDir := requestTestIsolateTempDir(t)
+		r, _ := requestTestNewMultipart(t, "/upload", nil, requestTestUpload{
+			field: "upload", filename: "large.txt", body: []byte("123456789"),
+		})
+		_, _, _, _, err := requestTestParse(t, r, nil)
+		if !errors.Is(err, requestBodyTooLargeError) {
+			t.Fatalf("per-file pre-scan error = %v, want requestBodyTooLargeError", err)
+		}
+		requestTestAssertTempDirEmpty(t, tempDir)
+	})
+
 	t.Run("over limit", func(t *testing.T) {
 		requestTestLimits(t, 4096, 1, 8)
 		tempDir := requestTestIsolateTempDir(t)
@@ -736,6 +776,18 @@ func TestRequestMultipartFileLimitCleansSpilledFiles(t *testing.T) {
 		}
 		requestTestAssertTempDirEmpty(t, tempDir)
 	})
+}
+
+func TestRequestMultipartProbeDoesNotTrustContentLength(t *testing.T) {
+	requestTestLimits(t, 4096, 128, 8)
+	r, _ := requestTestNewMultipart(t, "/upload", nil, requestTestUpload{
+		field: "file", filename: "large.txt", body: []byte("123456789"),
+	})
+	r.ContentLength = 1
+	_, _, _, _, err := requestTestParse(t, r, nil)
+	if !errors.Is(err, requestBodyTooLargeError) {
+		t.Fatalf("undersized ContentLength error = %v, want requestBodyTooLargeError", err)
+	}
 }
 
 func TestRequestMultipartPipelineShapesAndCleanup(t *testing.T) {
@@ -929,6 +981,61 @@ func TestMultipartReadTrackerRestoresOriginalBody(t *testing.T) {
 		t.Fatalf("multipart form = %#v", form)
 	}
 	releasePooledForm(form)
+}
+
+func TestMultipartMalformedQueryDoesNotRejectUpload(t *testing.T) {
+	requestTestLimits(t, 4096, 128, 128)
+	r, _ := requestTestNewMultipart(t, "/upload", url.Values{"name": {"body"}}, requestTestUpload{
+		field: "file", filename: "a.txt", body: []byte("content"),
+	})
+	r.URL.RawQuery = "unrelated=%zz"
+	r.RequestURI = "/upload?unrelated=%zz"
+	form, files, _, _, err := requestTestParse(t, r, []string{"name", "file"})
+	if err != nil {
+		t.Fatalf("multipart with malformed unrelated query: %v", err)
+	}
+	if form.Get("name") != "body" || len(files["file"]) != 1 {
+		t.Fatalf("multipart form/files = (%#v, %#v), want body field and upload", form, files)
+	}
+}
+
+func TestValidateMultipartFileSizesRejectsMalformedBodies(t *testing.T) {
+	const boundary = "boundary"
+	for _, body := range []string{
+		"not multipart",
+		"--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n\r\nabc",
+	} {
+		if err := validateMultipartFileSizes([]byte(body), boundary, 8); err == nil {
+			t.Fatalf("validateMultipartFileSizes(%q) unexpectedly succeeded", body)
+		}
+	}
+}
+
+func TestRequestMultipartPreScanClassifiesMalformedBody(t *testing.T) {
+	requestTestLimits(t, 128, 8, 8)
+	r := httptest.NewRequest(http.MethodPost, "/upload", strings.NewReader("not multipart"))
+	r.Header.Set(contentType, multipartFormData+"; boundary=boundary")
+	_, _, _, _, err := requestTestParse(t, r, nil)
+	var clientErr *requestClientError
+	if !errors.As(err, &clientErr) {
+		t.Fatalf("malformed multipart error = %T %v, want requestClientError", err, err)
+	}
+}
+
+func TestRequestMultipartRejectsPreparsedOversizedHeader(t *testing.T) {
+	requestTestLimits(t, 4096, 128, 8)
+	r, _ := requestTestNewMultipart(t, "/upload", nil, requestTestUpload{
+		field: "file", filename: "small.txt", body: []byte("small"),
+	})
+	preparsed := &multipart.Form{File: map[string][]*multipart.FileHeader{
+		"file": {{Filename: "large.txt", Size: 9}},
+	}}
+	r.MultipartForm = preparsed
+	t.Cleanup(func() { _ = preparsed.RemoveAll() })
+	_, _, _, _, err := requestTestParse(t, r, nil)
+	if !errors.Is(err, requestBodyTooLargeError) {
+		t.Fatalf("preparsed oversized header error = %v, want requestBodyTooLargeError", err)
+	}
 }
 
 func TestMultipartStorageErrorsRemainInternal(t *testing.T) {

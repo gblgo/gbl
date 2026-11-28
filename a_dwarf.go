@@ -9,7 +9,10 @@ import (
 	"debug/elf"
 	"debug/macho"
 	"debug/pe"
+	"fmt"
 	"os"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -64,9 +67,9 @@ var (
 )
 
 // buildDWARFIndexFor indexes only targets when non-nil. It skips compilation
-// units without a target file and skips every non-target subprogram subtree,
-// while still visiting all matching entries so duplicate positions are marked
-// ambiguous. A nil target set requests the compatibility full index.
+// units without a target file, retains subprogram metadata in matching units so
+// AbstractOrigin references can be resolved, and emits only target positions.
+// A nil target set requests the compatibility full index.
 func buildDWARFIndexFor(targets map[string]struct{}) map[string]dwarfParamNames {
 	exe, err := osExecutable()
 	if err != nil {
@@ -77,6 +80,80 @@ func buildDWARFIndexFor(targets map[string]struct{}) map[string]dwarfParamNames 
 		return nil
 	}
 	return buildDWARFIndexFromData(data, targets)
+}
+
+// dwarfSubprogramInfo retains one subprogram's declaration context and direct
+// input names until forward AbstractOrigin references can be resolved.
+type dwarfSubprogramInfo struct {
+	entry *dwarf.Entry
+	files []*dwarf.LineFile
+	names []string
+}
+
+func dwarfSubprogramOrigin(entry *dwarf.Entry) (dwarf.Offset, bool) {
+	for _, field := range entry.Field {
+		if field.Attr == dwarf.AttrAbstractOrigin {
+			origin, ok := field.Val.(dwarf.Offset)
+			return origin, ok
+		}
+	}
+	return 0, false
+}
+
+func dwarfSubprogramDeclKey(entry *dwarf.Entry, files []*dwarf.LineFile) (string, bool) {
+	var declFile, declLine int64
+	hasDeclFile := false
+	for _, field := range entry.Field {
+		switch field.Attr {
+		case dwarf.AttrDeclFile:
+			if v, ok := field.Val.(int64); ok {
+				declFile = v
+				hasDeclFile = true
+			}
+		case dwarf.AttrDeclLine:
+			if v, ok := field.Val.(int64); ok {
+				declLine = v
+			}
+		}
+	}
+	if !hasDeclFile || declFile < 0 || declFile >= int64(len(files)) ||
+		files[declFile] == nil || declLine <= 0 {
+		return empty, false
+	}
+	return files[declFile].Name + colon + strconv.FormatInt(declLine, 10), true
+}
+
+func dwarfSubprogramKey(info *dwarfSubprogramInfo,
+	byOffset map[dwarf.Offset]*dwarfSubprogramInfo) (string, bool) {
+	for range 16 {
+		if key, ok := dwarfSubprogramDeclKey(info.entry, info.files); ok {
+			return key, true
+		}
+		origin, ok := dwarfSubprogramOrigin(info.entry)
+		if !ok {
+			return empty, false
+		}
+		info = byOffset[origin]
+		if info == nil {
+			return empty, false
+		}
+	}
+	return empty, false
+}
+
+func dwarfSubprogramNames(info *dwarfSubprogramInfo,
+	byOffset map[dwarf.Offset]*dwarfSubprogramInfo) []string {
+	for range 16 {
+		origin, ok := dwarfSubprogramOrigin(info.entry)
+		if !ok {
+			return info.names
+		}
+		info = byOffset[origin]
+		if info == nil {
+			return nil
+		}
+	}
+	return nil
 }
 
 // buildDWARFIndexFromData parses an already loaded DWARF data set. Keeping the
@@ -103,22 +180,11 @@ func buildDWARFIndexFromData(data *dwarf.Data,
 	// parameter children of a subprogram contribute to its signature; parameters
 	// nested in lexical blocks or inlined routines belong to another scope.
 	var (
-		key             string
-		names           []string
-		seen            bool
+		infos           []*dwarfSubprogramInfo
+		current         *dwarfSubprogramInfo
 		depth           int
 		subprogramDepth int
 	)
-	flush := func() {
-		if seen && key != empty {
-			if _, exists := index[key]; exists {
-				index[key] = dwarfParamNames{ambiguous: true}
-			} else {
-				index[key] = dwarfParamNames{names: names}
-			}
-		}
-		key, names, seen = empty, nil, false
-	}
 
 	for {
 		entry, err := reader.Next()
@@ -132,7 +198,7 @@ func buildDWARFIndexFromData(data *dwarf.Data,
 		}
 		switch entry.Tag {
 		case dwarf.TagCompileUnit:
-			flush()
+			current = nil
 			files = nil
 			// DeclFile indexes this unit line-table file list. Older DWARF
 			// versions reserve entry 0; DWARF 5 may use it as a real file.
@@ -155,38 +221,11 @@ func buildDWARFIndexFromData(data *dwarf.Data,
 				}
 			}
 		case dwarf.TagSubprogram:
-			flush()
-			var declFile, declLine int64
-			hasDeclFile := false
-			for _, field := range entry.Field {
-				switch field.Attr {
-				case dwarf.AttrDeclFile:
-					if v, ok := field.Val.(int64); ok {
-						declFile = v
-						hasDeclFile = true
-					}
-				case dwarf.AttrDeclLine:
-					if v, ok := field.Val.(int64); ok {
-						declLine = v
-					}
-				}
-			}
-			if hasDeclFile && declFile >= 0 && declFile < int64(len(files)) &&
-				files[declFile] != nil && declLine > 0 {
-				key = files[declFile].Name + colon + strconv.FormatInt(declLine, 10)
-				if targeted {
-					_, seen = targets[key]
-				} else {
-					seen = true
-				}
-			}
-			if targeted && !seen {
-				reader.SkipChildren()
-				continue
-			}
+			current = &dwarfSubprogramInfo{entry: entry, files: files}
+			infos = append(infos, current)
 			subprogramDepth = depth
 		case dwarf.TagFormalParameter:
-			if seen && depth == subprogramDepth+1 {
+			if current != nil && depth == subprogramDepth+1 {
 				var name string
 				output := false
 				for _, field := range entry.Field {
@@ -207,7 +246,7 @@ func buildDWARFIndexFromData(data *dwarf.Data,
 					if name == empty || name == "_" || strings.HasPrefix(name, "~p") {
 						name = empty
 					}
-					names = append(names, name)
+					current.names = append(current.names, name)
 				}
 			}
 		}
@@ -215,7 +254,30 @@ func buildDWARFIndexFromData(data *dwarf.Data,
 			depth++
 		}
 	}
-	flush()
+
+	byOffset := make(map[dwarf.Offset]*dwarfSubprogramInfo, len(infos))
+	for _, info := range infos {
+		byOffset[info.entry.Offset] = info
+	}
+	for _, info := range infos {
+		key, ok := dwarfSubprogramKey(info, byOffset)
+		if !ok {
+			continue
+		}
+		if targeted {
+			if _, ok := targets[key]; !ok {
+				continue
+			}
+		}
+		names := dwarfSubprogramNames(info, byOffset)
+		if existing, exists := index[key]; exists {
+			if !existing.ambiguous && !slices.Equal(existing.names, names) {
+				index[key] = dwarfParamNames{ambiguous: true}
+			}
+		} else {
+			index[key] = dwarfParamNames{names: names}
+		}
+	}
 
 	return index
 }
@@ -232,6 +294,60 @@ type dwarfFile interface {
 // dwarfFile; openSelfDWARF tries each opener in turn.
 type dwarfOpener func(string) (dwarfFile, error)
 
+// fatMachOFile keeps the universal container alive while its selected slice is
+// read; the slice itself does not own the underlying file descriptor.
+type fatMachOFile struct {
+	*macho.File
+	fat *macho.FatFile
+}
+
+func (f *fatMachOFile) Close() error {
+	_ = f.File.Close()
+	return f.fat.Close()
+}
+
+func openMachO(path string) (dwarfFile, error) {
+	return openMachOForArch(path, runtime.GOARCH)
+}
+
+func openMachOForArch(path, arch string) (dwarfFile, error) {
+	thin, thinErr := macho.Open(path)
+	if thinErr == nil {
+		return thin, nil
+	}
+	fat, err := macho.OpenFat(path)
+	if err != nil {
+		return nil, thinErr
+	}
+	cpu, ok := machoCPUForArch(arch)
+	if !ok {
+		_ = fat.Close()
+		return nil, fmt.Errorf("gbl: unsupported Mach-O architecture %s", arch)
+	}
+	for _, candidate := range fat.Arches {
+		if candidate.Cpu == cpu {
+			return &fatMachOFile{File: candidate.File, fat: fat}, nil
+		}
+	}
+	_ = fat.Close()
+	return nil, fmt.Errorf("gbl: universal Mach-O has no %s slice", arch)
+}
+
+func machoCPUForArch(arch string) (macho.Cpu, bool) {
+	switch arch {
+	case "amd64":
+		return macho.CpuAmd64, true
+	case "arm64":
+		return macho.CpuArm64, true
+	case "386":
+		return macho.Cpu386, true
+	case "arm":
+		return macho.CpuArm, true
+	default:
+		return 0, false
+	}
+}
+
 // openSelfDWARF reads the DWARF section from the executable at path, trying each
 // platform format. The debug sections are loaded into memory by the call, so
 // closing the file afterward is safe. It returns nil for an unknown format, for a
@@ -241,7 +357,7 @@ func openSelfDWARF(path string) *dwarf.Data {
 	openers := []dwarfOpener{
 		func(p string) (dwarfFile, error) { return pe.Open(p) },
 		func(p string) (dwarfFile, error) { return elf.Open(p) },
-		func(p string) (dwarfFile, error) { return macho.Open(p) },
+		func(p string) (dwarfFile, error) { return openMachO(p) },
 	}
 	for _, open := range openers {
 		f, err := open(path)

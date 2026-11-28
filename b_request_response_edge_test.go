@@ -348,25 +348,6 @@ func TestRequestResponseEdgeErrorsAndReplayBody(t *testing.T) {
 	if err := (&replayRequestBody{Reader: bytes.NewReader(nil)}).Close(); err != nil {
 		t.Fatalf("Close with nil closer: %v", err)
 	}
-	for _, tc := range []struct {
-		name      string
-		readErr   error
-		wantTrack error
-	}{
-		{name: "EOF is not retained", readErr: io.EOF},
-		{name: "non-EOF is retained", readErr: cause, wantTrack: cause},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			body := &rrEdgeReadCloser{steps: []rrEdgeReadStep{{data: []byte("x"), err: tc.readErr}}}
-			tracker := &requestReadTracker{ReadCloser: body}
-			var n int
-			var err error
-			rrEdgeRun(t, func(ctx context.Context) error { n, err = tracker.Read(make([]byte, 1)); return nil })
-			if n != 1 || !errors.Is(err, tc.readErr) || !errors.Is(tracker.err, tc.wantTrack) {
-				t.Fatalf("tracked Read = (%d, %v, %v), want (1, %v, %v)", n, err, tracker.err, tc.readErr, tc.wantTrack)
-			}
-		})
-	}
 	for _, closeErr := range []error{nil, errors.New("close failed")} {
 		closer := &rrEdgeReadCloser{closeErr: closeErr}
 		body := &replayRequestBody{Reader: bytes.NewReader([]byte("replay")), closer: closer}
@@ -825,6 +806,55 @@ func TestRequestResponseEdgePoolAndCleanup(t *testing.T) {
 	cleanupMultipart(&http.Request{MultipartForm: &multipart.Form{}})
 }
 
+func TestRequestResponseEdgeJSONKeyTable(t *testing.T) {
+	keys := []string{"", "name", "Name", "alpha", "beta", "gamma", "世界", "quoted\"key"}
+	for i := range 32 {
+		keys = append(keys, fmt.Sprintf("key-%d", i))
+	}
+	table := buildJSONKeyTable(keys)
+	if len(table) < len(keys)*2 {
+		t.Fatalf("JSON key table size = %d, want at least %d", len(table), len(keys)*2)
+	}
+	for i, key := range keys {
+		if got := jsonKeyIndexTable(table, []byte(key)); got != i {
+			t.Errorf("byte lookup for %q = %d, want %d", key, got, i)
+		}
+		if got := jsonKeyIndexTableString(table, key); got != i {
+			t.Errorf("string lookup for %q = %d, want %d", key, got, i)
+		}
+	}
+	for _, missing := range []string{"missing", "NAME", "key-32", "世界x"} {
+		if got := jsonKeyIndexTable(table, []byte(missing)); got != -1 {
+			t.Errorf("byte lookup for missing %q = %d, want -1", missing, got)
+		}
+		if got := jsonKeyIndexTableString(table, missing); got != -1 {
+			t.Errorf("string lookup for missing %q = %d, want -1", missing, got)
+		}
+	}
+	if jsonKeyIndexTable(nil, []byte("name")) != -1 || jsonKeyIndexTableString(nil, "name") != -1 {
+		t.Fatal("nil JSON key table reported a match")
+	}
+
+	key := strings.Clone("name")
+	differentLength := append([]byte(nil), "long"...)
+	differentBytes := append([]byte(nil), "Name"...)
+	if equalJSONKeyBytes(key, differentLength) || equalJSONKeyBytes(key, differentBytes) {
+		t.Fatal("equalJSONKeyBytes accepted a different key")
+	}
+	if !equalJSONKeyBytes(key, append([]byte(nil), "name"...)) {
+		t.Fatal("equalJSONKeyBytes rejected an identical key")
+	}
+
+	body := []byte(`{"name":"first","\u006eame":"last","Name":9,"unknown":true}`)
+	fields := make(map[string]json.RawMessage)
+	if err := decodeJSONFieldsInto(body, keys, table, fields); err != nil {
+		t.Fatalf("decode JSON fields through table: %v", err)
+	}
+	if string(fields["name"]) != `"last"` || string(fields["Name"]) != "9" || len(fields) != 2 {
+		t.Fatalf("table-selected fields = %#v, want last name and case-sensitive Name", fields)
+	}
+}
+
 func TestRequestResponseEdgeJSONDecodeAndScanners(t *testing.T) {
 	fields, err := decodeJSONFields([]byte(`{"name":"first","name":"last","other":1}`), []string{"name"})
 	if err != nil || string(fields["name"]) != `"last"` || len(fields) != 1 {
@@ -1003,10 +1033,6 @@ func TestInternalPoolReleaseBounds(t *testing.T) {
 	releaseJSONFields(nil)
 	fields := acquireJSONFields(maxPooledJSONFieldKeys + 1)
 	releaseJSONFields(fields)
-
-	releaseRequestReadTracker(nil)
-	tracker := acquireRequestReadTracker(http.NoBody)
-	releaseRequestReadTracker(tracker)
 
 	buffer := make([]byte, 0, maxPooledPathBytes+1)
 	pathPool := &buffer
@@ -1265,7 +1291,7 @@ func TestRequestResponseEdgeContextPendingAndSSE(t *testing.T) {
 		logger := &rrEdgeLogger{}
 		called := false
 		e := requestTestEngine(t, http.MethodGet, "/events", func(SSEWriter) { called = true }, []string{"stream"})
-		e.logger = logger
+		logTestStoreLogger(e, logger)
 		sink := &rrEdgeFlushWriter{rrEdgeWriter: rrEdgeNewWriter(), flushErr: flushErr}
 		r := httptest.NewRequest(http.MethodGet, "/events", nil)
 		rrEdgeRun(t, func(ctx context.Context) error {
@@ -1285,10 +1311,10 @@ func TestRequestResponseEdgeContextPendingAndSSE(t *testing.T) {
 }
 
 func TestRequestResponseEdgeWriteRequestError(t *testing.T) {
-	oldLogger := defaultEngine.logger
-	defer func() { defaultEngine.logger = oldLogger }()
+	oldLogger := defaultEngine.logger.Load()
+	defer func() { defaultEngine.logger.Store(oldLogger) }()
 	fallback := &rrEdgeLogger{}
-	defaultEngine.logger = fallback
+	logTestStoreLogger(defaultEngine, fallback)
 	client := &requestClientError{err: errors.New("bad input")}
 	internal := &requestInternalError{err: errors.New("private I/O detail")}
 	for _, tc := range []struct {
@@ -1312,9 +1338,9 @@ func TestRequestResponseEdgeWriteRequestError(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			provided := &rrEdgeLogger{}
 			fallback := &rrEdgeLogger{}
-			defaultEngine.logger = fallback
+			logTestStoreLogger(defaultEngine, fallback)
 			if tc.defaultNil {
-				defaultEngine.logger = nil
+				logTestStoreLogger(defaultEngine, nil)
 			}
 			var loggers []Logger
 			switch tc.loggerMode {
@@ -1369,8 +1395,8 @@ func TestRequestResponseEdgeResponseWriterCapabilities(t *testing.T) {
 		rw := &pooledResponseWriter{w: sink}
 		var err error
 		rrEdgeRun(t, func(ctx context.Context) error { err = rw.FlushError(); return nil })
-		if !errors.Is(err, http.ErrNotSupported) || rw.flushed() {
-			t.Fatalf("unsupported FlushError = %v, flushed=%v", err, rw.flushed())
+		if !errors.Is(err, http.ErrNotSupported) || rw.flushedStatus {
+			t.Fatalf("unsupported FlushError = %v, flushedStatus=%v", err, rw.flushedStatus)
 		}
 		if supportsFlush(nil) || supportsFlush(&rrEdgeUnwrapWriter{}) {
 			t.Fatal("nil unwrap chain reported flush support")

@@ -6,6 +6,7 @@ package gbl
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"slices"
 	"strconv"
@@ -157,38 +158,61 @@ type corsHandler struct {
 	allowedHeadersMap map[string]struct{}
 }
 
-// corsResponseWriter restores policy-owned Vary fields at the commit boundary,
+// corsResponseWriter restores policy-owned headers at the commit boundary,
 // after application middleware had a chance to replace the header map.
 type corsResponseWriter struct {
 	http.ResponseWriter
-	varyFields []string
-	ensured    bool
+	varyFields       []string
+	allowOrigin      string
+	allowCredentials bool
+	exposeHeaders    string
+	policySet        bool
+	ensured          bool
 }
 
-func (w *corsResponseWriter) ensureVary() {
+func (w *corsResponseWriter) ensurePolicy() {
 	if w.ensured {
 		return
 	}
 	for _, field := range w.varyFields {
 		ensureVaryHeader(w.Header(), field)
 	}
+	if w.policySet {
+		header := w.Header()
+		header.Set(accessControlAllowOrigin, w.allowOrigin)
+		if w.allowCredentials {
+			header.Set(accessControlAllowCredentials, headerTrue)
+		} else {
+			header.Del(accessControlAllowCredentials)
+		}
+		if w.exposeHeaders != empty {
+			header.Set(accessControlExposeHeaders, w.exposeHeaders)
+		} else {
+			header.Del(accessControlExposeHeaders)
+		}
+	}
 	w.ensured = true
 }
 
 func (w *corsResponseWriter) WriteHeader(code int) {
 	if code >= http.StatusOK {
-		w.ensureVary()
+		w.ensurePolicy()
 	}
 	w.ResponseWriter.WriteHeader(code)
 }
 
 func (w *corsResponseWriter) Write(data []byte) (int, error) {
-	w.ensureVary()
+	w.ensurePolicy()
 	return w.ResponseWriter.Write(data)
 }
 
+func (w *corsResponseWriter) WriteString(data string) (int, error) {
+	w.ensurePolicy()
+	return io.WriteString(w.ResponseWriter, data)
+}
+
 func (w *corsResponseWriter) FlushError() error {
-	w.ensureVary()
+	w.ensurePolicy()
 	return http.NewResponseController(w.ResponseWriter).Flush()
 }
 
@@ -339,10 +363,10 @@ func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestHeaders := r.Header.Get(accessControlRequestHeaders)
-	if requestHeaders != empty {
-		count := 0
-		for h := range strings.SplitSeq(requestHeaders, comma) {
+	requestHeaders := r.Header.Values(accessControlRequestHeaders)
+	count := 0
+	for _, line := range requestHeaders {
+		for h := range strings.SplitSeq(line, comma) {
 			count++
 			if count > corsMaxPreflightHeaders {
 				http.Error(w, corsHeaderNotAllowed, http.StatusForbidden)
@@ -387,11 +411,13 @@ func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if preflight {
 		varyFields = ch.preflightVary
 	}
+	var corsWriter *corsResponseWriter
 	if len(varyFields) > 0 {
 		for _, field := range varyFields {
 			ensureVaryHeader(header, field)
 		}
-		w = &corsResponseWriter{ResponseWriter: w, varyFields: varyFields}
+		corsWriter = &corsResponseWriter{ResponseWriter: w, varyFields: varyFields}
+		w = corsWriter
 	}
 
 	// Non-cross-origin request
@@ -429,6 +455,15 @@ func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if ch.expose {
 		header.Set(accessControlExposeHeaders, ch.exposeHeaders)
 	}
+
+	if corsWriter == nil {
+		corsWriter = &corsResponseWriter{ResponseWriter: w}
+		w = corsWriter
+	}
+	corsWriter.policySet = true
+	corsWriter.allowOrigin = allowOrigin
+	corsWriter.allowCredentials = ch.config.AllowCredentials
+	corsWriter.exposeHeaders = ch.exposeHeaders
 
 	// Handle preflight request
 	if preflight {

@@ -19,13 +19,13 @@ var (
 func BenchmarkRouteMethodOf(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		routeTestMethodSink, routeTestMethodOKSink = methodOf("pAtCh")
+		routeTestMethodSink, routeTestMethodOKSink = methodOf("PATCH")
 	}
 }
 
 func BenchmarkRouteDealPath(b *testing.B) {
 	e := newEngine()
-	e.logger = routeTestDiscardLogger{}
+	logTestStoreLogger(e, routeTestDiscardLogger{})
 	b.Cleanup(e.cancelStreams)
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -36,7 +36,7 @@ func BenchmarkRouteDealPath(b *testing.B) {
 
 func BenchmarkRouteStaticMatch(b *testing.B) {
 	e := newEngine()
-	e.logger = routeTestDiscardLogger{}
+	logTestStoreLogger(e, routeTestDiscardLogger{})
 	b.Cleanup(e.cancelStreams)
 	e.register(methodGet, "/api/users/me", routeTestNoArgHandler)
 	e.generateRoute()
@@ -50,7 +50,7 @@ func BenchmarkRouteStaticMatch(b *testing.B) {
 // BenchmarkRouteStaticNormalizeMatch measures the pooled non-normalized static probe.
 func BenchmarkRouteStaticNormalizeMatch(b *testing.B) {
 	e := newEngine()
-	e.logger = routeTestDiscardLogger{}
+	logTestStoreLogger(e, routeTestDiscardLogger{})
 	b.Cleanup(e.cancelStreams)
 	e.register(methodGet, "/api/users/me", routeTestNoArgHandler)
 	e.generateRoute()
@@ -67,7 +67,7 @@ func BenchmarkRouteStaticNormalizeMatch(b *testing.B) {
 
 func BenchmarkRouteDynamicMatch(b *testing.B) {
 	e := newEngine()
-	e.logger = routeTestDiscardLogger{}
+	logTestStoreLogger(e, routeTestDiscardLogger{})
 	b.Cleanup(e.cancelStreams)
 	e.register(methodGet, "/api/users/:id/posts/:postID", routeTestNoArgHandler)
 	e.generateRoute()

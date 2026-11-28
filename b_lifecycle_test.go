@@ -686,18 +686,125 @@ func TestLifecycleShutdownLockWaitHonorsContext(t *testing.T) {
 	e.runState.Store(runStateRunning)
 	e.server = &http.Server{}
 	e.shutdownMu <- struct{}{}
+	finished := false
+	result := make(chan error, 1)
+	t.Cleanup(func() {
+		select {
+		case <-e.shutdownMu:
+		case <-time.After(routeTestLifecycleTimeout):
+			t.Error("Shutdown test left the drain lock held")
+		}
+		if !finished {
+			select {
+			case <-result:
+			case <-time.After(routeTestLifecycleTimeout):
+				t.Error("Shutdown goroutine did not exit during cleanup")
+			}
+		}
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	err := e.shutdown(ctx)
-	elapsed := time.Since(started)
-	<-e.shutdownMu
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Shutdown while another drain holds the lock = %v, want context deadline exceeded", err)
+	go func() { result <- e.shutdown(ctx) }()
+	select {
+	case err := <-result:
+		finished = true
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Shutdown while another drain holds the lock = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not return after its context expired while waiting for the lock")
 	}
-	if elapsed > 500*time.Millisecond {
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
 		t.Fatalf("Shutdown ignored context while waiting for the lock: %s", elapsed)
+	}
+}
+
+func TestLifecycleShutdownDoneLatchesDuringCall(t *testing.T) {
+	for _, latchDuringCall := range []bool{false, true} {
+		name := "latched before call"
+		if latchDuringCall {
+			name = "latched during call"
+		}
+		t.Run(name, func(t *testing.T) {
+			e := routeTestNewEngine(t)
+			e.runState.Store(runStateRunning)
+			e.server = &http.Server{}
+			e.shutdownMu <- struct{}{}
+			lockHeld := true
+			t.Cleanup(func() {
+				if lockHeld {
+					<-e.shutdownMu
+				}
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			if !latchDuringCall {
+				e.shutdownDone.Store(true)
+				if err := e.shutdown(ctx); err != nil {
+					t.Fatalf("Shutdown after completion = %v", err)
+				}
+				return
+			}
+
+			entered := make(chan struct{})
+			coverageSeamReplace(t, &shutdownStart, func() { close(entered) })
+			result := make(chan error, 1)
+			go func() { result <- e.shutdown(ctx) }()
+			select {
+			case <-entered:
+			case <-time.After(routeTestLifecycleTimeout):
+				t.Fatal("Shutdown did not start")
+			}
+			e.shutdownDone.Store(true)
+			<-e.shutdownMu
+			lockHeld = false
+			select {
+			case err := <-result:
+				if err != nil {
+					t.Fatalf("Shutdown completing during call = %v", err)
+				}
+			case <-time.After(routeTestLifecycleTimeout):
+				t.Fatal("Shutdown did not observe completion after drain release")
+			}
+		})
+	}
+}
+
+func TestLifecycleConcurrentShutdownCalls(t *testing.T) {
+	for _, callers := range []int{2, 8} {
+		t.Run(fmt.Sprintf("%d callers", callers), func(t *testing.T) {
+			e := routeTestNewEngine(t)
+			listener := routeTestHoldListener(t)
+			server := routeTestStartServer(t, e, listener)
+			start := make(chan struct{})
+			results := make(chan error, callers)
+			for range callers {
+				go func() {
+					<-start
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					defer cancel()
+					results <- e.shutdown(ctx)
+				}()
+			}
+			close(start)
+			for range callers {
+				select {
+				case err := <-results:
+					if err != nil {
+						t.Errorf("concurrent Shutdown = %v", err)
+					}
+				case <-time.After(routeTestLifecycleTimeout):
+					t.Fatal("concurrent Shutdown calls did not all return")
+				}
+			}
+			routeTestWaitDone(t, server.done, "Run after concurrent Shutdown")
+			if server.panicValue != nil {
+				t.Fatalf("Run panicked after concurrent Shutdown: %v", server.panicValue)
+			}
+		})
 	}
 }
 
@@ -747,10 +854,21 @@ func TestLifecycleShutdownClosesHijackedConnections(t *testing.T) {
 		t.Fatalf("Run panicked after hijacked-connection Shutdown: %v", server.panicValue)
 	}
 
+	if err := conn.SetDeadline(time.Now().Add(routeTestLifecycleTimeout)); err != nil {
+		t.Fatalf("set hijacked connection read deadline: %v", err)
+	}
 	buffer := make([]byte, 1)
+	readStarted := time.Now()
 	n, readErr := conn.Read(buffer)
-	if n != 0 || readErr == nil {
-		t.Fatalf("hijacked connection read after Shutdown = (%d, %v), want closed connection", n, readErr)
+	elapsed := time.Since(readStarted)
+	if n != 0 || (!errors.Is(readErr, io.EOF) && !errors.Is(readErr, net.ErrClosed)) {
+		if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+			t.Fatalf("hijacked connection did not close promptly after Shutdown: %v", readErr)
+		}
+		t.Fatalf("hijacked connection read after Shutdown = (%d, %v), want timely EOF", n, readErr)
+	}
+	if elapsed > routeTestLifecycleTimeout {
+		t.Fatalf("hijacked connection close took %s, want less than %s", elapsed, routeTestLifecycleTimeout)
 	}
 	// The registry owns the connection and closes it during Shutdown. Closing
 	// the wrapper again is harmless and keeps cleanup safe on assertion failures.

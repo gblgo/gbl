@@ -50,6 +50,10 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
+      - name: Run tests with trimpath
+        if: matrix.os == 'ubuntu-latest'
+        run: go test ./... -trimpath -count=1 -timeout=10m
+
       - name: Run tests with race
         if: matrix.os == 'ubuntu-latest'
         env:
@@ -71,6 +75,13 @@ jobs:
         run: |
           go tool cover -func=coverage-${{ matrix.os }}.out | grep '^total:'
           go tool cover -func=coverage-${{ matrix.os }}.out | grep '^total:' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce coverage target
+        run: |
+          go tool cover -func=coverage-${{ matrix.os }}.out | awk '
+            $1 == "total:" { found = 1; if ($3 != "100.0%") exit 1 }
+            END { if (!found) exit 1 }
+          '
 
       - name: Upload coverage artifact
         if: always()

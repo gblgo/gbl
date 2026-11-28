@@ -27,7 +27,8 @@ import (
 // Implement the interface and install it with SetLogger; a one-line adapter is
 // enough. File logging is one such integration: the framework itself only
 // prints to the console, and an application that wants files installs a Logger
-// that writes there.
+// that writes there. Logger methods must not call back into gbl.Info, gbl.Warn
+// or gbl.Error.
 type Logger interface {
 	Info(msg string, keysAndValues ...any)
 	Warn(msg string, keysAndValues ...any)
@@ -42,6 +43,21 @@ type Logger interface {
 // ordinary record.
 type BannerLogger interface {
 	Banner(block string)
+}
+
+type loggerHolder struct {
+	logger Logger
+}
+
+func newLoggerHolder(logger Logger) *loggerHolder {
+	return &loggerHolder{logger: logger}
+}
+
+func (e *engine) currentLogger() Logger {
+	if holder := e.logger.Load(); holder != nil {
+		return holder.logger
+	}
+	return nil
 }
 
 // stdLogger is the default Logger and a deliberate development aid: it prints
@@ -127,7 +143,7 @@ func appendLogValue(b *strings.Builder, value any) {
 	case nil:
 		b.WriteString("<nil>")
 	case string:
-		appendLogString(b, v)
+		appendLogFieldString(b, v)
 	case time.Duration:
 		appendLogString(b, v.String())
 	case bool:
@@ -161,7 +177,7 @@ func appendLogValue(b *strings.Builder, value any) {
 	default:
 		// fmt handles typed-nil values and recovers panics from Error, String and
 		// Format methods while preserving their normal formatting precedence.
-		appendLogString(b, fmt.Sprint(value))
+		appendLogFieldString(b, fmt.Sprint(value))
 	}
 }
 
@@ -195,6 +211,26 @@ func appendLogString(b *strings.Builder, value string) {
 	b.WriteString(value[start:])
 }
 
+// appendLogFieldString quotes values that could otherwise forge another
+// key=value field in the default text format.
+func appendLogFieldString(b *strings.Builder, value string) {
+	if value != empty && !strings.ContainsAny(value, " \t\r\n=\"") {
+		appendLogString(b, value)
+		return
+	}
+	b.WriteByte('"')
+	start := 0
+	for i := 0; i < len(value); i++ {
+		if value[i] == '"' {
+			appendLogString(b, value[start:i])
+			b.WriteString(`\"`)
+			start = i + 1
+		}
+	}
+	appendLogString(b, value[start:])
+	b.WriteByte('"')
+}
+
 // SetLogger installs a Logger on the default engine. Passing nil or a typed-nil
 // pointer panics instead of silently keeping a different logger. Until it is
 // called the default engine logs through the console helper described above:
@@ -210,17 +246,17 @@ func SetLogger(l Logger) { defaultEngine.setLogger(l) }
 // to keep or fetch a reference. msg describes the event, followed by
 // alternating key/value pairs (see Logger).
 func Info(msg string, keysAndValues ...any) {
-	safeLog(func() { defaultEngine.logger.Info(msg, keysAndValues...) })
+	safeLog(func() { defaultEngine.currentLogger().Info(msg, keysAndValues...) })
 }
 
 // Warn logs at warn level through the Logger installed on the default engine.
 func Warn(msg string, keysAndValues ...any) {
-	safeLog(func() { defaultEngine.logger.Warn(msg, keysAndValues...) })
+	safeLog(func() { defaultEngine.currentLogger().Warn(msg, keysAndValues...) })
 }
 
 // Error logs at error level through the Logger installed on the default engine.
 func Error(msg string, keysAndValues ...any) {
-	safeLog(func() { defaultEngine.logger.Error(msg, keysAndValues...) })
+	safeLog(func() { defaultEngine.currentLogger().Error(msg, keysAndValues...) })
 }
 
 // setLogger installs a Logger on this engine. It is safe to call at any point
@@ -240,7 +276,7 @@ func (e *engine) setLogger(l Logger) {
 		e.failStartup(fmt.Errorf("gbl: SetLogger received a typed-nil %T", l))
 		return
 	}
-	e.logger = l
+	e.logger.Store(newLoggerHolder(l))
 	unlock()
 }
 
@@ -259,6 +295,6 @@ func safeLog(fn func()) {
 // have without the logging. It is deliberately not used for the request-time
 // responseAbort control flow, which is a normal answer rather than a failure.
 func (e *engine) failStartup(reason any) {
-	safeLog(func() { e.logger.Error("startup aborted", "reason", reason) })
+	safeLog(func() { e.currentLogger().Error("startup aborted", "reason", reason) })
 	panic(reason)
 }

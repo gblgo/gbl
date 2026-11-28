@@ -287,5 +287,5 @@ func (e *engine) catchRuntimePanic(rw responseWriter) {
 // recovered value and the goroutine stack are recorded as structured fields so a
 // leak-free 500 stays debuggable in any backend.
 func (e *engine) logRecoveredPanic(err any) {
-	safeLog(func() { e.logger.Error("recovered panic", "error", err, "stack", string(debug.Stack())) })
+	safeLog(func() { e.currentLogger().Error("recovered panic", "error", err, "stack", string(debug.Stack())) })
 }

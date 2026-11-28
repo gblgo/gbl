@@ -189,6 +189,72 @@ func TestSSEStartCancellationDuringFlushIsNormal(t *testing.T) {
 	}
 }
 
+func TestSSEStartFlushFailurePrefersExistingCancellation(t *testing.T) {
+	writer, _ := sseTestNewWriter(t, time.Second, nil, context.Background())
+	base := writer.w.(*pooledResponseWriter)
+	writer.w = &sseEdgeCancelOnFlushFailure{
+		pooledResponseWriter: base,
+		cancel:               writer.cancel,
+		err:                  errors.New("racing startup flush failure"),
+	}
+	if err := writer.start(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("start() cancellation during failed flush = %v, want context.Canceled", err)
+	}
+	writer.callbackMu.Lock()
+	started, completed := writer.started, writer.completed
+	writer.callbackMu.Unlock()
+	if started || completed {
+		t.Fatalf("canceled startup state: started=%t completed=%t, want false false", started, completed)
+	}
+}
+
+type sseEdgeCancelOnWrite struct {
+	*pooledResponseWriter
+	cancel context.CancelCauseFunc
+	err    error
+}
+
+func (w *sseEdgeCancelOnWrite) Write([]byte) (int, error) {
+	w.cancel(context.Canceled)
+	return 0, w.err
+}
+
+type sseEdgeCancelOnFlushFailure struct {
+	*pooledResponseWriter
+	cancel context.CancelCauseFunc
+	err    error
+}
+
+func (w *sseEdgeCancelOnFlushFailure) FlushError() error {
+	w.cancel(context.Canceled)
+	return w.err
+}
+
+func TestSSEWriteAndFlushFailurePreferExistingCancellation(t *testing.T) {
+	for _, mode := range []string{"write", "flush"} {
+		t.Run(mode, func(t *testing.T) {
+			writer, sink := sseTestNewWriter(t, time.Second, nil, nil)
+			sseTestStart(t, writer, sink)
+			ioFailure := errors.New("racing SSE " + mode + " failure")
+			base := writer.w.(*pooledResponseWriter)
+			if mode == "write" {
+				writer.w = &sseEdgeCancelOnWrite{pooledResponseWriter: base, cancel: writer.cancel, err: ioFailure}
+			} else {
+				writer.w = &sseEdgeCancelOnFlushFailure{pooledResponseWriter: base, cancel: writer.cancel, err: ioFailure}
+			}
+			errorResult := make(chan error, 1)
+			writer.OnError(func(err error) { errorResult <- err })
+
+			err := writer.writeData([]byte("payload"))
+			if !errors.Is(err, context.Canceled) || errors.Is(err, ioFailure) {
+				t.Fatalf("writeData() = %v, want existing cancellation cause", err)
+			}
+			sseEdgeRequireOutcome(t, writer, err, context.Canceled, false)
+			sseTestRequireNoValue(t, errorResult, 30*time.Millisecond, "OnError for cancellation racing I/O failure")
+		})
+	}
+}
+
 func TestSSEEdgeStartFlushFailure(t *testing.T) {
 	writer, sink := sseTestNewWriter(t, time.Second, nil, nil)
 	failure := errors.New("startup flush failed")
