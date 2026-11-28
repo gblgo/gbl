@@ -84,16 +84,12 @@ func BenchmarkBindStruct(b *testing.B) {
 func BenchmarkFrameworkJSONFieldExtraction(b *testing.B) {
 	body := []byte(`{"id":42,"name":"alice","enabled":true,"noise":"ignored"}`)
 	keys := []string{"id", "name", "enabled"}
-	canonical := make(map[string]string, len(keys))
-	for _, key := range keys {
-		canonical[key] = key
-	}
 	b.ReportAllocs()
 	b.SetBytes(int64(len(body)))
 	b.ResetTimer()
 	for range b.N {
 		fields := acquireJSONFields(len(keys))
-		if err := decodeJSONFieldsMapInto(body, canonical, fields.values); err != nil {
+		if err := decodeJSONFieldsListInto(body, keys, fields.values); err != nil {
 			releaseJSONFields(fields)
 			b.Fatalf("select JSON fields: %v", err)
 		}

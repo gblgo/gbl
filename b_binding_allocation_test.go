@@ -50,6 +50,24 @@ func TestFilterExactJSONValueDeepAllocationCount(t *testing.T) {
 	}
 }
 
+func TestDecodeJSONFieldsListIntoAllocations(t *testing.T) {
+	body := []byte(`{"id":42,"name":"alice","enabled":true,"noise":"ignored"}`)
+	keys := []string{"id", "name", "enabled"}
+	fields := acquireJSONFields(len(keys))
+	defer releaseJSONFields(fields)
+	var decodeErr error
+	allocations := testing.AllocsPerRun(100, func() {
+		clear(fields.values)
+		decodeErr = decodeJSONFieldsListInto(body, keys, fields.values)
+	})
+	if decodeErr != nil {
+		t.Fatalf("decode JSON fields: %v", decodeErr)
+	}
+	if allocations != 0 {
+		t.Fatalf("JSON field selection allocations = %.0f, want 0", allocations)
+	}
+}
+
 func TestContextValidatablePointerModeAvoidsBoxing(t *testing.T) {
 	value := ctxTestValidatable{Name: "value"}
 	addressable := reflect.ValueOf(&value).Elem()

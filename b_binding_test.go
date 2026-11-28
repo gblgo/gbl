@@ -612,6 +612,32 @@ func TestBindJSONSingleStructUsesExactFieldCase(t *testing.T) {
 	}
 }
 
+func TestBindJSONContainersUseExactFieldCase(t *testing.T) {
+	t.Run("slice", func(t *testing.T) {
+		values, err := bindTestInject(t, func(payload []bindTestJSONStruct) {}, []string{"payload"}, nameSources{},
+			[]byte(`[{"Name":"alice","Count":3}]`), true)
+		if err != nil {
+			t.Fatalf("inject JSON slice: %v", err)
+		}
+		got := bindTestInterface(t, values[0]).([]bindTestJSONStruct)
+		if len(got) != 1 || !reflect.DeepEqual(got[0], bindTestJSONStruct{}) {
+			t.Fatalf("JSON slice bound wrong-case fields: %#v", got)
+		}
+	})
+
+	t.Run("map", func(t *testing.T) {
+		values, err := bindTestInject(t, func(payload map[string]bindTestJSONStruct) {}, []string{"payload"}, nameSources{},
+			[]byte(`{"item":{"Name":"alice","Count":3}}`), true)
+		if err != nil {
+			t.Fatalf("inject JSON map: %v", err)
+		}
+		got := bindTestInterface(t, values[0]).(map[string]bindTestJSONStruct)
+		if !reflect.DeepEqual(got["item"], bindTestJSONStruct{}) {
+			t.Fatalf("JSON map bound wrong-case fields: %#v", got)
+		}
+	})
+}
+
 func TestBindJSONMultipleParametersUseExactStructFieldCase(t *testing.T) {
 	body := []byte(`{"payload":{"Name":"alice","Count":3},"id":1}`)
 	values, err := bindTestInject(t, func(payload bindTestJSONStruct, id int) {},
