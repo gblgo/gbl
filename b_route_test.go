@@ -689,6 +689,16 @@ func TestRouteSourceParamNameTrimpathFallback(t *testing.T) {
 	}
 }
 
+func TestRouteLocalSourcePathWorkingDirectoryError(t *testing.T) {
+	previous := sourceWorkingDir
+	sourceWorkingDir = func() (string, error) { return "", fmt.Errorf("working directory unavailable") }
+	t.Cleanup(func() { sourceWorkingDir = previous })
+	file := modulePath + "/a_paramNames.go"
+	if got := localSourcePath(file); got != file {
+		t.Fatalf("localSourcePath on Getwd error = %q, want original %q", got, file)
+	}
+}
+
 func TestRouteSourceParamNameDefensiveBranches(t *testing.T) {
 	if names, resolved, ambiguous := resolveSourceParamNames(reflect.Value{}); names != nil ||
 		resolved || ambiguous != "" {
@@ -730,6 +740,20 @@ func TestRouteSourceParamNameDefensiveBranches(t *testing.T) {
 	if names != nil || resolved || ambiguous == "" {
 		t.Fatalf("ambiguous source line = (%#v, %t, %q), want ambiguous",
 			names, resolved, ambiguous)
+	}
+}
+
+func TestRouteDynamicMatchRejectsTooManySegments(t *testing.T) {
+	e := routeTestNewEngine(t)
+	e.register(methodGet, "/root/:id", func() string { return "ok" })
+	e.generateRoute()
+	path := "/root" + strings.Repeat("/a", maxRoutePathSegments)
+	handler, params := e.matchNode(methodGet, path, nil)
+	if params != nil {
+		releasePathParams(params)
+	}
+	if handler != nil {
+		t.Fatalf("dynamic route matched path with %d segments", len(strings.Split(path, "/"))-1)
 	}
 }
 

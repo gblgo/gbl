@@ -568,7 +568,7 @@ func TestRequestBodyLimitAppliedBeforeMiddleware(t *testing.T) {
 			return name
 		}, []string{"name"}, func(c *Context) {
 			c.Request.Body = io.NopCloser(strings.NewReader("name=" + strings.Repeat("x", limit)))
-			c.Request.ContentLength = -1
+			c.Request.ContentLength = 1
 			c.Next()
 		})
 		r := httptest.NewRequest(http.MethodPost, "/limited", strings.NewReader("name=ok"))
@@ -581,6 +581,63 @@ func TestRequestBodyLimitAppliedBeforeMiddleware(t *testing.T) {
 			t.Fatalf("replaced body response: status=%d handlerCalled=%t, want 413 and false", recorder.Code, handlerCalled)
 		}
 	})
+
+	t.Run("raw handler replacement is bounded", func(t *testing.T) {
+		var readErr error
+		e := requestTestEngine(t, http.MethodPost, "/raw", func(r *http.Request) string {
+			_, readErr = io.ReadAll(r.Body)
+			return "ok"
+		}, []string{"r"}, func(c *Context) {
+			c.Request.Body = io.NopCloser(strings.NewReader(strings.Repeat("x", limit+1)))
+			c.Request.ContentLength = 1
+			c.Next()
+		})
+		r := httptest.NewRequest(http.MethodPost, "/raw", strings.NewReader("ok"))
+		recorder := httptest.NewRecorder()
+
+		e.ServeHTTP(recorder, r)
+
+		var maxBytesErr *http.MaxBytesError
+		if !errors.As(readErr, &maxBytesErr) {
+			t.Fatalf("raw replacement read error = %v, want MaxBytesError", readErr)
+		}
+	})
+
+	t.Run("raw handler known oversize replacement skips handler", func(t *testing.T) {
+		handlerCalled := false
+		e := requestTestEngine(t, http.MethodPost, "/raw", func(r *http.Request) string {
+			handlerCalled = true
+			return "ok"
+		}, []string{"r"}, func(c *Context) {
+			c.Request.Body = io.NopCloser(strings.NewReader("replacement"))
+			c.Request.ContentLength = limit + 1
+			c.Next()
+		})
+		r := httptest.NewRequest(http.MethodPost, "/raw", strings.NewReader("ok"))
+		recorder := httptest.NewRecorder()
+
+		e.ServeHTTP(recorder, r)
+
+		if recorder.Code != http.StatusRequestEntityTooLarge || handlerCalled {
+			t.Fatalf("raw replacement response: status=%d handlerCalled=%t, want 413 and false", recorder.Code, handlerCalled)
+		}
+	})
+}
+
+func TestPooledFormParseReusesBodyBuffer(t *testing.T) {
+	form := acquirePooledForm(1)
+	defer releasePooledForm(form)
+	keys := newRequestKeySet([]string{"name"})
+	if err := form.parse([]byte("name=alice"), keys); err != nil {
+		t.Fatalf("first pooled form parse: %v", err)
+	}
+	capacity := cap(form.body)
+	if err := form.parse([]byte("name=bob"), keys); err != nil {
+		t.Fatalf("second pooled form parse: %v", err)
+	}
+	if cap(form.body) != capacity {
+		t.Fatalf("pooled form body capacity changed from %d to %d", capacity, cap(form.body))
+	}
 }
 
 func TestRequestUnsupportedMediaHonorsBodyLimit(t *testing.T) {

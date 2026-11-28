@@ -155,7 +155,7 @@ func countRouteNodes(node *routeNode) int {
 	for _, child := range node.staticNode {
 		count += countRouteNodes(child)
 	}
-	for _, child := range node.varNode {
+	if child := node.varNode; child != nil {
 		count += countRouteNodes(child)
 	}
 	return count

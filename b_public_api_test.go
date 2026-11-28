@@ -191,6 +191,11 @@ func TestPublicRunAndShutdown(t *testing.T) {
 	if err := Shutdown(context.Background()); err != nil {
 		t.Fatalf("repeated public Shutdown: %v", err)
 	}
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := Shutdown(canceledCtx); err != nil {
+		t.Fatalf("Shutdown after completion with canceled context: %v", err)
+	}
 }
 
 func TestPublicShutdownBeforeRun(t *testing.T) {

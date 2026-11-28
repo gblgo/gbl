@@ -227,12 +227,12 @@ func TestCompressSkipsLargerOutput(t *testing.T) {
 func TestCompressWeakensStrongETag(t *testing.T) {
 	body := []byte(strings.Repeat("etag payload\n", 100))
 	e := mwTestNewEngine(t, func(w http.ResponseWriter) string {
-		w.Header().Set("ETag", `"strong"`)
+		w.Header().Set("Etag", `"strong"`)
 		return string(body)
 	}, Compress(DefaultCompression))
 	rec := mwTestGzipResponse(e, "gzip")
 	mwTestRequireGzipBody(t, rec, body)
-	if got := rec.Header().Get("ETag"); got != `W/"strong"` {
+	if got := rec.Header().Get("Etag"); got != `W/"strong"` {
 		t.Fatalf("ETag = %q, want weak gzip variant", got)
 	}
 }

@@ -267,6 +267,10 @@ func (v *CorrectnessJSONCustom) UnmarshalJSON(data []byte) error {
 	return json.Unmarshal(data, &v.Seen)
 }
 
+type correctnessEndlessJSONPointer *correctnessEndlessJSONPointer
+
+type correctnessRecursiveJSONSlice []correctnessRecursiveJSONSlice
+
 // CorrectnessJSONContainers covers every recursive container binder shape.
 type CorrectnessJSONContainers struct {
 	Map    map[string]CorrectnessJSONItem `json:"map"`
@@ -486,6 +490,33 @@ func TestJSONExactParserUnterminatedKey(t *testing.T) {
 
 // TestJSONExactParserContainerBoundaries checks whitespace around commas and
 // colons, including commas after discarded members and shape-mismatched elements.
+func TestJSONTypeNeedsExactFilterBoundaries(t *testing.T) {
+	tests := []struct {
+		name string
+		typ  reflect.Type
+		want bool
+	}{
+		{name: "struct", typ: reflect.TypeFor[CorrectnessJSONItem](), want: true},
+		{name: "slice of structs", typ: reflect.TypeFor[[]CorrectnessJSONItem](), want: true},
+		{name: "map of structs", typ: reflect.TypeFor[map[string]CorrectnessJSONItem](), want: true},
+		{name: "bytes", typ: reflect.TypeFor[[]byte](), want: false},
+		{name: "scalar", typ: reflect.TypeFor[int](), want: false},
+		{name: "custom decoder", typ: reflect.TypeFor[CorrectnessJSONCustom](), want: false},
+		{name: "endless pointer", typ: reflect.TypeFor[correctnessEndlessJSONPointer](), want: false},
+		{name: "recursive slice", typ: reflect.TypeFor[correctnessRecursiveJSONSlice](), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := jsonTypeNeedsExactFilter(tt.typ); got != tt.want {
+				t.Fatalf("jsonTypeNeedsExactFilter(%s) = %t, want %t", tt.typ, got, tt.want)
+			}
+		})
+	}
+	if got := jsonKeyIndexString([]string{"name"}, "missing"); got != -1 {
+		t.Fatalf("jsonKeyIndexString miss = %d, want -1", got)
+	}
+}
+
 func TestJSONExactParserContainerBoundaries(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

@@ -335,22 +335,34 @@ func (e *engine) generateRoute() {
 				e.failStartup(fmt.Sprintf("recursive pointer return type for %s %s: %s",
 					methodName, meta.path, t.Out(0)))
 			}
-			switch out.Kind() {
-			case reflect.Struct, reflect.Map, reflect.Array:
-				handler.contentType = applicationJsonCharset
-			case reflect.Interface:
-				// The runtime value determines the media type. Committing JSON before
-				// the handler returns can mislabel a flushed scalar response.
-				handler.contentType = empty
-			case reflect.Slice:
-				// []byte is written verbatim; every other slice is JSON-marshaled.
-				if out.Elem().Kind() == reflect.Uint8 {
-					handler.contentType = textPlainCharset
-				} else {
-					handler.contentType = applicationJsonCharset
-				}
-			default:
+			if t.Out(0).Implements(responseErrorType) {
 				handler.contentType = textPlainCharset
+			} else {
+				// A pointer may be nil; do not commit JSON before the runtime value is known.
+				pointerComposite := t.Out(0).Kind() == reflect.Pointer &&
+					(out.Kind() == reflect.Struct || out.Kind() == reflect.Map || out.Kind() == reflect.Array ||
+						(out.Kind() == reflect.Slice && out.Elem().Kind() != reflect.Uint8))
+				if pointerComposite {
+					handler.contentType = empty
+				} else {
+					switch out.Kind() {
+					case reflect.Struct, reflect.Map, reflect.Array:
+						handler.contentType = applicationJsonCharset
+					case reflect.Interface:
+						// The runtime value determines the media type. Committing JSON before
+						// the handler returns can mislabel a flushed scalar response.
+						handler.contentType = empty
+					case reflect.Slice:
+						// []byte is written verbatim; every other slice is JSON-marshaled.
+						if out.Elem().Kind() == reflect.Uint8 {
+							handler.contentType = textPlainCharset
+						} else {
+							handler.contentType = applicationJsonCharset
+						}
+					default:
+						handler.contentType = textPlainCharset
+					}
+				}
 			}
 		}
 

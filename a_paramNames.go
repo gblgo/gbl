@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -136,23 +137,45 @@ func selectSourceParamSpan(spans []sourceParamSpan, line int, file string) (*sou
 	return &spans[best], empty
 }
 
-// sourceSpansForFile parses and caches one source file, resolving trimpath module paths locally when possible.
+// sourceWorkingDir isolates the test-only source fallback's working-directory lookup.
+var sourceWorkingDir = os.Getwd
+
+// localSourcePath maps a module-relative file from a -trimpath build back to the local module tree.
+func localSourcePath(file string) string {
+	mainModule := modulePath
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Path != empty {
+		mainModule = info.Main.Path
+	}
+	prefix := mainModule + slash
+	if !strings.HasPrefix(file, prefix) {
+		return file
+	}
+	relative := filepath.FromSlash(strings.TrimPrefix(file, prefix))
+	dir, err := sourceWorkingDir()
+	if err != nil {
+		return file
+	}
+	for {
+		candidate := filepath.Join(dir, relative)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return file
+		}
+		dir = parent
+	}
+}
+
+// sourceSpansForFile parses and caches one source file, resolving module-relative paths from -trimpath builds locally when possible.
 func sourceSpansForFile(file string) ([]sourceParamSpan, bool) {
 	if cached, ok := sourceParamFileCache.Load(file); ok {
 		result := cached.(sourceParamFile)
 		return result.spans, result.parsed
 	}
 	fSet := token.NewFileSet()
-	sourcePath := file
-	if strings.HasPrefix(file, modulePath+slash) {
-		if workingDir, err := os.Getwd(); err == nil {
-			local := filepath.Join(workingDir, filepath.FromSlash(strings.TrimPrefix(file, modulePath+slash)))
-			if _, err := os.Stat(local); err == nil {
-				sourcePath = local
-			}
-		}
-	}
-	parsed, err := parser.ParseFile(fSet, sourcePath, nil, 0)
+	parsed, err := parser.ParseFile(fSet, localSourcePath(file), nil, 0)
 	if err != nil {
 		result := sourceParamFile{}
 		actual, _ := sourceParamFileCache.LoadOrStore(file, result)

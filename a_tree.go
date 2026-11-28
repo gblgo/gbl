@@ -14,22 +14,18 @@ import (
 // walking segments from the root; the node where the last segment lands either
 // terminates in a handler (exist) or is only a waypoint on a longer route.
 type routeNode struct {
-	// raw segment text of the first registration at this node
-	segment string
 	// full route path, set only on a terminal node
 	path string
-	// first registration name when segment is a variable; retained for diagnostics
-	paramName string
 	// true when a handler is registered at this node
 	exist bool
 	// handler reached at this node, valid when exist
 	handler *routeHandler
 	// literal children, keyed by exact segment text
 	staticNode map[string]*routeNode
-	// structural wildcard child, matched against any segment. The slice is kept
-	// for existing tree walkers, but a generated node has at most one entry:
-	// marker spelling and parameter names do not create distinct branches.
-	varNode []*routeNode
+	// structural wildcard child, matched against any segment. Marker spelling and
+	// parameter names do not create distinct branches, so a generated node has at
+	// most one entry.
+	varNode *routeNode
 }
 
 // pathParam binds one dynamic segment position to a route-specific name.
@@ -71,24 +67,21 @@ func findOverlappingRoute(node *routeNode, segments []segmentMeta, index int) (b
 		node.staticNode[meta.segment], segments, index+1); found {
 		return true, path
 	}
-	// Generated trees have one structural wildcard child. Keeping this as a
-	// direct probe avoids the name-dependent linear scan of the old slice.
-	if len(node.varNode) > 0 {
-		if found, path := findOverlappingRoute(node.varNode[0], segments, index+1); found {
+	// Generated trees have one structural wildcard child.
+	if node.varNode != nil {
+		if found, path := findOverlappingRoute(node.varNode, segments, index+1); found {
 			return true, path
 		}
 	}
 	return false, empty
 }
 
-// newNode builds an empty, non-terminal node for segment, ready to receive children.
-func newNode(segment string) *routeNode {
+// newNode builds an empty, non-terminal node ready to receive children.
+func newNode() *routeNode {
 	return &routeNode{
-		segment:    segment,
 		exist:      false,
 		handler:    nil,
 		staticNode: make(map[string]*routeNode),
-		varNode:    make([]*routeNode, 0),
 	}
 }
 
@@ -102,7 +95,7 @@ func (e *engine) insertNode(segmentMetas []segmentMeta, path string,
 	method httpMethod, handler *routeHandler) {
 	root := e.roots[method]
 	if root == nil {
-		root = newNode(slash)
+		root = newNode()
 		e.roots[method] = root
 	}
 	if found, existingPath := findOverlappingRoute(root, segmentMetas, 0); found {
@@ -121,14 +114,11 @@ func (e *engine) insertNode(segmentMetas []segmentMeta, path string,
 		isLast := i == len(segmentMetas)-1
 		if meta.isVar {
 			var node *routeNode
-			if len(root.varNode) > 0 {
-				node = root.varNode[0]
+			if root.varNode != nil {
+				node = root.varNode
 			} else {
-				node = newNode(meta.segment)
-				// Retained for diagnostics and compatibility with existing tree
-				// inspectors; request binding uses handler.pathParams instead.
-				node.paramName = meta.paramName
-				root.varNode = append(root.varNode, node)
+				node = newNode()
+				root.varNode = node
 			}
 
 			if isLast {
@@ -144,7 +134,7 @@ func (e *engine) insertNode(segmentMetas []segmentMeta, path string,
 		// Find or create a static node.
 		node := root.staticNode[meta.segment]
 		if node == nil {
-			node = newNode(meta.segment)
+			node = newNode()
 			root.staticNode[meta.segment] = node
 		}
 
@@ -167,6 +157,9 @@ var segmentPool = sync.Pool{
 
 // largest segment slice retained by the pool
 const maxPooledPathSegments = 64
+
+// maxRoutePathSegments bounds recursive dynamic-route matching.
+const maxRoutePathSegments = 1024
 
 // releaseSegments clears path references and pools a reasonably sized slice.
 func releaseSegments(bufPool *[]string, segments []string) {
@@ -269,6 +262,10 @@ func (e *engine) matchNode(
 	}
 	bufPool := segmentPool.Get().(*[]string)
 	segments := splitPathInto((*bufPool)[:0], path)
+	if len(segments) > maxRoutePathSegments {
+		releaseSegments(bufPool, segments)
+		return nil, params
+	}
 	handler := searchNode(root, segments, 0, params)
 
 	releaseSegments(bufPool, segments)
@@ -353,8 +350,8 @@ func searchNode(root *routeNode, segments []string, index int,
 			return handler
 		}
 	}
-	if len(root.varNode) > 0 {
-		if handler := searchNode(root.varNode[0], segments, index+1, params); handler != nil {
+	if root.varNode != nil {
+		if handler := searchNode(root.varNode, segments, index+1, params); handler != nil {
 			return handler
 		}
 	}

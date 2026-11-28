@@ -269,6 +269,12 @@ type responseTestPanicJSON struct{}
 
 func (responseTestPanicJSON) MarshalJSON() ([]byte, error) { panic("payload marshal boom") }
 
+type responseTestStructError struct {
+	Message string
+}
+
+func (e responseTestStructError) Error() string { return e.Message }
+
 func responseTestNewEngine(t *testing.T) *engine {
 	t.Helper()
 	e := newEngine()
@@ -1630,6 +1636,28 @@ func TestErrorMediaTypeDepth(t *testing.T) {
 	}
 }
 
+func TestResponseErrorClearsRepresentationHeaders(t *testing.T) {
+	e := responseTestNewEngine(t)
+	sink := responseTestNewWriter()
+	rw := &pooledResponseWriter{w: sink}
+	rw.Header().Set(contentEncoding, encodingGzip)
+	rw.Header().Set("Content-Length", "999")
+	rw.Header().Set("Etag", `"stale"`)
+
+	escaped := responseTestCatchPanic(e, rw, func() { panic("private failure") })
+	if escaped != nil {
+		t.Fatalf("panic escaped: %v", escaped)
+	}
+	if rw.status() != http.StatusInternalServerError || sink.body.String() != http.StatusText(http.StatusInternalServerError) {
+		t.Fatalf("error response = (%d, %q)", rw.status(), sink.body.String())
+	}
+	for _, name := range []string{contentEncoding, "Content-Length", "Etag"} {
+		if got := sink.header.Get(name); got != empty {
+			t.Errorf("%s = %q, want cleared", name, got)
+		}
+	}
+}
+
 func TestResponsePanicProcessor(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -1845,6 +1873,41 @@ func TestResponsePipelineFrameworkAbort(t *testing.T) {
 	responseTestCheckResponse(t, rec, http.StatusNotFound, "ctxTest safe halt", textPlainCharset)
 	if entries := logger.snapshot(); len(entries) != 0 {
 		t.Fatalf("framework abort was logged as a crash: %+v", entries)
+	}
+}
+
+func TestResponsePipelineStructErrorUsesTextContentTypeBeforeFlush(t *testing.T) {
+	e := responseTestNewEngine(t)
+	e.register(methodGet, "/responseTest", func(w http.ResponseWriter) responseTestStructError {
+		_ = http.NewResponseController(w).Flush()
+		return responseTestStructError{Message: "plain error"}
+	})
+	e.generateRoute()
+
+	recorder, escaped := responseTestServe(t, e, http.MethodGet, "/responseTest", empty, empty)
+	if escaped != nil {
+		t.Fatalf("pipeline leaked panic: %v", escaped)
+	}
+	responseTestCheckResponse(t, recorder, http.StatusOK, "plain error", textPlainCharset)
+}
+
+func TestResponsePipelineNilPointerDoesNotPrecommitJSON(t *testing.T) {
+	e := responseTestNewEngine(t)
+	e.register(methodGet, "/responseTest", func(w http.ResponseWriter) *responseTestPayload {
+		_ = http.NewResponseController(w).Flush()
+		return nil
+	})
+	e.generateRoute()
+
+	recorder, escaped := responseTestServe(t, e, http.MethodGet, "/responseTest", empty, empty)
+	if escaped != nil {
+		t.Fatalf("pipeline leaked panic: %v", escaped)
+	}
+	if recorder.Code != http.StatusOK || recorder.Body.Len() != 0 {
+		t.Fatalf("nil pointer response = %d %q, want empty 200", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Header().Get(contentType), applicationJson) {
+		t.Fatalf("nil pointer precommitted JSON Content-Type: %q", recorder.Header().Get(contentType))
 	}
 }
 

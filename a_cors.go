@@ -146,6 +146,9 @@ type corsHandler struct {
 	wildcard bool
 	// expose records whether response headers should be exposed
 	expose bool
+	// originVary and preflightVary are immutable policy-owned cache dimensions.
+	originVary    []string
+	preflightVary []string
 	// allowedOriginsMap holds lowercased origins for large lists
 	allowedOriginsMap map[string]struct{}
 	// allowedMethodsMap holds lowercased methods for large lists
@@ -159,12 +162,17 @@ type corsHandler struct {
 type corsResponseWriter struct {
 	http.ResponseWriter
 	varyFields []string
+	ensured    bool
 }
 
 func (w *corsResponseWriter) ensureVary() {
+	if w.ensured {
+		return
+	}
 	for _, field := range w.varyFields {
 		ensureVaryHeader(w.Header(), field)
 	}
+	w.ensured = true
 }
 
 func (w *corsResponseWriter) WriteHeader(code int) {
@@ -221,6 +229,18 @@ func newCorsHandler(e *engine, cc *CorsConfig) *corsHandler {
 			headersMap[strings.ToLower(header)] = struct{}{}
 		}
 	}
+	var originVary []string
+	if !wildcard || cc.AllowCredentials {
+		originVary = []string{headerOrigin}
+	}
+	var preflightVary []string
+	if len(originVary) > 0 {
+		preflightVary = make([]string, 0, 3)
+		preflightVary = append(preflightVary, originVary...)
+	} else {
+		preflightVary = make([]string, 0, 2)
+	}
+	preflightVary = append(preflightVary, accessControlRequestMethod, accessControlRequestHeaders)
 	return &corsHandler{
 		engine:            e,
 		config:            cc,
@@ -230,6 +250,8 @@ func newCorsHandler(e *engine, cc *CorsConfig) *corsHandler {
 		maxAge:            maxAge,
 		wildcard:          wildcard,
 		expose:            len(cc.ExposedHeaders) > 0,
+		originVary:        originVary,
+		preflightVary:     preflightVary,
 		allowedOriginsMap: originsMap,
 		allowedMethodsMap: methodsMap,
 		allowedHeadersMap: headersMap,
@@ -357,16 +379,13 @@ func (ch *corsHandler) handlePreflight(w http.ResponseWriter, r *http.Request) {
 func (ch *corsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	origin := strings.TrimSpace(r.Header.Get(headerOrigin))
 	header := w.Header()
-	var varyFields []string
-	if !ch.wildcard || ch.config.AllowCredentials {
-		varyFields = append(varyFields, headerOrigin)
-	}
+	varyFields := ch.originVary
 
 	// Mark every preflight response before any origin, method or header check
 	// can reject it, so caches never reuse a denial for different inputs.
 	preflight := isPreflightRequest(r)
 	if preflight {
-		varyFields = append(varyFields, accessControlRequestMethod, accessControlRequestHeaders)
+		varyFields = ch.preflightVary
 	}
 	if len(varyFields) > 0 {
 		for _, field := range varyFields {

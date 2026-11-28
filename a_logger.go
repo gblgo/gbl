@@ -172,7 +172,7 @@ func appendLogString(b *strings.Builder, value string) {
 	start := 0
 	for i := 0; i < len(value); i++ {
 		c := value[i]
-		if c >= 0x20 && c != 0x7f {
+		if c >= 0x20 && c != 0x7f && c != '\\' {
 			continue
 		}
 		b.WriteString(value[start:i])
@@ -183,6 +183,8 @@ func appendLogString(b *strings.Builder, value string) {
 			b.WriteString(`\r`)
 		case '\t':
 			b.WriteString(`\t`)
+		case '\\':
+			b.WriteString(`\\`)
 		default:
 			b.WriteString(`\x`)
 			b.WriteByte(hex[c>>4])
