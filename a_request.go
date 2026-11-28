@@ -8,13 +8,48 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 // This file holds request parsing orchestration across body, form,
 // multipart, and JSON inputs.
+
+const multipartBoundaryPrefix = multipartFormData + "; boundary="
+
+func multipartBoundaryFast(header string) (string, bool) {
+	if !strings.HasPrefix(header, multipartBoundaryPrefix) {
+		return empty, false
+	}
+	boundary := header[len(multipartBoundaryPrefix):]
+	if !validMultipartBoundaryToken(boundary) {
+		return empty, false
+	}
+	return boundary, true
+}
+
+func validMultipartBoundaryToken(boundary string) bool {
+	if len(boundary) == 0 || len(boundary) > 70 {
+		return false
+	}
+	for i := range len(boundary) {
+		c := boundary[i]
+		switch {
+		case c >= 'a' && c <= 'z',
+			c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9',
+			c == '\'', c == '(', c == ')', c == '+', c == '_', c == ',',
+			c == '-', c == '.', c == '/', c == ':', c == '=', c == '?':
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 // parseRequestParameters collects handler-bindable inputs for the request:
 // form values, uploaded files, the JSON body buffer and whether a JSON body
@@ -59,6 +94,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 		files     filesMap
 		bodyBuf   *bytes.Buffer
 		mediaType string
+		boundary  string
 	)
 
 	contentTypeHeader := r.Header.Get(contentType)
@@ -72,12 +108,21 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 		case xWwwFormUrlencoded:
 			mediaType = xWwwFormUrlencoded
 		default:
+			if fastBoundary, ok := multipartBoundaryFast(contentTypeHeader); ok {
+				mediaType = multipartFormData
+				boundary = fastBoundary
+				break
+			}
 			var err error
-			mediaType, _, err = mime.ParseMediaType(contentTypeHeader)
+			var params map[string]string
+			mediaType, params, err = mime.ParseMediaType(contentTypeHeader)
 			if err != nil {
 				return nil, nil, nil, false, &requestClientError{
 					err: fmt.Errorf("invalid Content-Type: %w", err),
 				}
+			}
+			if mediaType == multipartFormData {
+				boundary = params["boundary"]
 			}
 		}
 	}
@@ -116,29 +161,10 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 		// larger amount to disk merely because the aggregate threshold is higher.
 		memory = min(memory, maxUpload)
 
-		body := r.Body
-		if body == nil {
-			body = http.NoBody
-		}
-		tracker := acquireRequestReadTracker(body)
-		r.Body = tracker
-		defer func() {
-			r.Body = originalBody
-			releaseRequestReadTracker(tracker)
-		}()
-		if err := r.ParseMultipartForm(memory); err != nil {
-			cleanupParsedMultipart(r)
-			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
-				return nil, nil, nil, false, requestBodyTooLargeError
+		if r.MultipartForm == nil {
+			if err := parseMultipartBody(r, boundary, maxUpload, memory, originalBody); err != nil {
+				return nil, nil, nil, false, err
 			}
-			if tracker.err != nil {
-				return nil, nil, nil, false, classifyBodyReadError(tracker.err)
-			}
-			return nil, nil, nil, false, classifyMultipartParseError(err)
-		}
-		if tracker.err != nil {
-			cleanupParsedMultipart(r)
-			return nil, nil, nil, false, classifyBodyReadError(tracker.err)
 		}
 		if r.PostForm == nil {
 			r.PostForm = make(url.Values)
@@ -151,9 +177,7 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 		if r.MultipartForm != nil {
 			files = r.MultipartForm.File
 		}
-		// Per-file hard cap: any uploaded part larger than the configured
-		// threshold aborts the request before the handler runs. All parsed
-		// temporary files are removed if any file exceeds the cap.
+		// Defense in depth for custom MultipartForm values installed by middleware.
 		for _, headers := range files {
 			for _, hdr := range headers {
 				if hdr != nil && hdr.Size > maxUpload {
@@ -230,11 +254,108 @@ func parseRequestParameters(w http.ResponseWriter, r *http.Request,
 	return form, files, bodyBuf, jsonMedia && bodyBuf != nil, nil
 }
 
+type multipartReplayBody struct {
+	data   []byte
+	offset int
+}
+
+func (b *multipartReplayBody) Read(p []byte) (int, error) {
+	if b.offset >= len(b.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[b.offset:])
+	b.offset += n
+	return n, nil
+}
+
+func (*multipartReplayBody) Close() error { return nil }
+
+// parseMultipartBody buffers the bounded body and restores it afterward. Bodies
+// no larger than one file cannot contain an oversized file and skip the extra
+// multipart scan; larger bodies are validated before the standard parser can
+// spill file content to disk.
+func parseMultipartBody(r *http.Request, boundary string, maxUpload, memory int64,
+	restoreBody io.ReadCloser) error {
+	body := r.Body
+	if body == nil {
+		body = http.NoBody
+	}
+	defer func() { r.Body = restoreBody }()
+
+	buf := bodyBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer releaseBodyBuffer(buf)
+
+	probeLimit := maxUpload
+	if probeLimit < 1<<63-1 {
+		probeLimit++
+	}
+	_, readErr := io.CopyN(buf, body, probeLimit)
+	if readErr == nil {
+		if _, readErr = buf.ReadFrom(body); readErr != nil {
+			return classifyBodyReadError(readErr)
+		}
+		if boundary != empty {
+			if err := validateMultipartFileSizes(buf.Bytes(), boundary, maxUpload); err != nil {
+				if errors.Is(err, requestBodyTooLargeError) {
+					return err
+				}
+				return classifyMultipartParseError(err)
+			}
+		}
+	} else if readErr != io.EOF {
+		return classifyBodyReadError(readErr)
+	}
+	data := buf.Bytes()
+	r.Body = &multipartReplayBody{data: data}
+	parsed, err := multipart.NewReader(r.Body, boundary).ReadForm(memory)
+	if err != nil {
+		cleanupParsedMultipart(r)
+		return classifyMultipartParseError(err)
+	}
+	r.MultipartForm = parsed
+	r.PostForm = parsed.Value
+	return nil
+}
+
 // cleanupParsedMultipart removes all files left by a complete or partial
 // multipart parse. ParseMultipartForm performs its own cleanup on read errors;
 // calling this again also covers errors discovered after a successful parse.
 func cleanupParsedMultipart(r *http.Request) {
 	if r.MultipartForm != nil {
 		_ = r.MultipartForm.RemoveAll()
+	}
+}
+
+// validateMultipartFileSizes scans the already bounded body before the standard
+// parser writes any file to disk, stopping at the first oversized file part.
+func validateMultipartFileSizes(body []byte, boundary string, maxUpload int64) error {
+	reader := multipart.NewReader(bytes.NewReader(body), boundary)
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if part.FileName() == empty {
+			_, err = io.Copy(io.Discard, part)
+		} else {
+			_, err = io.CopyN(io.Discard, part, maxUpload)
+			if err == nil {
+				_, err = io.CopyN(io.Discard, part, 1)
+				if err == nil {
+					return requestBodyTooLargeError
+				}
+			}
+			if err == io.EOF {
+				err = nil
+			}
+		}
+		if err != nil {
+			return err
+		}
+		_ = part.Close()
 	}
 }

@@ -57,6 +57,112 @@ func releaseJSONFields(fields *pooledJSONFields) {
 	}
 }
 
+// jsonKeySlot is one immutable open-addressed JSON key entry. index is -1 for
+// an empty slot so blank parameter names cannot look occupied.
+type jsonKeySlot struct {
+	hash  uint64
+	key   string
+	index int
+}
+
+// Small parameter lists are faster to scan directly; larger lists use the
+// startup-built table to avoid request-time O(parameters × fields) work.
+const jsonKeyLinearScanLimit = 8
+
+const (
+	jsonKeyHashOffset uint64 = 14695981039346656037
+	jsonKeyHashPrime  uint64 = 1099511628211
+)
+
+func buildJSONKeyTable(keys []string) []jsonKeySlot {
+	if len(keys) <= jsonKeyLinearScanLimit {
+		return nil
+	}
+	size := 1
+	for size < len(keys)*2 {
+		size <<= 1
+	}
+	table := make([]jsonKeySlot, size)
+	for i := range table {
+		table[i].index = -1
+	}
+	for i, key := range keys {
+		hash := hashJSONKeyString(key)
+		slot := hash & uint64(size-1)
+		for table[slot].index >= 0 {
+			slot = (slot + 1) & uint64(size-1)
+		}
+		table[slot] = jsonKeySlot{hash: hash, key: key, index: i}
+	}
+	return table
+}
+
+func jsonKeyIndexTable(table []jsonKeySlot, raw []byte) int {
+	if len(table) == 0 {
+		return -1
+	}
+	hash := hashJSONKeyBytes(raw)
+	slot := hash & uint64(len(table)-1)
+	for {
+		entry := &table[slot]
+		if entry.index < 0 {
+			return -1
+		}
+		if entry.hash == hash && equalJSONKeyBytes(entry.key, raw) {
+			return entry.index
+		}
+		slot = (slot + 1) & uint64(len(table)-1)
+	}
+}
+
+func jsonKeyIndexTableString(table []jsonKeySlot, name string) int {
+	if len(table) == 0 {
+		return -1
+	}
+	hash := hashJSONKeyString(name)
+	slot := hash & uint64(len(table)-1)
+	for {
+		entry := &table[slot]
+		if entry.index < 0 {
+			return -1
+		}
+		if entry.hash == hash && entry.key == name {
+			return entry.index
+		}
+		slot = (slot + 1) & uint64(len(table)-1)
+	}
+}
+
+func hashJSONKeyBytes(key []byte) uint64 {
+	hash := jsonKeyHashOffset
+	for _, b := range key {
+		hash ^= uint64(b)
+		hash *= jsonKeyHashPrime
+	}
+	return hash
+}
+
+func hashJSONKeyString(key string) uint64 {
+	hash := jsonKeyHashOffset
+	for i := range len(key) {
+		hash ^= uint64(key[i])
+		hash *= jsonKeyHashPrime
+	}
+	return hash
+}
+
+func equalJSONKeyBytes(key string, raw []byte) bool {
+	if len(key) != len(raw) {
+		return false
+	}
+	for i := range len(raw) {
+		if key[i] != raw[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // decodeJSONFieldsList is the direct-call variant with a fresh map.
 func decodeJSONFieldsList(body []byte, keys []string) (map[string]json.RawMessage, error) {
 	fields := make(map[string]json.RawMessage, len(keys))
@@ -82,6 +188,13 @@ func decodeJSONFieldsSet(body []byte, keys requestKeySet) (map[string]json.RawMe
 // decodeJSONFieldsListInto fills a caller-owned map for direct list callers.
 func decodeJSONFieldsListInto(body []byte, keys []string,
 	fields map[string]json.RawMessage) error {
+	return decodeJSONFieldsInto(body, keys, nil, fields)
+}
+
+// decodeJSONFieldsInto uses the immutable startup table on the request path and
+// retains the list lookup for direct callers that do not have a bind plan.
+func decodeJSONFieldsInto(body []byte, keys []string, table []jsonKeySlot,
+	fields map[string]json.RawMessage) error {
 	if !json.Valid(body) {
 		return fmt.Errorf("invalid JSON body: %w", json.Unmarshal(body, &json.RawMessage{}))
 	}
@@ -99,12 +212,21 @@ func decodeJSONFieldsListInto(body []byte, keys []string,
 		keyStart := index
 		index = scanJSONStringEnd(body, index)
 		rawKey := body[keyStart+1 : index-1]
-		keyIndex := jsonKeyIndex(keys, rawKey)
+		var keyIndex int
+		if table != nil {
+			keyIndex = jsonKeyIndexTable(table, rawKey)
+		} else {
+			keyIndex = jsonKeyIndex(keys, rawKey)
+		}
 		if keyIndex < 0 && bytes.IndexByte(rawKey, '\\') >= 0 {
 			// Escaped keys are uncommon; standard decoding preserves exact JSON semantics.
 			var name string
 			_ = json.Unmarshal(body[keyStart:index], &name)
-			keyIndex = jsonKeyIndexString(keys, name)
+			if table != nil {
+				keyIndex = jsonKeyIndexTableString(table, name)
+			} else {
+				keyIndex = jsonKeyIndexString(keys, name)
+			}
 		}
 		index = skipJSONSpace(body, index)
 		index = skipJSONSpace(body, index+1)

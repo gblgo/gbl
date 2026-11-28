@@ -34,6 +34,9 @@ var paramsPool = sync.Pool{
 	New: func() any { s := make([]reflect.Value, 0, 8); return &s },
 }
 
+// maxPooledParamsCapacity bounds retained reflection argument storage.
+const maxPooledParamsCapacity = 256
+
 // acquireParams returns a zeroed reflection argument slice of length n, reusing a
 // pooled backing array when it is large enough.
 func acquireParams(n int) (*[]reflect.Value, []reflect.Value) {
@@ -51,6 +54,9 @@ func acquireParams(n int) (*[]reflect.Value, []reflect.Value) {
 // returns it to the pool.
 func releaseParams(bufPool *[]reflect.Value, params []reflect.Value) {
 	clear(params)
+	if cap(params) > maxPooledParamsCapacity {
+		return
+	}
 	*bufPool = params
 	paramsPool.Put(bufPool)
 }
@@ -142,7 +148,7 @@ func injectedParameters(
 			// has failed for the first parameter that actually needs JSON.
 			if len(plan.businessIndexes) > 1 && jsonFields == nil {
 				jsonFields = acquireJSONFields(len(plan.jsonKeySet))
-				if err := decodeJSONFieldsListInto(body, plan.jsonKeys, jsonFields.values); err != nil {
+				if err := decodeJSONFieldsInto(body, plan.jsonKeys, plan.jsonKeyTable, jsonFields.values); err != nil {
 					return err
 				}
 			}

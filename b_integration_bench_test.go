@@ -62,8 +62,11 @@ func (w *frameworkBenchWriter) Write(p []byte) (int, error) {
 }
 
 // benchmarkFrameworkJSONPipeline measures gbl handling with reusable input and output.
-func benchmarkFrameworkJSONPipeline(b *testing.B, e *engine) {
+func benchmarkFrameworkJSONPipeline(b *testing.B, e *engine, compressible bool) {
 	payload := `{"name":"alice"}`
+	if compressible {
+		payload = `{"name":"` + strings.Repeat("compressible-", 128) + `"}`
+	}
 	body := &frameworkBenchBody{reader: strings.NewReader(payload)}
 	request := httptest.NewRequest(http.MethodPost, "/json", body)
 	request.ContentLength = int64(len(payload))
@@ -75,6 +78,7 @@ func benchmarkFrameworkJSONPipeline(b *testing.B, e *engine) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		body.reader.Reset(payload)
+		request.Body = body
 		clear(writer.header)
 		writer.status = 0
 		writer.size = 0
@@ -94,9 +98,9 @@ func BenchmarkFrameworkJSONPipeline(b *testing.B) {
 			return integrationTestResponse{ID: 1, Name: user.Name, RequestID: "benchmark"}
 		})
 		e.generateRoute()
-		benchmarkFrameworkJSONPipeline(b, e)
+		benchmarkFrameworkJSONPipeline(b, e, false)
 	})
 	b.Run("with-compress", func(b *testing.B) {
-		benchmarkFrameworkJSONPipeline(b, integrationBenchEngine(b))
+		benchmarkFrameworkJSONPipeline(b, integrationBenchEngine(b), true)
 	})
 }

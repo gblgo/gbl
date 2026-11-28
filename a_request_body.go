@@ -43,7 +43,7 @@ const (
 	defaultMaxFileMemory = 2 << 20
 	// Hard cap on each individual uploaded file: 1 MiB.
 	defaultMaxUploadFileSize = 1 << 20
-	// largest JSON body buffer retained by the pool
+	// largest request body buffer retained by the pool
 	maxPooledBodyCapacity = 1 << 20
 
 	// body type carrying form fields plus uploaded files
@@ -59,9 +59,8 @@ func init() {
 	maxUploadFileSize.Store(defaultMaxUploadFileSize)
 }
 
-// bodyBufferPool recycles the buffer used to read JSON and URL-encoded request
-// bodies, so a small-body request reuses one backing array instead of allocating
-// a fresh read buffer every time. sync.Pool drops its contents at GC, so an
+// bodyBufferPool recycles the buffer used to read JSON, URL-encoded and
+// multipart request bodies, so repeated requests reuse one backing array. sync.Pool drops its contents at GC, so an
 // oversized body buffer is not pinned indefinitely.
 var bodyBufferPool = sync.Pool{
 	New: func() any { return new(bytes.Buffer) },
@@ -145,47 +144,6 @@ func (b *replayRequestBody) Close() error {
 		return nil
 	}
 	return b.closer.Close()
-}
-
-// requestReadTracker remembers a body-read error even when a parser such as
-// multipart.ReadForm wraps it with format-specific context.
-type requestReadTracker struct {
-	// ReadCloser is the request body being observed.
-	io.ReadCloser
-	// err retains the first non-EOF read failure.
-	err error
-}
-
-// requestReadTrackerPool reuses the multipart parser's internal body wrapper.
-var requestReadTrackerPool = sync.Pool{
-	New: func() any { return &requestReadTracker{} },
-}
-
-// acquireRequestReadTracker binds a fresh body reader to a pooled tracker.
-func acquireRequestReadTracker(body io.ReadCloser) *requestReadTracker {
-	tracker := requestReadTrackerPool.Get().(*requestReadTracker)
-	tracker.ReadCloser = body
-	tracker.err = nil
-	return tracker
-}
-
-// releaseRequestReadTracker clears body references before pooling.
-func releaseRequestReadTracker(tracker *requestReadTracker) {
-	if tracker == nil {
-		return
-	}
-	tracker.ReadCloser = nil
-	tracker.err = nil
-	requestReadTrackerPool.Put(tracker)
-}
-
-// Read records body failures that a multipart parser may wrap.
-func (r *requestReadTracker) Read(p []byte) (int, error) {
-	n, err := r.ReadCloser.Read(p)
-	if err != nil && err != io.EOF {
-		r.err = err
-	}
-	return n, err
 }
 
 // preparedRequestBody marks a body already wrapped with the framework limit.

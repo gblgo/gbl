@@ -81,6 +81,8 @@ type (
 		jsonKeys []string
 		// jsonKeySet tracks accepted member names and their count.
 		jsonKeySet requestKeySet
+		// jsonKeyTable is the immutable open-addressed lookup built from jsonKeys.
+		jsonKeyTable []jsonKeySlot
 		// needsParse records whether request data must be parsed
 		needsParse bool
 		// hasSSE is true when any parameter declares gbl.SSEWriter.
@@ -351,6 +353,7 @@ func (p *bindPlan) prepareKeys(names []string) {
 	clear(p.queryKeys)
 	clear(p.jsonKeySet)
 	p.jsonKeys = nil
+	p.jsonKeyTable = nil
 
 	visited := make(map[reflect.Type]bool)
 	for _, index := range p.businessIndexes {
@@ -370,6 +373,7 @@ func (p *bindPlan) prepareKeys(names []string) {
 			}
 		}
 	}
+	p.jsonKeyTable = buildJSONKeyTable(p.jsonKeys)
 }
 
 // appendStructQueryKeys collects leaf field names because nested structs bind

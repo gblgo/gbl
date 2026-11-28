@@ -87,24 +87,6 @@ func BenchmarkFrameworkQuerySelection(b *testing.B) {
 	}
 }
 
-// BenchmarkFrameworkMultipartReadTracker measures the pooled body wrapper only.
-func BenchmarkFrameworkMultipartReadTracker(b *testing.B) {
-	payload := []byte("multipart-body")
-	body := &requestTestBenchBody{Reader: bytes.NewReader(payload)}
-	var buffer [64]byte
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		body.Reset(payload)
-		tracker := acquireRequestReadTracker(body)
-		n, err := tracker.Read(buffer[:])
-		releaseRequestReadTracker(tracker)
-		if err != nil || n != len(payload) {
-			b.Fatalf("tracked read = (%d, %v)", n, err)
-		}
-	}
-}
-
 // BenchmarkFrameworkJSONBodyBuffer measures only framework body buffering, not JSON decoding.
 func BenchmarkFrameworkJSONBodyBuffer(b *testing.B) {
 	payload := []byte(bindTestBenchJSONPayload)

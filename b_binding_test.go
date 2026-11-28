@@ -105,12 +105,22 @@ func (v *bindTestValidated) Validate() error {
 	return nil
 }
 
+type bindTestScalar int
+
+func (v *bindTestScalar) Validate() error {
+	bindTestValidationCalls.Add(1)
+	if *v == 0 {
+		return bindTestValidationError
+	}
+	return nil
+}
+
 // bindTestEngine installs a single already-planned route, avoiding global route
 // registration while still exercising matching, dispatch, recovery and cleanup.
 func bindTestEngine(t *testing.T, method, path string, fn any, names []string) *engine {
 	t.Helper()
 	e := newEngine()
-	e.logger = bindTestLogger{}
+	logTestStoreLogger(e, bindTestLogger{})
 	t.Cleanup(e.cancelStreams)
 
 	m, ok := methodOf(method)
@@ -265,8 +275,39 @@ func TestBindTextPointers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bind missing pointer: %v", err)
 	}
-	if !missing.IsNil() {
-		t.Fatalf("missing pointer = %v, want nil", missing.Interface())
+	if !missing.IsValid() || missing.Type() != reflect.TypeFor[*int]() || !missing.IsNil() {
+		t.Fatalf("missing pointer = %v, want a valid nil *int", missing)
+	}
+
+	bindTestValidationCalls.Store(0)
+	missingValidatable, err := bindTextValue(reflect.TypeFor[*bindTestValidated](), nil)
+	if err != nil || !missingValidatable.IsValid() || !missingValidatable.IsNil() {
+		t.Fatalf("missing validatable pointer = (%v, %v), want valid nil", missingValidatable, err)
+	}
+	for _, pointerMode := range []bool{false, true} {
+		if err := validateBusiness([]reflect.Value{missingValidatable}, []int{0}, []bool{pointerMode}); err != nil {
+			t.Fatalf("Validate missing pointer (pointerMode=%t): %v", pointerMode, err)
+		}
+	}
+	if calls := bindTestValidationCalls.Load(); calls != 0 {
+		t.Fatalf("Validate calls = %d, want 0 for missing scalar pointer", calls)
+	}
+}
+
+func TestBindMissingScalarRemainsAddressableForValidation(t *testing.T) {
+	bindTestValidationCalls.Store(0)
+	value, err := bindTextValue(reflect.TypeFor[bindTestScalar](), nil)
+	if err != nil {
+		t.Fatalf("bind missing scalar: %v", err)
+	}
+	if !value.CanAddr() {
+		t.Fatal("missing scalar is not addressable for pointer-receiver validation")
+	}
+	if err := validateBusiness([]reflect.Value{value}, []int{0}, []bool{true}); !errors.Is(err, bindTestValidationError) {
+		t.Fatalf("Validate missing scalar = %v, want %v", err, bindTestValidationError)
+	}
+	if calls := bindTestValidationCalls.Load(); calls != 1 {
+		t.Fatalf("Validate calls = %d, want 1", calls)
 	}
 }
 
@@ -796,6 +837,24 @@ func TestBindValidationRunsAfterPresentValues(t *testing.T) {
 	}
 	if calls := bindTestValidationCalls.Load(); calls != 1 {
 		t.Fatalf("Validate calls = %d, want 1", calls)
+	}
+}
+
+func TestBindValidationFailureIsLogged(t *testing.T) {
+	e := bindTestEngine(t, http.MethodPost, "/validate", func(value bindTestValidated) string {
+		return value.Name
+	}, nil)
+	capture := &logTestCaptureLogger{}
+	logTestStoreLogger(e, capture)
+	r := httptest.NewRequest(http.MethodPost, "/validate", strings.NewReader("name="))
+	r.Header.Set(contentType, xWwwFormUrlencoded)
+	recorder := httptest.NewRecorder()
+	e.ServeHTTP(recorder, r)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("response = %d, want 400", recorder.Code)
+	}
+	if len(capture.records) != 1 || capture.records[0].msg != "request validation failed" {
+		t.Fatalf("validation logs = %#v, want one request validation failed record", capture.records)
 	}
 }
 
