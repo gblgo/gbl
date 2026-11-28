@@ -397,7 +397,7 @@ func TestRequestResponseEdgePrepareRequestBody(t *testing.T) {
 		{name: "nil body", method: http.MethodPost, nilBody: true, limit: 4},
 		{name: "known no body", method: http.MethodPost, noBody: true, limit: 4},
 		{name: "known oversize", method: http.MethodPost, contentLength: 5, steps: []rrEdgeReadStep{{data: []byte("data")}}, limit: 4, wantErr: requestBodyTooLargeError},
-		{name: "known exact", method: http.MethodPut, contentLength: 4, steps: []rrEdgeReadStep{{data: []byte("data")}}, limit: 4},
+		{name: "known exact", method: http.MethodPut, contentLength: 4, steps: []rrEdgeReadStep{{data: []byte("data")}}, limit: 4, wantData: "data"},
 		{name: "unknown length", method: http.MethodPatch, contentLength: -1, steps: []rrEdgeReadStep{{data: []byte("data")}}, limit: 4, wantData: "data"},
 		{name: "zero with body", method: http.MethodPost, steps: []rrEdgeReadStep{{data: []byte("data")}}, limit: 4, wantData: "data"},
 		{name: "non positive limit falls back", method: http.MethodPost, contentLength: -1, steps: []rrEdgeReadStep{{data: []byte("ok")}}, limit: 0, wantData: "ok"},

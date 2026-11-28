@@ -89,9 +89,9 @@ func (e *engine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Apply the body boundary before middleware runs. Parameter parsing prepares
-	// the same body again, but the marker makes that check idempotent; a middleware
-	// replacement is still limited when the handler parses it.
+	// Apply the body boundary before middleware runs. Parameter parsing and raw
+	// handlers prepare the body again, but the marker makes that check idempotent;
+	// a middleware replacement is still limited before application code consumes it.
 	if method.isBodyMethod() {
 		if err := prepareRequestBody(w, r); err != nil {
 			writeRequestError(err, e.logger)
