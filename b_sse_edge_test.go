@@ -36,14 +36,24 @@ func (w *sseEdgeFailWriter) Write(p []byte) (int, error) {
 	return w.body.Write(p)
 }
 
+type sseEdgeCancelOnFlush struct {
+	*pooledResponseWriter
+	cancel context.CancelCauseFunc
+}
+
+func (w *sseEdgeCancelOnFlush) FlushError() error {
+	w.cancel(context.Canceled)
+	return w.pooledResponseWriter.FlushError()
+}
+
 func TestSSEEdgeWriteSSEDataEveryErrorPoint(t *testing.T) {
 	tests := []struct {
 		name      string
 		data      []byte
 		wantCalls int
 	}{
-		{name: "single line", data: []byte("payload"), wantCalls: 4},
-		{name: "multiline CRLF CR LF", data: []byte("first\r\nsecond\rthird\n"), wantCalls: 13},
+		{name: "single line", data: []byte("payload"), wantCalls: 1},
+		{name: "multiline CRLF CR LF", data: []byte("first\r\nsecond\rthird\n"), wantCalls: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -141,6 +151,41 @@ func TestSSECanceledRequestBeforeStartSkipsHandler(t *testing.T) {
 	}
 	if recorder.Body.Len() != 0 || recorder.Code == http.StatusInternalServerError {
 		t.Fatalf("canceled SSE response = %d %q, want empty non-500", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestSSEEngineShutdownBeforeStartSkipsHandler(t *testing.T) {
+	called := false
+	e := requestTestEngine(t, http.MethodGet, "/events", func(SSEWriter) { called = true }, []string{"stream"})
+	e.cancelStreams()
+	request := httptest.NewRequest(http.MethodGet, "/events", nil)
+	recorder := httptest.NewRecorder()
+
+	e.ServeHTTP(recorder, request)
+
+	if called {
+		t.Fatal("SSE handler ran after engine shutdown before startup")
+	}
+	if recorder.Body.Len() != 0 || recorder.Code == http.StatusInternalServerError {
+		t.Fatalf("shutdown SSE response = %d %q, want empty non-500", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestSSEStartCancellationDuringFlushIsNormal(t *testing.T) {
+	writer, _ := sseTestNewWriter(t, time.Second, nil, context.Background())
+	writer.w = &sseEdgeCancelOnFlush{
+		pooledResponseWriter: writer.w.(*pooledResponseWriter),
+		cancel:               writer.cancel,
+	}
+
+	if err := writer.start(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("start() cancellation during flush = %v, want context.Canceled", err)
+	}
+	writer.callbackMu.Lock()
+	started := writer.started
+	writer.callbackMu.Unlock()
+	if started {
+		t.Fatal("SSE stream marked started after cancellation during flush")
 	}
 }
 

@@ -179,6 +179,7 @@ func (e *engine) writeResponseAbort(rw responseWriter, halt responseAbort) {
 		rw.writeHeader()
 		return
 	}
+	resetRepresentationHeaders(rw.Header())
 	rw.Header().Set(contentType, textPlainCharset)
 	rw.WriteHeader(halt.status)
 	rw.writeHeader()
@@ -193,6 +194,7 @@ func writeGeneric500(rw responseWriter) {
 	if rw.hijacked() || rw.flushed() || rw.written() {
 		return
 	}
+	resetRepresentationHeaders(rw.Header())
 	rw.Header().Set(contentType, textPlainCharset)
 	rw.replaceStatus(http.StatusInternalServerError)
 	rw.writeHeader()
@@ -213,6 +215,7 @@ func (e *engine) renderPanic(rw responseWriter, err any) {
 		if code < http.StatusOK || code > 999 {
 			code = http.StatusInternalServerError
 		}
+		resetRepresentationHeaders(rw.Header())
 		if !bodyAllowedForStatus(code) {
 			rw.Header().Set(contentType, errorMediaType(payload))
 			rw.replaceStatus(code)

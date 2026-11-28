@@ -308,6 +308,7 @@ func (c *Context) AbortWithStatusString(status int, body string) {
 		return
 	}
 	validateFinalAbortStatus(status)
+	resetRepresentationHeaders(c.writer.Header())
 	c.writer.Header().Set(contentType, textPlainCharset)
 	c.writer.WriteHeader(status)
 	c.writer.writeHeader()
@@ -327,6 +328,7 @@ func (c *Context) AbortWithStatusJSON(status int, body any) {
 		return
 	}
 	validateFinalAbortStatus(status)
+	resetRepresentationHeaders(c.writer.Header())
 	if !bodyAllowedForStatus(status) {
 		c.writer.Header().Set(contentType, applicationJsonCharset)
 		c.writer.WriteHeader(status)
@@ -375,6 +377,12 @@ func (c *Context) invokeHandler() {
 		defer sw.complete()
 	}
 
+	if !rh.plan.needsParse && c.method.isBodyMethod() {
+		if err := prepareRequestBody(c.writer, c.Request); err != nil {
+			writeRequestError(err, c.logger)
+			return
+		}
+	}
 	var (
 		form    *pooledForm
 		files   filesMap

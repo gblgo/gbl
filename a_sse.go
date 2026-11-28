@@ -109,6 +109,9 @@ func newSSEWriter(w responseWriter, r *http.Request, writeTimeout time.Duration,
 	logger Logger, streamCtx context.Context) *sseWriter {
 	ctx, cancel := context.WithCancelCause(r.Context())
 	stopShutdown := context.AfterFunc(streamCtx, func() { cancel(streamCtx.Err()) })
+	if err := streamCtx.Err(); err != nil {
+		cancel(err)
+	}
 	return &sseWriter{
 		w:            w,
 		ctx:          ctx,
@@ -236,6 +239,9 @@ func (s *sseWriter) start() error {
 	if err := http.NewResponseController(s.w).Flush(); err != nil {
 		return err
 	}
+	if err := context.Cause(s.ctx); err != nil {
+		return err
+	}
 	s.callbackMu.Lock()
 	s.started = true
 	s.callbackMu.Unlock()
@@ -301,8 +307,13 @@ func (s *sseWriter) writeData(data []byte) error {
 		}
 		return s.fail(err)
 	}
-	if err := writeSSEData(s.w, data); err != nil {
-		return s.fail(err)
+	buf := responseBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	frameSSEData(buf, data)
+	_, writeErr := s.w.Write(buf.Bytes())
+	releaseResponseBuffer(buf)
+	if writeErr != nil {
+		return s.fail(writeErr)
 	}
 	if err := http.NewResponseController(s.w).Flush(); err != nil {
 		return s.fail(err)
@@ -416,25 +427,19 @@ func (s *sseWriter) runCallback(kind string, fn func()) {
 	fn()
 }
 
-// writeSSEData frames every payload line as a data field. CRLF and bare CR are
+// frameSSEData frames every payload line as a data field. CRLF and bare CR are
 // normalized to LF, and a trailing line break produces a final empty data field
 // so the decoded event preserves the original payload.
-func writeSSEData(w http.ResponseWriter, data []byte) error {
+func frameSSEData(dst *bytes.Buffer, data []byte) {
 	start := 0
 	for {
 		end := start
 		for end < len(data) && data[end] != '\r' && data[end] != '\n' {
 			end++
 		}
-		if _, err := w.Write(sseDataPrefix); err != nil {
-			return err
-		}
-		if _, err := w.Write(data[start:end]); err != nil {
-			return err
-		}
-		if _, err := w.Write(sseNewline); err != nil {
-			return err
-		}
+		dst.Write(sseDataPrefix)
+		dst.Write(data[start:end])
+		dst.Write(sseNewline)
 		if end == len(data) {
 			break
 		}
@@ -443,6 +448,13 @@ func writeSSEData(w http.ResponseWriter, data []byte) error {
 		}
 		start = end + 1
 	}
-	_, err := w.Write(sseNewline)
+	dst.Write(sseNewline)
+}
+
+// writeSSEData is the direct-call variant used by tests and fuzzing.
+func writeSSEData(w http.ResponseWriter, data []byte) error {
+	var buf bytes.Buffer
+	frameSSEData(&buf, data)
+	_, err := w.Write(buf.Bytes())
 	return err
 }

@@ -199,6 +199,13 @@ func bodyAllowedForStatus(code int) bool {
 		code != http.StatusResetContent && code != http.StatusNotModified
 }
 
+// resetRepresentationHeaders removes metadata tied to a replaced response body.
+func resetRepresentationHeaders(header http.Header) {
+	header.Del(contentEncoding)
+	header.Del("Content-Length")
+	header.Del("Etag")
+}
+
 // size reports how many body bytes have been written so far.
 func (rw *pooledResponseWriter) size() int { return rw.bytesWritten }
 
