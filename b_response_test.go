@@ -65,6 +65,16 @@ func (w *responseTestWriter) Write(p []byte) (int, error) {
 	return w.body.Write(p)
 }
 
+type responseTestStringWriter struct {
+	*responseTestWriter
+	stringCalls int
+}
+
+func (w *responseTestStringWriter) WriteString(data string) (int, error) {
+	w.stringCalls++
+	return w.Write([]byte(data))
+}
+
 type responseTestFlushWriter struct {
 	*responseTestWriter
 	flushCalls int
@@ -878,6 +888,7 @@ func TestResponseWriterForbiddenBodies(t *testing.T) {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			sink := responseTestNewWriter()
 			rw := &pooledResponseWriter{w: sink}
+			rw.Header().Set("Content-Length", "9")
 			rw.WriteHeader(status)
 			n, err := rw.Write([]byte("forbidden"))
 			if n != 0 || !errors.Is(err, http.ErrBodyNotAllowed) {
@@ -888,6 +899,9 @@ func TestResponseWriterForbiddenBodies(t *testing.T) {
 			}
 			if rw.status() != status {
 				t.Fatalf("status = %d, want %d", rw.status(), status)
+			}
+			if status == http.StatusResetContent && sink.header.Get("Content-Length") != empty {
+				t.Fatalf("205 Content-Length = %q, want cleared", sink.header.Get("Content-Length"))
 			}
 		})
 	}
@@ -914,6 +928,53 @@ func TestResponseWriterPartialWriteAndZeroLengthWrite(t *testing.T) {
 		}
 		if !reflect.DeepEqual(sink.statuses, []int{http.StatusOK}) {
 			t.Fatalf("statuses = %v, want [200]", sink.statuses)
+		}
+	})
+}
+
+func TestResponseWriterWriteString(t *testing.T) {
+	t.Run("staged status and string writer", func(t *testing.T) {
+		sink := &responseTestStringWriter{responseTestWriter: responseTestNewWriter()}
+		rw := &pooledResponseWriter{w: sink}
+		rw.WriteHeader(http.StatusAccepted)
+		n, err := rw.WriteString("body")
+		if n != 4 || err != nil || rw.status() != http.StatusAccepted || !rw.written() || !rw.flushed() || rw.size() != 4 {
+			t.Fatalf("WriteString state = (%d, %v, %d, %v, %v, %d)", n, err, rw.status(), rw.written(), rw.flushed(), rw.size())
+		}
+		if sink.stringCalls != 1 || sink.body.String() != "body" || !reflect.DeepEqual(sink.statuses, []int{http.StatusAccepted}) {
+			t.Fatalf("string sink = calls:%d body:%q statuses:%v", sink.stringCalls, sink.body.String(), sink.statuses)
+		}
+	})
+
+	t.Run("empty string commits implicit status", func(t *testing.T) {
+		sink := &responseTestStringWriter{responseTestWriter: responseTestNewWriter()}
+		rw := &pooledResponseWriter{w: sink}
+		n, err := rw.WriteString("")
+		if n != 0 || err != nil || !rw.written() || !rw.flushed() || rw.size() != 0 || sink.stringCalls != 1 {
+			t.Fatalf("empty WriteString = (%d, %v, written=%v, flushed=%v, size=%d, calls=%d)", n, err, rw.written(), rw.flushed(), rw.size(), sink.stringCalls)
+		}
+	})
+
+	t.Run("forbidden body does not reach string writer", func(t *testing.T) {
+		sink := &responseTestStringWriter{responseTestWriter: responseTestNewWriter()}
+		rw := &pooledResponseWriter{w: sink}
+		rw.Header().Set("Content-Length", "7")
+		rw.WriteHeader(http.StatusResetContent)
+		n, err := rw.WriteString("forbidden")
+		if n != 0 || !errors.Is(err, http.ErrBodyNotAllowed) || sink.stringCalls != 0 || rw.size() != 0 {
+			t.Fatalf("forbidden WriteString = (%d, %v), calls=%d size=%d", n, err, sink.stringCalls, rw.size())
+		}
+		if got := sink.header.Get("Content-Length"); got != empty {
+			t.Fatalf("205 Content-Length = %q, want cleared", got)
+		}
+	})
+
+	t.Run("hijacked writer rejects strings", func(t *testing.T) {
+		sink := &responseTestStringWriter{responseTestWriter: responseTestNewWriter()}
+		rw := &pooledResponseWriter{w: sink, hijackedStatus: true}
+		n, err := rw.WriteString("forbidden")
+		if n != 0 || !errors.Is(err, http.ErrHijacked) || sink.stringCalls != 0 || rw.written() || rw.flushed() {
+			t.Fatalf("hijacked WriteString = (%d, %v), calls=%d written=%v flushed=%v", n, err, sink.stringCalls, rw.written(), rw.flushed())
 		}
 	})
 }
@@ -999,8 +1060,8 @@ func TestResponseWriterFlush(t *testing.T) {
 		if err := rw.FlushError(); !errors.Is(err, http.ErrNotSupported) {
 			t.Fatalf("FlushError = %v, want ErrNotSupported", err)
 		}
-		if rw.flushed() || len(sink.statuses) != 0 || !rw.headed() {
-			t.Fatalf("unsupported flush committed response: statuses=%v", sink.statuses)
+		if rw.flushedStatus || len(sink.statuses) != 0 || !rw.headed() {
+			t.Fatalf("unsupported flush committed response: statuses=%v flushedStatus=%v", sink.statuses, rw.flushedStatus)
 		}
 	})
 
@@ -1036,8 +1097,8 @@ func TestResponseWriterFlush(t *testing.T) {
 			t.Fatalf("FlushError = %v, want ErrHijacked", err)
 		}
 		rw.Flush()
-		if rw.flushed() || len(sink.statuses) != 0 {
-			t.Fatalf("hijacked flush committed response: statuses=%v", sink.statuses)
+		if rw.flushedStatus || len(sink.statuses) != 0 {
+			t.Fatalf("hijacked flush committed response: statuses=%v flushedStatus=%v", sink.statuses, rw.flushedStatus)
 		}
 	})
 }
@@ -1079,6 +1140,24 @@ func TestResponseWriterHijack(t *testing.T) {
 		}
 		if !conn.isClosed() || responseTestRegistrySize(registry) != 0 {
 			t.Fatalf("Close state = closed:%v tracked:%d", conn.isClosed(), responseTestRegistrySize(registry))
+		}
+	})
+
+	t.Run("staged final status is committed before hijack", func(t *testing.T) {
+		conn := &responseTestConn{}
+		sink := responseTestNewWriter()
+		hijacker := &responseTestHijackWriter{responseTestWriter: sink, conn: conn}
+		rw := &pooledResponseWriter{w: hijacker}
+		rw.WriteHeader(http.StatusAccepted)
+		gotConn, _, err := rw.Hijack()
+		if err != nil || gotConn != conn {
+			t.Fatalf("Hijack = (%v, %v)", gotConn, err)
+		}
+		if !rw.hijacked() || !rw.flushed() || rw.status() != http.StatusAccepted {
+			t.Fatalf("staged hijack state = (hijacked=%v, flushed=%v, status=%d)", rw.hijacked(), rw.flushed(), rw.status())
+		}
+		if !reflect.DeepEqual(sink.statuses, []int{http.StatusAccepted}) {
+			t.Fatalf("statuses before Hijack = %v, want [202]", sink.statuses)
 		}
 	})
 
@@ -1497,7 +1576,7 @@ func TestResponseCatchRuntimePanicAfterCommitOnlyLogs(t *testing.T) {
 
 func TestResponseRecoveredPanicSurvivesLoggerPanic(t *testing.T) {
 	e := responseTestNewEngine(t)
-	e.logger = &logTestPanicLogger{}
+	logTestStoreLogger(e, &logTestPanicLogger{})
 	sink := responseTestNewWriter()
 	rw := &pooledResponseWriter{w: sink}
 	escaped := responseTestCatchPanic(e, rw, func() { panic("original panic") })
@@ -1643,6 +1722,11 @@ func TestResponseErrorClearsRepresentationHeaders(t *testing.T) {
 	rw.Header().Set(contentEncoding, encodingGzip)
 	rw.Header().Set("Content-Length", "999")
 	rw.Header().Set("Etag", `"stale"`)
+	rw.Header().Set("Content-Range", "bytes 0-9/999")
+	rw.Header().Set("Content-MD5", "stale-md5")
+	rw.Header().Set("Digest", "sha-256=stale")
+	rw.Header().Set("Content-Digest", "sha-256=stale")
+	rw.Header().Set("Repr-Digest", "sha-256=stale")
 
 	escaped := responseTestCatchPanic(e, rw, func() { panic("private failure") })
 	if escaped != nil {
@@ -1651,10 +1735,42 @@ func TestResponseErrorClearsRepresentationHeaders(t *testing.T) {
 	if rw.status() != http.StatusInternalServerError || sink.body.String() != http.StatusText(http.StatusInternalServerError) {
 		t.Fatalf("error response = (%d, %q)", rw.status(), sink.body.String())
 	}
-	for _, name := range []string{contentEncoding, "Content-Length", "Etag"} {
+	for _, name := range []string{
+		contentEncoding, "Content-Length", "Etag", "Content-Range", "Content-MD5",
+		"Digest", "Content-Digest", "Repr-Digest",
+	} {
 		if got := sink.header.Get(name); got != empty {
 			t.Errorf("%s = %q, want cleared", name, got)
 		}
+	}
+}
+
+func TestResponsePanicThenNormalRequestRecoversPooledState(t *testing.T) {
+	e := responseTestNewEngine(t)
+	var leaked bool
+	e.register(methodGet, "/panic", func(c *Context) {
+		c.Set("leaked", "request value")
+		panic("request panic")
+	})
+	e.register(methodGet, "/ok", func(c *Context) string {
+		_, leaked = c.Get[string]("leaked")
+		return "ok"
+	})
+	e.generateRoute()
+
+	panicRecorder, escaped := responseTestServe(t, e, http.MethodGet, "/panic", "", "")
+	if escaped != nil {
+		t.Fatalf("panic escaped recovery: %v", escaped)
+	}
+	responseTestCheckResponse(t, panicRecorder, http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError), textPlainCharset)
+
+	normalRecorder, escaped := responseTestServe(t, e, http.MethodGet, "/ok", "", "")
+	if escaped != nil {
+		t.Fatalf("normal request after panic escaped: %v", escaped)
+	}
+	responseTestCheckResponse(t, normalRecorder, http.StatusOK, "ok", textPlainCharset)
+	if leaked {
+		t.Fatal("normal request inherited Context keys from the panicking request")
 	}
 }
 

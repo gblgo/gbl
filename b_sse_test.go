@@ -1046,6 +1046,9 @@ func TestSSEErrorCallbackWaitsForInflightSend(t *testing.T) {
 
 	marshalEntered := make(chan struct{}, 1)
 	marshalRelease := make(chan struct{})
+	var releaseMarshalOnce sync.Once
+	releaseMarshal := func() { releaseMarshalOnce.Do(func() { close(marshalRelease) }) }
+	t.Cleanup(releaseMarshal)
 	queuedResult := make(chan error, 1)
 	go func() {
 		queuedResult <- writer.Send(sseTestBlockingJSON{entered: marshalEntered, release: marshalRelease})
@@ -1060,7 +1063,7 @@ func TestSSEErrorCallbackWaitsForInflightSend(t *testing.T) {
 	}
 	sseTestRequireNoValue(t, errorResult, 50*time.Millisecond, "OnError before in-flight Send drained")
 
-	close(marshalRelease)
+	releaseMarshal()
 	sseTestWait(t, queuedResult, "queued Send to finish")
 	sseTestWait(t, errorResult, "OnError after in-flight Send drained")
 	writer.complete()
@@ -1087,6 +1090,9 @@ func TestSSEConcurrentSendDuringNormalClose(t *testing.T) {
 
 	marshalEntered := make(chan struct{}, queued)
 	marshalRelease := make(chan struct{})
+	var releaseMarshalOnce sync.Once
+	releaseMarshal := func() { releaseMarshalOnce.Do(func() { close(marshalRelease) }) }
+	t.Cleanup(releaseMarshal)
 	queuedResults := make(chan error, queued)
 	for range queued {
 		go func() {
@@ -1106,7 +1112,7 @@ func TestSSEConcurrentSendDuringNormalClose(t *testing.T) {
 	sseTestRequireNoValue(t, completeResult, 0, "completion callback before writes drain")
 	sseTestRequireNoValue(t, errorResult, 0, "error callback before writes drain")
 
-	close(marshalRelease)
+	releaseMarshal()
 	closeGate()
 	sseTestWait(t, completeReturned, "normal close to drain sends")
 	if err := sseTestWait(t, firstResult, "first Send result"); err != nil {

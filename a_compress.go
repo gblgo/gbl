@@ -135,8 +135,9 @@ func Compress(level int) HandlerFunc {
 		gw.Reset(buf)
 
 		writeErr, closeErr := gzipWriteAndClose(gw, c.bytes)
-		// A writer returns to the pool either way since Reset discards its state
-		// on the next use.
+		// Drop the output reference before pooling so the writer cannot pin a
+		// response buffer that the response pool has already released or dropped.
+		gw.Reset(io.Discard)
 		writerPool.Put(gw)
 		if writeErr != nil || closeErr != nil {
 			releaseResponseBuffer(buf)

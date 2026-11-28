@@ -237,6 +237,9 @@ func (s *sseWriter) start() error {
 		return err
 	}
 	if err := http.NewResponseController(s.w).Flush(); err != nil {
+		if cause := context.Cause(s.ctx); cause != nil {
+			return cause
+		}
 		return err
 	}
 	if err := context.Cause(s.ctx); err != nil {
@@ -288,10 +291,10 @@ func (s *sseWriter) writeHeartbeat() error {
 		return s.fail(err)
 	}
 	if _, err := s.w.Write(sseHeartbeat); err != nil {
-		return s.fail(err)
+		return s.writeFailure(err)
 	}
 	if err := http.NewResponseController(s.w).Flush(); err != nil {
-		return s.fail(err)
+		return s.writeFailure(err)
 	}
 	return nil
 }
@@ -313,10 +316,10 @@ func (s *sseWriter) writeData(data []byte) error {
 	_, writeErr := s.w.Write(buf.Bytes())
 	releaseResponseBuffer(buf)
 	if writeErr != nil {
-		return s.fail(writeErr)
+		return s.writeFailure(writeErr)
 	}
 	if err := http.NewResponseController(s.w).Flush(); err != nil {
-		return s.fail(err)
+		return s.writeFailure(err)
 	}
 	return nil
 }
@@ -333,6 +336,15 @@ func (s *sseWriter) beforeWrite() error {
 		timeout = sseDefaultWriteTimeout
 	}
 	return http.NewResponseController(s.w).SetWriteDeadline(time.Now().Add(timeout))
+}
+
+// writeFailure gives an already-canceled stream precedence over a racing I/O
+// error, so normal disconnect and shutdown do not trigger OnError.
+func (s *sseWriter) writeFailure(err error) error {
+	if cause := context.Cause(s.ctx); cause != nil {
+		return cause
+	}
+	return s.fail(err)
 }
 
 // fail records the first non-cancellation stream error as the cancellation cause
