@@ -7,6 +7,7 @@ package gbl
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"reflect"
 	"slices"
@@ -39,6 +40,8 @@ func FuzzFilterExactJSONValueNoPanic(f *testing.F) {
 	f.Add([]byte(`{"value":1,"unknown":{"nested":[true,null,"x"]}}`), uint8(0))
 	f.Add([]byte(`{"\u0076alue":2,"Value":3}`), uint8(0))
 	f.Add([]byte(`[{"value":1},{"value":2}]`), uint8(2))
+	f.Add([]byte(`[{"Value":99,"value":1},{"value":2}]`), uint8(2))
+	f.Add([]byte(`{"Value":99,"value":1,"children":[{"Value":2,"value":3}]}`), uint8(4))
 	f.Add([]byte(`{"value":"bad","value":1}`), uint8(0))
 	f.Add([]byte(`null`), uint8(1))
 	f.Add([]byte(`{"key":{"value":7},"other":[{"value":8}]}`), uint8(4))
@@ -60,7 +63,187 @@ func FuzzFilterExactJSONValueNoPanic(f *testing.F) {
 			t.Fatalf("filterExactJSONValue did not reach an exact-field fixed point: input=%q output=%q",
 				data, filtered)
 		}
+		actual := reflect.New(typ)
+		actualErr := json.Unmarshal(filtered, actual.Interface())
+		expected, expectedErr := fuzzJSONFilterOracle(data, typ)
+		if (actualErr == nil) != (expectedErr == nil) {
+			t.Fatalf("filtered decode error mismatch for type %v: input=%q output=%q actual=%v expected=%v",
+				typ, data, filtered, actualErr, expectedErr)
+		}
+		if actualErr == nil && !reflect.DeepEqual(actual.Elem().Interface(), expected) {
+			t.Fatalf("filtered value mismatch for type %v: input=%q output=%q got=%#v want=%#v",
+				typ, data, filtered, actual.Elem().Interface(), expected)
+		}
 	})
+}
+
+// fuzzJSONObject preserves duplicate members and their order so the independent
+// oracle can retain the standard decoder's first-type-error behavior.
+type fuzzJSONObject []fuzzJSONMember
+
+type fuzzJSONMember struct {
+	key   string
+	value any
+}
+
+func fuzzJSONDecodeValue(decoder *json.Decoder) (any, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return token, nil
+	}
+	switch delim {
+	case '{':
+		var object fuzzJSONObject
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return nil, err
+			}
+			value, err := fuzzJSONDecodeValue(decoder)
+			if err != nil {
+				return nil, err
+			}
+			object = append(object, fuzzJSONMember{key: keyToken.(string), value: value})
+		}
+		_, err = decoder.Token()
+		return object, err
+	case '[':
+		var array []any
+		for decoder.More() {
+			value, err := fuzzJSONDecodeValue(decoder)
+			if err != nil {
+				return nil, err
+			}
+			array = append(array, value)
+		}
+		_, err = decoder.Token()
+		return array, err
+	default:
+		return nil, errors.New("unexpected JSON delimiter")
+	}
+}
+
+func fuzzJSONFilterOracle(data []byte, typ reflect.Type) (any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	value, err := fuzzJSONDecodeValue(decoder)
+	if err != nil {
+		return nil, err
+	}
+	filtered := fuzzJSONFilterOracleValue(value, typ)
+	expectedData, err := fuzzJSONMarshalOracle(filtered)
+	if err != nil {
+		return nil, err
+	}
+	target := reflect.New(typ)
+	if err := json.Unmarshal(expectedData, target.Interface()); err != nil {
+		return nil, err
+	}
+	return target.Elem().Interface(), nil
+}
+
+func fuzzJSONFilterOracleValue(value any, typ reflect.Type) any {
+	for typ.Kind() == reflect.Pointer {
+		if value == nil {
+			return nil
+		}
+		typ = typ.Elem()
+	}
+	switch typ {
+	case reflect.TypeFor[fuzzJSONFilterNode]():
+		return fuzzJSONFilterOracleNode(value)
+	case reflect.TypeFor[[]fuzzJSONFilterNode](),
+		reflect.TypeFor[[2]fuzzJSONFilterNode]():
+		array, ok := value.([]any)
+		if !ok {
+			return value
+		}
+		filtered := make([]any, len(array))
+		for i, item := range array {
+			filtered[i] = fuzzJSONFilterOracleNode(item)
+		}
+		return filtered
+	case reflect.TypeFor[map[string]fuzzJSONFilterNode]():
+		object, ok := value.(fuzzJSONObject)
+		if !ok {
+			return value
+		}
+		filtered := make(fuzzJSONObject, len(object))
+		for i, member := range object {
+			filtered[i] = fuzzJSONMember{key: member.key, value: fuzzJSONFilterOracleNode(member.value)}
+		}
+		return filtered
+	default:
+		return value
+	}
+}
+
+func fuzzJSONFilterOracleNode(value any) any {
+	object, ok := value.(fuzzJSONObject)
+	if !ok {
+		return value
+	}
+	filtered := make(fuzzJSONObject, 0, len(object))
+	for _, member := range object {
+		switch member.key {
+		case "value":
+			filtered = append(filtered, member)
+		case "children":
+			filtered = append(filtered, fuzzJSONMember{key: member.key,
+				value: fuzzJSONFilterOracleValue(member.value, reflect.TypeFor[[]fuzzJSONFilterNode]())})
+		case "lookup":
+			filtered = append(filtered, fuzzJSONMember{key: member.key,
+				value: fuzzJSONFilterOracleValue(member.value, reflect.TypeFor[map[string]fuzzJSONFilterNode]())})
+		}
+	}
+	return filtered
+}
+
+func fuzzJSONMarshalOracle(value any) ([]byte, error) {
+	switch typed := value.(type) {
+	case fuzzJSONObject:
+		var out bytes.Buffer
+		out.WriteByte('{')
+		for i, member := range typed {
+			if i > 0 {
+				out.WriteByte(',')
+			}
+			key, err := json.Marshal(member.key)
+			if err != nil {
+				return nil, err
+			}
+			valueData, err := fuzzJSONMarshalOracle(member.value)
+			if err != nil {
+				return nil, err
+			}
+			out.Write(key)
+			out.WriteByte(':')
+			out.Write(valueData)
+		}
+		out.WriteByte('}')
+		return out.Bytes(), nil
+	case []any:
+		var out bytes.Buffer
+		out.WriteByte('[')
+		for i, item := range typed {
+			if i > 0 {
+				out.WriteByte(',')
+			}
+			itemData, err := fuzzJSONMarshalOracle(item)
+			if err != nil {
+				return nil, err
+			}
+			out.Write(itemData)
+		}
+		out.WriteByte(']')
+		return out.Bytes(), nil
+	default:
+		return json.Marshal(value)
+	}
 }
 
 // FuzzWriteSSEDataNoPanic requires arbitrary bytes to produce one correctly
