@@ -135,6 +135,15 @@ func TestCoverageSeamRunClosedListener(t *testing.T) {
 	if !ok || !errors.Is(serveErr, net.ErrClosed) {
 		t.Fatalf("Run panic = %#v, want a closed-listener error", panicValue)
 	}
+	if !errors.Is(e.streamCtx.Err(), context.Canceled) {
+		t.Fatal("abnormal Serve exit did not cancel stream context")
+	}
+	e.hijacks.mu.Lock()
+	hijacksClosed := e.hijacks.closed
+	e.hijacks.mu.Unlock()
+	if !hijacksClosed {
+		t.Fatal("abnormal Serve exit did not close the hijack registry")
+	}
 	if got := e.runState.Load(); got != runStateStopped {
 		t.Errorf("Run state = %d, want runStateStopped", got)
 	}

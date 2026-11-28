@@ -248,6 +248,32 @@ func routeTestRequireFailedStartupState(t *testing.T, e *engine) {
 	}
 }
 
+func TestLifecycleAssemblingUsesExclusiveLock(t *testing.T) {
+	e := routeTestNewEngine(t)
+	unlock := e.assertAssembling("exclusive-lock-test")
+	exclusive := !e.assemblyMu.TryRLock()
+	if !exclusive {
+		e.assemblyMu.RUnlock()
+	}
+	unlock()
+	if !exclusive {
+		t.Fatal("assertAssembling allowed a concurrent reader while an assembling mutation was active")
+	}
+}
+
+func TestLifecycleShutdownObservesCompletionWhileWaiting(t *testing.T) {
+	e := routeTestNewEngine(t)
+	e.runState.Store(runStateRunning)
+	e.server = &http.Server{}
+	previous := shutdownStart
+	shutdownStart = func() { e.shutdownDone.Store(true) }
+	t.Cleanup(func() { shutdownStart = previous })
+
+	if err := e.shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown after concurrent completion = %v", err)
+	}
+}
+
 func TestLifecycleAssemblingRejectedAfterRunClaim(t *testing.T) {
 	e := routeTestNewEngine(t)
 	e.runState.Store(runStateStarting)

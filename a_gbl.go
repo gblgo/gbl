@@ -47,6 +47,8 @@ type engine struct {
 	staticRoutes [methodCount]map[string]*routeHandler
 	// runtime configuration; defaults overlaid by Configure
 	cfg *Config
+	// configVersion is guarded by assemblyMu and detects overlapping Configure calls.
+	configVersion uint64
 	// nil disables the CORS layer
 	cors *CorsConfig
 	// lazily built "<file>:<line>"->param names from the binary DWARF.
@@ -72,6 +74,8 @@ type engine struct {
 
 	// runState makes the single-use claim atomic, independently of route generation
 	runState atomic.Uint32
+	// assemblyFailure prevents recursive logging when a Logger rejects assembly again.
+	assemblyFailure atomic.Bool
 	// closed when Run publishes its server or aborts startup, unblocking an early Shutdown
 	startDone chan struct{}
 	// the server has been drained successfully; later Shutdown calls are no-ops
@@ -269,14 +273,21 @@ func (e *engine) run() {
 	}
 
 	// ErrServerClosed is the expected result of a graceful shutdown, not a
-	// crash: only genuine failures propagate as a panic.
+	// crash: only genuine failures propagate as a panic. An abnormal Serve exit
+	// owns cleanup because there is no successful Shutdown path to drain it.
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		_ = server.Close()
+		e.cancelStreams()
+		e.hijacks.closeAll()
 		e.failStartup(serveErr)
 	}
 }
 
 // shutdown is the instance-level counterpart of the package-level Shutdown.
 func (e *engine) shutdown(ctx context.Context) error {
+	if e.shutdownDone.Load() {
+		return nil
+	}
 	shutdownStart()
 	// Taking startMu first preserves the before-Run behavior while also waiting
 	// behind a test or integration layer that deliberately holds the publication
@@ -342,24 +353,28 @@ func (e *engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	e.serveHTTP(w, r)
 }
 
-// assertAssembling enforces the engine's read-only-after-Run-claim contract.
-// Route registration, middleware, loggers, CORS, configuration, panic renderers
-// and size limits must all be set before Run. Once Run is claimed, those setters
-// can no longer take effect, so a wrong registration order is logged and fails
-// fast instead of being silently ignored.
+// assertAssembling enforces the engine's read-only-after-Run-claim contract and
+// serializes assembling mutations. Route registration, middleware, loggers, CORS,
+// panic renderers and size limits must all be set before Run. Once Run is claimed,
+// those setters can no longer take effect, so a wrong registration order is logged
+// and fails fast instead of being silently ignored.
 func (e *engine) assertAssembling(op string) func() {
-	e.assemblyMu.RLock()
+	e.assemblyMu.Lock()
 	if e.runState.Load() != runStateIdle {
-		e.assemblyMu.RUnlock()
+		e.assemblyMu.Unlock()
 		e.failAssembling(op)
 	}
-	return e.assemblyMu.RUnlock
+	return e.assemblyMu.Unlock
 }
 
 // failAssembling records an API-order violation without letting a failing logger
 // replace the panic that callers use to detect the mistake.
 func (e *engine) failAssembling(op string) {
 	reason := "gbl." + op + " must be called before Run; the engine is read-only while serving"
+	if !e.assemblyFailure.CompareAndSwap(false, true) {
+		panic(reason)
+	}
+	defer e.assemblyFailure.Store(false)
 	safeLog(func() { e.logger.Error("assembly rejected", "reason", reason) })
 	panic(reason)
 }

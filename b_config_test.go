@@ -133,6 +133,72 @@ func TestEngineConfigureRejectsRunClaimDuringCallback(t *testing.T) {
 	}
 }
 
+func TestEngineConfigureMergesOverlappingUpdates(t *testing.T) {
+	e := newEngine()
+	defer e.cancelStreams()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan any, 1)
+	go func() {
+		defer func() { done <- recover() }()
+		e.configure(func(c *Config) {
+			c.Port = "8080"
+			close(entered)
+			<-release
+		})
+	}()
+	<-entered
+	e.configure(func(c *Config) { c.ReadTimeout = 2 * time.Second })
+	close(release)
+	if recovered := <-done; recovered != nil {
+		t.Fatalf("overlapping Configure panicked: %v", recovered)
+	}
+	if e.cfg.Port != "8080" || e.cfg.ReadTimeout != 2*time.Second {
+		t.Fatalf("overlapping Configure lost updates: %#v", e.cfg)
+	}
+}
+
+func TestEngineConfigureMergesNestedUpdates(t *testing.T) {
+	e := newEngine()
+	defer e.cancelStreams()
+	e.configure(func(c *Config) {
+		c.Port = "8080"
+		e.configure(func(inner *Config) { inner.ReadTimeout = 2 * time.Second })
+		c.WriteTimeout = 3 * time.Second
+	})
+	if e.cfg.Port != "8080" || e.cfg.ReadTimeout != 2*time.Second || e.cfg.WriteTimeout != 3*time.Second {
+		t.Fatalf("nested Configure lost updates: %#v", e.cfg)
+	}
+}
+
+func TestMergeConfigChangesCopiesEveryChangedField(t *testing.T) {
+	base := Config{
+		Port:              "9801",
+		CertFile:          "old.crt",
+		KeyFile:           "old.key",
+		ReadTimeout:       time.Second,
+		ReadHeaderTimeout: 2 * time.Second,
+		WriteTimeout:      3 * time.Second,
+		IdleTimeout:       4 * time.Second,
+	}
+	changed := Config{
+		Port:              "8080",
+		CertFile:          "new.crt",
+		KeyFile:           "new.key",
+		ReadTimeout:       5 * time.Second,
+		ReadHeaderTimeout: 6 * time.Second,
+		WriteTimeout:      7 * time.Second,
+		IdleTimeout:       8 * time.Second,
+	}
+	dst := Config{Port: "untouched"}
+	mergeConfigChanges(&dst, &base, &changed)
+	if dst.Port != changed.Port || dst.CertFile != changed.CertFile || dst.KeyFile != changed.KeyFile ||
+		dst.ReadTimeout != changed.ReadTimeout || dst.ReadHeaderTimeout != changed.ReadHeaderTimeout ||
+		dst.WriteTimeout != changed.WriteTimeout || dst.IdleTimeout != changed.IdleTimeout {
+		t.Fatalf("merged config = %#v, want %#v", dst, changed)
+	}
+}
+
 func TestEngineConfigureNilCopiesCurrentSnapshot(t *testing.T) {
 	e := newEngine()
 	defer e.cancelStreams()

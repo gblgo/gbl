@@ -58,6 +58,32 @@ func defaultConfig() *Config {
 // Call it before Run. Passing nil is a no-op.
 func Configure(fn func(*Config)) { defaultEngine.configure(fn) }
 
+// mergeConfigChanges applies only fields changed since the snapshot, preserving
+// independent updates published by an overlapping or nested Configure call.
+func mergeConfigChanges(dst, base, changed *Config) {
+	if changed.Port != base.Port {
+		dst.Port = changed.Port
+	}
+	if changed.CertFile != base.CertFile {
+		dst.CertFile = changed.CertFile
+	}
+	if changed.KeyFile != base.KeyFile {
+		dst.KeyFile = changed.KeyFile
+	}
+	if changed.ReadTimeout != base.ReadTimeout {
+		dst.ReadTimeout = changed.ReadTimeout
+	}
+	if changed.ReadHeaderTimeout != base.ReadHeaderTimeout {
+		dst.ReadHeaderTimeout = changed.ReadHeaderTimeout
+	}
+	if changed.WriteTimeout != base.WriteTimeout {
+		dst.WriteTimeout = changed.WriteTimeout
+	}
+	if changed.IdleTimeout != base.IdleTimeout {
+		dst.IdleTimeout = changed.IdleTimeout
+	}
+}
+
 // configure overlays this engine configuration. After fn returns, useTLS is
 // re-derived from the certificate and key paths, so setting or clearing either
 // path takes effect without a separate switch. Once Run is claimed the
@@ -70,6 +96,8 @@ func (e *engine) configure(fn func(*Config)) {
 		return
 	}
 	next := *e.cfg
+	base := next
+	baseVersion := e.configVersion
 	e.assemblyMu.Unlock()
 
 	if fn != nil {
@@ -83,12 +111,18 @@ func (e *engine) configure(fn func(*Config)) {
 		e.failAssembling("Configure")
 		return
 	}
-	if (next.CertFile == empty) != (next.KeyFile == empty) {
+	latest := next
+	if e.configVersion != baseVersion {
+		latest = *e.cfg
+		mergeConfigChanges(&latest, &base, &next)
+	}
+	if (latest.CertFile == empty) != (latest.KeyFile == empty) {
 		e.assemblyMu.Unlock()
 		e.failStartup("gbl: CertFile and KeyFile must both be set or both be empty")
 		return
 	}
-	next.useTLS = next.CertFile != empty && next.KeyFile != empty
-	e.cfg = &next
+	latest.useTLS = latest.CertFile != empty && latest.KeyFile != empty
+	e.cfg = &latest
+	e.configVersion++
 	e.assemblyMu.Unlock()
 }
