@@ -387,8 +387,8 @@ func TestCoreEdgeFindOverlappingRouteNilAndVariableStatic(t *testing.T) {
 		t.Fatalf("findOverlappingRoute(nil) = (%t, %q), want (false, empty)", found, path)
 	}
 
-	root := newNode("/")
-	terminal := newNode("users")
+	root := newNode()
+	terminal := newNode()
 	terminal.exist = true
 	terminal.path = "/users"
 	root.staticNode["users"] = terminal
@@ -421,7 +421,7 @@ func TestCoreEdgeSearchNodeNilAndNonTerminal(t *testing.T) {
 	if got := searchNode(nil, nil, 0, nil); got != nil {
 		t.Fatalf("searchNode(nil) = %v, want nil", got)
 	}
-	root := newNode("root")
+	root := newNode()
 	root.handler = &routeHandler{}
 	if got := searchNode(root, nil, 0, map[string]string{}); got != nil {
 		t.Fatalf("searchNode(non-terminal) = %v, want nil", got)

@@ -138,9 +138,9 @@ func TestCountRouteNodes(t *testing.T) {
 	root := &routeNode{
 		exist:      true,
 		staticNode: map[string]*routeNode{"static": {exist: true}},
-		varNode: []*routeNode{
-			{exist: true},
-			{staticNode: map[string]*routeNode{"child": {exist: true}}},
+		varNode: &routeNode{
+			exist:      true,
+			staticNode: map[string]*routeNode{"child": {exist: true}},
 		},
 	}
 	if got := countRouteNodes(root); got != 4 {
@@ -154,7 +154,7 @@ func TestCountRoutesIncludesDynamicAndStaticMethods(t *testing.T) {
 	e.roots[methodGet] = &routeNode{
 		exist:      true,
 		staticNode: map[string]*routeNode{"users": {exist: true}},
-		varNode:    []*routeNode{{exist: true}},
+		varNode:    &routeNode{exist: true},
 	}
 	e.roots[methodPost] = &routeNode{exist: true}
 	e.staticRoutes[methodGet] = map[string]*routeHandler{
