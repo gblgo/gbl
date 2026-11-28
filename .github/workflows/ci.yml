@@ -1,8 +1,9 @@
 name: Test and Coverage
 
 on:
-  push:
+  # Validate pull requests before merge; push events are excluded to avoid duplicate post-merge runs.
   pull_request:
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
